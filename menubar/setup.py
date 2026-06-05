@@ -1,12 +1,12 @@
 """py2app 构建脚本
 
-构建命令（必须用 homebrew Python，**不能用 Anaconda Python**）：
+构建命令：
 
-    /opt/homebrew/bin/python3.13 setup.py py2app
+    cd menubar && python3 setup.py py2app
 
-为什么：Anaconda Python 的 C 扩展（_sqlite3 / _ssl / lz4 等）依赖 Anaconda
+为什么不能用 Anaconda Python：Anaconda Python 的 C 扩展（_sqlite3 / _ssl / lz4 等）依赖 Anaconda
 私有 dylib（libsqlite3.0、libssl.3、liblz4.1 等），py2app 默认不打包这些
-dylib，导致 bundle 运行时找不到符号。homebrew / python.org 的 Python 用
+dylib，导致 bundle 运行时找不到符号。homebrew / python.org / pyenv 的 Python 用
 系统级 libsqlite3、libssl 等，可以直接打包成可分发的 .app。
 """
 import sys

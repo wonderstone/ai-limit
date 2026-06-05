@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -110,8 +111,17 @@ def _acquire_single_instance() -> bool:
     return True
 
 def _set_login_item(enabled: bool):
+    """通过 launchctl bootstrap / bootout 管理 LaunchAgent。
+
+    只有装到 /Applications 的正式 App 才走 launchctl；源码运行不写自启。
+    """
+    app_path = pathlib.Path(sys.executable if getattr(sys, 'frozen', False) else __file__)
+    if not str(app_path).startswith("/Applications/"):
+        return  # 非正式安装路径，不操作 launchctl
+
+    _LAUNCH_AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+
     if enabled:
-        _LAUNCH_AGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
         _LAUNCH_AGENT_PLIST.write_text(
             f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -127,15 +137,49 @@ def _set_login_item(enabled: bool):
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <key>StandardOutPath</key>
+    <string>{pathlib.Path.home()}/.ai-limit-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>{pathlib.Path.home()}/.ai-limit-launchd.log</string>
 </dict>
 </plist>
 """,
             encoding="utf-8",
         )
+        # bootstrap: 注册并立即启动；已注册则无操作（幂等）
+        _run_launchctl("bootstrap", f"gui/{os.getuid()}", str(_LAUNCH_AGENT_PLIST))
     else:
+        # bootout: 停止并从 launchd 注销
+        _run_launchctl("bootout", f"gui/{os.getuid()}/{_LAUNCH_AGENT_LABEL}")
         try:
             _LAUNCH_AGENT_PLIST.unlink()
         except FileNotFoundError:
+            pass
+
+
+def _run_launchctl(*args):
+    """执行 launchctl，静默失败（用户可能没有 launchctl 权限）。"""
+    try:
+        subprocess.run(
+            ["launchctl"] + list(args),
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _ensure_login_item_on_first_run():
+    """首次启动时自动注册开机自启（静默，不弹窗）。"""
+    if _STATE_PATH.exists():
+        return  # 已有状态文件 = 非首次运行
+
+    # 仅对 /Applications 下的正式安装启用
+    app_path = pathlib.Path(sys.executable if getattr(sys, 'frozen', False) else __file__)
+    if str(app_path).startswith("/Applications/"):
+        try:
+            _set_login_item(True)
+        except Exception:
             pass
 
 def _tr(lang, zh, en):
@@ -1017,4 +1061,5 @@ class AiLimitApp(rumps.App):
 if __name__ == "__main__":
     if not _acquire_single_instance():
         sys.exit(0)
+    _ensure_login_item_on_first_run()
     AiLimitApp().run()
