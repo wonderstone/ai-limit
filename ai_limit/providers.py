@@ -16,12 +16,25 @@ from ai_limit.i18n import t
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+GOOGLE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
+GEMINI_OAUTH_PATH = pathlib.Path.home() / ".gemini" / "oauth_creds.json"
+GEMINI_PROJECT_PATH = pathlib.Path.home() / ".gemini" / "config" / "projects" / "default-cli-project.json"
 DEEPSEEK_KEY_PATHS = (
     pathlib.Path.home() / ".deepseek_api_key",
     pathlib.Path.home() / ".config" / "ai-limit" / "deepseek_api_key",
+)
+GOOGLE_MODEL_PRIORITY = (
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash-lite",
 )
 
 
@@ -46,6 +59,14 @@ class DeepSeekError(Exception):
 
 
 class DeepSeekAuthError(DeepSeekError):
+    pass
+
+
+class GoogleQuotaError(Exception):
+    pass
+
+
+class GoogleQuotaAuthError(GoogleQuotaError):
     pass
 
 
@@ -560,6 +581,146 @@ def current_codex_rate_limits(latest_codex_rate_limits_func):
 
     ts, rate_limits = latest_codex_rate_limits_func()
     return ts, rate_limits, "snapshot", " → ".join(reasons) if reasons else None
+
+
+def load_google_oauth_creds() -> dict:
+    try:
+        raw = json.loads(GEMINI_OAUTH_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise GoogleQuotaAuthError(
+            t(
+                "未找到 Gemini / Antigravity 登录态，请先登录 Google CLI",
+                "Gemini / Antigravity auth not found. Please sign in to the Google CLI first",
+            )
+        ) from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GoogleQuotaError(str(exc)) from exc
+
+    access_token = str(raw.get("access_token") or "").strip()
+    if not access_token:
+        raise GoogleQuotaAuthError(
+            t(
+                "Gemini / Antigravity 登录态缺少 access token，请重新登录",
+                "Gemini / Antigravity auth is missing an access token. Please sign in again",
+            )
+        )
+    return raw
+
+
+def has_google_oauth_creds() -> bool:
+    try:
+        load_google_oauth_creds()
+    except GoogleQuotaAuthError:
+        return False
+    except GoogleQuotaError:
+        return True
+    return True
+
+
+def load_google_project_id() -> str:
+    default_project = "default-cli-project"
+    try:
+        raw = json.loads(GEMINI_PROJECT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_project
+    project_id = str(raw.get("id") or "").strip()
+    return project_id or default_project
+
+
+def _google_bucket_priority(bucket: dict) -> tuple[int, float, str]:
+    model_id = bucket.get("model_id") or ""
+    try:
+        remaining = float(bucket.get("remaining_fraction"))
+    except (TypeError, ValueError):
+        remaining = -1.0
+    try:
+        rank = GOOGLE_MODEL_PRIORITY.index(model_id)
+    except ValueError:
+        rank = len(GOOGLE_MODEL_PRIORITY)
+    return rank, -remaining, model_id
+
+
+def _normalize_google_quota(data: dict) -> dict:
+    buckets = []
+    for raw_bucket in data.get("buckets") or []:
+        model_id = raw_bucket.get("modelId")
+        remaining_amount = raw_bucket.get("remainingAmount")
+        remaining_fraction = raw_bucket.get("remainingFraction")
+        try:
+            remaining_amount = int(remaining_amount) if remaining_amount is not None else None
+        except (TypeError, ValueError):
+            remaining_amount = None
+        try:
+            remaining_fraction = float(remaining_fraction) if remaining_fraction is not None else None
+        except (TypeError, ValueError):
+            remaining_fraction = None
+        remaining_percent = None
+        if remaining_fraction is not None:
+            remaining_percent = max(0, min(100, int(round(remaining_fraction * 100))))
+        buckets.append(
+            {
+                "model_id": model_id,
+                "remaining_amount": remaining_amount,
+                "remaining_fraction": remaining_fraction,
+                "remaining_percent": remaining_percent,
+                "reset_time": raw_bucket.get("resetTime"),
+            }
+        )
+
+    buckets.sort(key=_google_bucket_priority)
+    primary = buckets[0] if buckets else None
+    percent_values = [bucket["remaining_percent"] for bucket in buckets if bucket.get("remaining_percent") is not None]
+    summary_percent = min(percent_values) if percent_values else (primary or {}).get("remaining_percent")
+    reset_times = sorted({bucket.get("reset_time") for bucket in buckets if bucket.get("reset_time")})
+
+    return {
+        "primary": primary,
+        "buckets": buckets,
+        "summary": {
+            "remaining_percent": summary_percent,
+            "reset_time": reset_times[0] if reset_times else (primary or {}).get("reset_time"),
+            "bucket_count": len(buckets),
+        },
+    }
+
+
+def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    import urllib.error
+    import urllib.request
+
+    creds = load_google_oauth_creds()
+    req = urllib.request.Request(
+        GOOGLE_QUOTA_URL,
+        data=json.dumps({"project": load_google_project_id()}).encode(),
+        headers={
+            "Authorization": f"Bearer {creds['access_token']}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ai-limit/0.3.5",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise GoogleQuotaAuthError(
+                t(
+                    f"HTTP {exc.code}：Google CLI 登录已失效，请重新登录 Antigravity / Gemini",
+                    f"HTTP {exc.code}: Google CLI auth expired. Please sign in to Antigravity / Gemini again",
+                )
+            ) from exc
+        raise GoogleQuotaError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise GoogleQuotaError(str(exc)) from exc
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise GoogleQuotaError("non-JSON response") from exc
+
+    return datetime.datetime.now(datetime.timezone.utc), _normalize_google_quota(data)
 
 
 def load_deepseek_api_key() -> str:

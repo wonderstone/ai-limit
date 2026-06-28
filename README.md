@@ -2,7 +2,7 @@
 
 English | [中文说明](README.zh-CN.md)
 
-A lightweight tool to monitor real-time **Claude Code** and **Codex** usage limits, quota consumption, and token statistics — so you can adjust your AI usage before hitting rate limits. Available as a macOS menu bar app or a CLI.
+A lightweight tool to monitor real-time **Claude Code**, **Codex**, and **Google Gemini / Antigravity** usage limits, quota consumption, and token statistics — so you can adjust your AI usage before hitting rate limits. Available as a macOS menu bar app or a CLI.
 
 If you find it useful, a Star would be appreciated: [GitHub](https://github.com/zhuchenxi113/ai-limit) · [Gitee](https://gitee.com/zhuchenxi113/ai-limit)
 
@@ -33,7 +33,7 @@ First launch: right-click the app → Open → Open Anyway (bypasses Gatekeeper;
 
 - Chinese / English UI toggle
 - 5-hour / 7-day quota window toggle
-- Claude and Codex shown simultaneously, each independently configurable
+- Claude, Codex, and Google shown simultaneously, each independently configurable
 - Manual refresh
 - Click to expand details (plan, usage, reset time)
 
@@ -65,6 +65,7 @@ Output language is detected automatically from your system locale.
 - Python 3.10+
 - Chrome or Firefox signed in to [claude.ai](https://claude.ai) (for Claude quota)
 - Chrome or Firefox signed in to [chatgpt.com](https://chatgpt.com) (recommended path for Codex quota)
+- Signed in to Gemini CLI / Antigravity on this Mac (for Google quota)
 - Optional: [Codex CLI](https://developers.openai.com/codex/cli) installed and signed in (fallback when browser cookies are unavailable)
 
 ### Usage Prerequisites
@@ -73,6 +74,7 @@ ai-limit only reads your existing local Claude / ChatGPT browser session and loc
 
 - If Claude Code is available and signed in, Claude Code quota is shown.
 - If ChatGPT / Codex is available and signed in, Codex quota is shown.
+- If Gemini CLI / Antigravity is signed in, Google quota is shown.
 - Services that are unavailable or not signed in show a ⚠️ warning. You can hide each service from the menu bar app under `Services`.
 - If both services are unavailable, the menu bar shows `ai-limit ⚠️` or the corresponding error state.
 
@@ -146,6 +148,14 @@ Data sources are tried in priority order:
 The browser path (1) reuses the same analytics endpoint that powers the chatgpt.com dashboard. It returns **merged Cloud + CLI usage**, is read-only, and does not trigger a new window. This is the recommended default.
 
 > **⚠️ Side-effect warning (Codex protocol limitation):** When path 1 fails (not signed in to chatgpt.com / cookies expired / network issue), ai-limit falls back to `codex app-server`. That path sends an `initialize` call, which OpenAI counts as a session start — if the current 5-hour window has already expired, **this triggers a new 5-hour rolling window**. This is an inherent consequence of how the Codex CLI exposes its data; no workaround exists at the tool level.
+
+### Google Gemini / Antigravity
+
+| Data | Source |
+|------|--------|
+| Live quota | `~/.gemini/oauth_creds.json` OAuth token → `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+
+ai-limit reuses the local Gemini / Antigravity sign-in already present on your Mac. It reads the current quota buckets from Google's Code Assist backend and shows a conservative summary percentage plus key model buckets.
 
 ## Notes
 

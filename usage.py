@@ -20,11 +20,15 @@ from ai_limit.providers import (
     CodexAuthError,
     DeepSeekAuthError,
     DeepSeekError,
+    GoogleQuotaAuthError,
+    GoogleQuotaError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     has_deepseek_api_key,
+    has_google_oauth_creds,
     live_claude_plan,
     live_claude_usage,
     live_deepseek_balance,
+    live_google_quota,
 )
 
 CLAUDE_BASE = pathlib.Path.home() / ".claude" / "projects"
@@ -508,11 +512,51 @@ def render_deepseek():
         print(f"  {currency:<4} {t('总余额', 'Total')}: {_BOLD}{total}{_RST}  |  {t('赠送', 'Granted')}: {granted}  |  {t('充值', 'Topped-up')}: {topped}")
 
 
+def render_google():
+    title = "Google (Antigravity)"
+    print(f"\n{_DIM}{SEP}{_RST}")
+    print(f"{_BOLD}{title.center(52)}{_RST}")
+    print()
+    try:
+        ts, data = live_google_quota()
+    except GoogleQuotaAuthError as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+    except GoogleQuotaError as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  (oauth live){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: cloudcode-pa.googleapis.com v1internal:retrieveUserQuota  (Gemini / Antigravity OAuth){_RST}")
+    print()
+
+    summary = data.get("summary") or {}
+    primary = data.get("primary") or {}
+    remaining = summary.get("remaining_percent")
+    remaining_label = "?" if remaining is None else f"{remaining:.0f}%"
+    primary_model = primary.get("model_id") or "?"
+    bucket_count = summary.get("bucket_count", 0)
+    print(f"  {t('保守汇总', 'Conservative summary')}: {_BOLD}{remaining_label}{_RST}  |  {t('模型桶', 'Buckets')}: {bucket_count}")
+    print(f"  {t('主参考模型', 'Primary reference model')}: {_BOLD}{primary_model}{_RST}")
+    reset_time = summary.get("reset_time")
+    if reset_time:
+        print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(ts_to_local(reset_time))}{_RST}")
+
+    buckets = data.get("buckets") or []
+    if buckets:
+        print(f"\n  {_BOLD}{t('主要模型', 'Key models')}{_RST}")
+        for bucket in buckets[:4]:
+            model_id = bucket.get("model_id") or "?"
+            pct = bucket.get("remaining_percent")
+            pct_text = "?" if pct is None else f"{pct:.0f}%"
+            print(f"  {model_id:<28} {_bold_bar(pct or 0)}  {pct_text}")
+
+
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description=t("查看 Claude / CodeX 本周消耗", "Show Claude / CodeX token usage and quota"),
+        description=t("查看 Claude / CodeX / Google 本周消耗", "Show Claude / CodeX / Google token usage and quota"),
     )
     parser.add_argument("--days", type=int, default=7,
                         help=t("统计最近 N 天（默认 7）", "show last N days (default: 7)"))
@@ -549,6 +593,8 @@ def main():
     render_codex(since)
     if has_deepseek_api_key():
         render_deepseek()
+    if has_google_oauth_creds():
+        render_google()
     render_summary()
 
 

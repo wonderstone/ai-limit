@@ -37,8 +37,12 @@ from ai_limit.providers import (
     current_codex_rate_limits as resolve_codex_rate_limits,
     DeepSeekAuthError,
     DeepSeekError,
+    GoogleQuotaAuthError,
+    GoogleQuotaError,
     has_deepseek_api_key,
+    has_google_oauth_creds,
     live_deepseek_balance,
+    live_google_quota,
 )
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -49,7 +53,7 @@ _CACHE_TTL    = 55
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
-_SERVICES      = ("claude", "codex", "deepseek")
+_SERVICES      = ("claude", "codex", "deepseek", "google")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -57,6 +61,8 @@ _EN_RESET_PAD  = 8
 _PROJECT_URL   = "https://github.com/zhuchenxi113/ai-limit"
 _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
+_DEEPSEEK_USAGE_URL = "https://platform.deepseek.com/usage"
+_GOOGLE_QUOTA_DOCS_URL = "https://antigravity.google/docs/cli-credits"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
 _LAUNCH_AGENT_PLIST = pathlib.Path.home() / "Library/LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
 _APP_EXECUTABLE     = pathlib.Path("/Applications/ai-limit.app/Contents/MacOS/ai-limit")
@@ -72,6 +78,8 @@ def _default_services():
     services = ["claude", "codex"]
     if has_deepseek_api_key():
         services.append("deepseek")
+    if has_google_oauth_creds():
+        services.append("google")
     return services
 
 
@@ -202,6 +210,33 @@ def _fmt_balance_short(balance):
     currency = balance.get("currency", "USD")
     total = balance.get("total_balance", "0")
     return fmt_money(total, currency)
+
+
+def _fmt_balance_compact(balance):
+    if not balance:
+        return "?"
+    currency = balance.get("currency", "USD")
+    total = balance.get("total_balance", "0")
+    try:
+        amount = float(total)
+    except Exception:
+        amount = None
+    if amount is None:
+        return str(total)
+    if currency == "USD":
+        return f"${amount:.0f}" if amount >= 100 else f"${amount:.2f}"
+    if currency == "CNY":
+        return f"¥{amount:.0f}" if amount >= 100 else f"¥{amount:.2f}"
+    return f"{currency}{amount:.0f}" if amount >= 100 else f"{currency}{amount:.2f}"
+
+
+def _status_service_label(service):
+    return {
+        "claude": "C",
+        "codex": "X",
+        "deepseek": "D",
+        "google": "G",
+    }.get(service, service[:1].upper())
 
 
 def _balance_amount(balance) -> float:
@@ -403,6 +438,32 @@ def _fetch_deepseek(lang):
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
+
+def _fetch_google(lang):
+    import socket, urllib.error
+    try:
+        _ts, data = live_google_quota()
+        summary = data.get("summary") or {}
+        primary = data.get("primary") or {}
+        return {
+            "daily_left": summary.get("remaining_percent"),
+            "daily_reset": summary.get("reset_time"),
+            "bucket_count": summary.get("bucket_count", 0),
+            "primary_model": primary.get("model_id"),
+            "buckets": data.get("buckets") or [],
+            "source": "oauth live",
+        }
+    except GoogleQuotaAuthError as e:
+        return {"error": str(e)}
+    except GoogleQuotaError as e:
+        return {"error": str(e)}
+    except (socket.timeout, TimeoutError):
+        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+    except urllib.error.URLError:
+        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
 # ── AppKit 辅助 ───────────────────────────────────────────────────────────────
 
 def _status_button(app):
@@ -512,7 +573,7 @@ def _render_attributed_title(items):
         )
 
     for i, (label, value, kind, err) in enumerate(items):
-        prefix = "  " if i > 0 else ""
+        prefix = " " if i > 0 else ""
         if err:
             append_text(f"{prefix}{label} ⚠️")
             continue
@@ -570,6 +631,7 @@ class AiLimitApp(rumps.App):
         self._claude = None
         self._codex  = None
         self._deepseek = None
+        self._google = None
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
@@ -597,6 +659,14 @@ class AiLimitApp(rumps.App):
         self._deepseek_main    = _inert(rumps.MenuItem("  balance  …"))
         self._deepseek_detail  = _inert(rumps.MenuItem("  detail  …"))
 
+        self._google_header    = _inert(rumps.MenuItem("Google"))
+        self._google_source    = _inert(rumps.MenuItem("  source  …"))
+        self._google_main      = _inert(rumps.MenuItem("  quota  …"))
+        self._google_detail    = _inert(rumps.MenuItem("  detail  …"))
+        self._google_bucket_items = [
+            _inert(rumps.MenuItem("  bucket  …")) for _ in range(8)
+        ]
+
         # 上次刷新（次要信息，刻意灰色）
         self._last_refresh = _disable(rumps.MenuItem("…"))
 
@@ -622,11 +692,13 @@ class AiLimitApp(rumps.App):
         self._svc_claude = rumps.MenuItem("Claude Code", callback=self._toggle_claude)
         self._svc_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_codex)
         self._svc_deepseek = rumps.MenuItem("DeepSeek",  callback=self._toggle_deepseek)
+        self._svc_google = rumps.MenuItem("Google", callback=self._toggle_google)
         svc_label = "监控服务" if lang == "zh" else "Services"
         self._svc_menu = rumps.MenuItem(svc_label)
         self._svc_menu.add(self._svc_claude)
         self._svc_menu.add(self._svc_codex)
         self._svc_menu.add(self._svc_deepseek)
+        self._svc_menu.add(self._svc_google)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -647,6 +719,14 @@ class AiLimitApp(rumps.App):
         self._claude_dash = rumps.MenuItem(
             "打开 Claude 用量页" if lang == "zh" else "Open Claude usage",
             callback=lambda _: webbrowser.open("https://claude.ai/settings/usage"),
+        )
+        self._deepseek_dash = rumps.MenuItem(
+            "打开 DeepSeek 用量页" if lang == "zh" else "Open DeepSeek usage",
+            callback=lambda _: webbrowser.open(_DEEPSEEK_USAGE_URL),
+        )
+        self._google_dash = rumps.MenuItem(
+            "打开 Google 配额说明页" if lang == "zh" else "Open Google quota docs",
+            callback=lambda _: webbrowser.open(_GOOGLE_QUOTA_DOCS_URL),
         )
 
         # 关于子菜单
@@ -698,6 +778,12 @@ class AiLimitApp(rumps.App):
             self._deepseek_main,
             self._deepseek_detail,
             None,
+            self._google_header,
+            self._google_source,
+            self._google_main,
+            self._google_detail,
+            *self._google_bucket_items,
+            None,
             self._last_refresh,
             None,
             self._mode_menu,
@@ -708,6 +794,8 @@ class AiLimitApp(rumps.App):
             self._refresh_item,
             self._codex_dash,
             self._claude_dash,
+            self._deepseek_dash,
+            self._google_dash,
             None,
             self._about_menu,
             None,
@@ -756,16 +844,18 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is None:
             return
-        claude, codex, deepseek = pending
+        claude, codex, deepseek, google = pending
         if claude is not None:
             self._claude = claude
         if codex is not None:
             self._codex = codex
         if deepseek is not None:
             self._deepseek = deepseek
+        if google is not None:
+            self._google = google
         _save_cache(
             self._claude,
-            {"codex": self._codex, "deepseek": self._deepseek},
+            {"codex": self._codex, "deepseek": self._deepseek, "google": self._google},
         )
         self._render()
 
@@ -774,9 +864,11 @@ class AiLimitApp(rumps.App):
         claude, cached = _load_cache()
         codex = None
         deepseek = None
-        if isinstance(cached, dict) and ("codex" in cached or "deepseek" in cached):
+        google = None
+        if isinstance(cached, dict) and ("codex" in cached or "deepseek" in cached or "google" in cached):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
+            google = cached.get("google")
         else:
             codex = cached
         # 不按 services 过滤——内存里保留两份数据，UI 显示由 _render 控
@@ -786,6 +878,8 @@ class AiLimitApp(rumps.App):
             self._codex = codex
         if deepseek is not None:
             self._deepseek = deepseek
+        if google is not None:
+            self._google = google
         self._render()
 
     def _kick_background_fetch(self):
@@ -800,8 +894,9 @@ class AiLimitApp(rumps.App):
         claude = _fetch_claude(lang) if "claude" in services else None
         codex  = _fetch_codex(lang)  if "codex"  in services else None
         deepseek = _fetch_deepseek(lang) if "deepseek" in services else None
+        google = _fetch_google(lang) if "google" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek)
+            self._pending = (claude, codex, deepseek, google)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -810,31 +905,37 @@ class AiLimitApp(rumps.App):
         show_claude = "claude" in services
         show_codex  = "codex"  in services
         show_deepseek = "deepseek" in services
+        show_google = "google" in services
         claude = self._claude or {}
         codex  = self._codex  or {}
         deepseek = self._deepseek or {}
+        google = self._google or {}
 
-        # 菜单栏标题：[Claude 68% ⌬]  [CodeX 99% ⌬]
-        # 电池是原生 SF Symbol，Apple 亲手画的 iPhone 风格，向量永不糊
+        # 菜单栏标题保持紧凑，避免 4 个服务同时显示时把系统状态项挤掉。
         bar_items = []
         if show_claude:
             if "error" in claude:
-                bar_items.append(("Claude", 0, "percent", True))
+                bar_items.append((_status_service_label("claude"), 0, "percent", True))
             elif claude:
                 pct = claude["5h_left"] if mode == "5h" else claude["7d_left"]
-                bar_items.append(("Claude", pct, "percent", False))
+                bar_items.append((_status_service_label("claude"), pct, "percent", False))
         if show_codex:
             if "error" in codex:
-                bar_items.append(("CodeX", 0, "percent", True))
+                bar_items.append((_status_service_label("codex"), 0, "percent", True))
             elif codex:
                 pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
-                bar_items.append(("CodeX", pct, "percent", False))
+                bar_items.append((_status_service_label("codex"), pct, "percent", False))
         if show_deepseek:
             if "error" in deepseek:
-                bar_items.append(("DS", "", "text", True))
+                bar_items.append((_status_service_label("deepseek"), "", "text", True))
             elif deepseek:
                 primary = deepseek.get("primary") or {}
-                bar_items.append(("DS", _fmt_balance_short(primary), "text", False))
+                bar_items.append((_status_service_label("deepseek"), _fmt_balance_compact(primary), "text", False))
+        if show_google:
+            if "error" in google:
+                bar_items.append((_status_service_label("google"), 0, "percent", True))
+            elif google and google.get("daily_left") is not None:
+                bar_items.append((_status_service_label("google"), google["daily_left"], "percent", False))
         try:
             _set_bar_with_batteries(self, bar_items)
         except Exception:
@@ -913,6 +1014,49 @@ class AiLimitApp(rumps.App):
                 self._deepseek_main.title = _tr(lang, f"  余额\t{total}\t{available}", f"  Balance\t{total}\t{available}")
                 self._deepseek_detail.title = _tr(lang, f"  赠送 {granted}  |  充值 {topped}", f"  Granted {granted}  |  Topped-up {topped}")
 
+        self._google_header._menuitem.setHidden_(not show_google)
+        self._google_source._menuitem.setHidden_(not show_google)
+        self._google_main._menuitem.setHidden_(not show_google)
+        self._google_detail._menuitem.setHidden_(not show_google)
+        for item in self._google_bucket_items:
+            item._menuitem.setHidden_(not show_google)
+        if show_google:
+            if "error" in google:
+                self._google_header.title = "Google ⚠️"
+                self._google_source.title = _tr(lang, "  来源：oauth error", "  Source: oauth error")
+                self._google_main.title = f"  {google['error'][:60]}"
+                self._google_detail._menuitem.setHidden_(True)
+                for item in self._google_bucket_items:
+                    item._menuitem.setHidden_(True)
+            elif google:
+                daily = google.get("daily_left")
+                daily_text = "?" if daily is None else f"{daily}%"
+                primary_model = google.get("primary_model") or "?"
+                bucket_count = google.get("bucket_count", 0)
+                self._google_header.title = "Google"
+                self._google_source.title = _tr(lang, "  来源：antigravity oauth live", "  Source: antigravity oauth live")
+                self._google_main.title = _tr(lang, f"  日额度\t{daily_text}\t{primary_model}", f"  Daily\t{daily_text}\t{primary_model}")
+                reset = google.get("daily_reset")
+                reset_text = _fmt_reset_iso(reset, lang) if reset else "?"
+                self._google_detail.title = _tr(lang, f"  重置 {reset_text}  |  {bucket_count} 个模型桶", f"  Reset {reset_text}  |  {bucket_count} buckets")
+                buckets = google.get("buckets") or []
+                for index, item in enumerate(self._google_bucket_items):
+                    if index >= len(buckets):
+                        item._menuitem.setHidden_(True)
+                        continue
+                    bucket = buckets[index]
+                    model_id = bucket.get("model_id") or "?"
+                    pct = bucket.get("remaining_percent")
+                    pct_text = "?" if pct is None else f"{pct}%"
+                    reset = bucket.get("reset_time")
+                    reset_bucket_text = _fmt_reset_iso(reset, lang) if reset else "?"
+                    item.title = _tr(
+                        lang,
+                        f"  {index + 1}. {model_id}\t{pct_text}\t↻ {reset_bucket_text}",
+                        f"  {index + 1}. {model_id}\t{pct_text}\t↻ {reset_bucket_text}",
+                    )
+                    item._menuitem.setHidden_(False)
+
         # 刷新时间
         now = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
         self._last_refresh.title = _tr(lang, f"上次刷新: {now}", f"Last refresh: {now}")
@@ -966,14 +1110,16 @@ class AiLimitApp(rumps.App):
         self._refresh_item.title = _tr(lang, "立即刷新", "Refresh now")
         self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
+        self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
+        self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._about_menu.title  = _tr(lang,
             f"关于（ai-limit {__version__}）",
             f"About (ai-limit {__version__})",
         )
         self._about_author.title = _tr(lang, "作者：zhuchenxi", "Author: zhuchenxi")
         self._about_desc.title   = _tr(lang,
-            "Claude Code / CodeX 额度监控",
-            "Claude Code / CodeX quota monitor",
+            "Claude Code / CodeX / Google 额度监控",
+            "Claude Code / CodeX / Google quota monitor",
         )
         self._about_src.title    = _tr(lang,
             "数据来源：本地日志 + 官方网页接口",
@@ -1002,6 +1148,9 @@ class AiLimitApp(rumps.App):
 
     def _toggle_deepseek(self, _):
         self._toggle_service("deepseek")
+
+    def _toggle_google(self, _):
+        self._toggle_service("google")
 
     def _toggle_service(self, service):
         svc = list(self._state.get("services") or list(_SERVICES))
@@ -1037,6 +1186,7 @@ class AiLimitApp(rumps.App):
         self._svc_claude.title = ("✓ " if "claude" in svc else "  ") + "Claude Code"
         self._svc_codex.title  = ("✓ " if "codex"  in svc else "  ") + "CodeX"
         self._svc_deepseek.title = ("✓ " if "deepseek" in svc else "  ") + "DeepSeek"
+        self._svc_google.title = ("✓ " if "google" in svc else "  ") + "Google"
         enabled = []
         if "claude" in svc:
             enabled.append("Claude Code")
@@ -1044,6 +1194,8 @@ class AiLimitApp(rumps.App):
             enabled.append("CodeX")
         if "deepseek" in svc:
             enabled.append("DeepSeek")
+        if "google" in svc:
+            enabled.append("Google")
         summary = _tr(lang, "全部", "All") if len(svc) == len(_SERVICES) else ", ".join(enabled)
         self._svc_menu.title = _tr(lang, f"监控服务（{summary}）", f"Services ({summary})")
 

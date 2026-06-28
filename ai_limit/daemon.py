@@ -33,11 +33,15 @@ from ai_limit.providers import (
     CodexWebError,
     DeepSeekAuthError,
     DeepSeekError,
+    GoogleQuotaAuthError,
+    GoogleQuotaError,
     current_codex_rate_limits,
     has_deepseek_api_key,
+    has_google_oauth_creds,
     live_claude_plan,
     live_claude_usage,
     live_deepseek_balance,
+    live_google_quota,
 )
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
@@ -206,6 +210,29 @@ def _fetch_deepseek():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _fetch_google():
+    if not has_google_oauth_creds():
+        return None
+    try:
+        _ts, data = live_google_quota()
+        summary = data.get("summary") or {}
+        primary = data.get("primary") or {}
+        return {
+            "daily_left": summary.get("remaining_percent"),
+            "daily_reset": summary.get("reset_time"),
+            "bucket_count": summary.get("bucket_count", 0),
+            "primary_model": primary.get("model_id"),
+        }
+    except (GoogleQuotaAuthError, GoogleQuotaError) as e:
+        return {"error": str(e)[:120]}
+    except (socket.timeout, TimeoutError):
+        return {"error": "network timeout"}
+    except urllib.error.URLError:
+        return {"error": "network unavailable"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 # ── 主循环 ────────────────────────────────────────────────────────────────────
 
 def _check_and_notify():
@@ -216,6 +243,7 @@ def _check_and_notify():
     claude = _fetch_claude()
     codex = _fetch_codex()
     deepseek = _fetch_deepseek()
+    google = _fetch_google()
 
     state = {"ts": datetime.datetime.now().isoformat()}
 
@@ -268,6 +296,24 @@ def _check_and_notify():
         except Exception:
             pass
 
+    # Google / Antigravity
+    if google and "error" not in google and google.get("daily_left") is not None:
+        pct = google["daily_left"]
+        state["google_daily"] = pct
+        prev_pct = prev.get("google_daily", 100)
+        if pct <= CRIT_THRESHOLD and prev_pct > CRIT_THRESHOLD:
+            _notify(
+                "⚠️ Google 额度严重不足",
+                f"日额度仅剩 {pct}%，请留意用量",
+            )
+            _log(f"CRITICAL: Google daily remaining = {pct}%")
+        elif pct <= WARN_THRESHOLD and prev_pct > WARN_THRESHOLD:
+            _notify(
+                "Google 额度偏低",
+                f"日额度剩余 {pct}%",
+            )
+            _log(f"WARN: Google daily remaining = {pct}%")
+
     _save_state(state)
 
     # 摘要日志
@@ -278,6 +324,8 @@ def _check_and_notify():
         parts.append(f"CodeX={codex.get('5h_left', '?')}%")
     if deepseek and deepseek.get("primary"):
         parts.append(f"DS={deepseek['primary'].get('total_balance', '?')}")
+    if google:
+        parts.append(f"Google={google.get('daily_left', '?')}%")
     _log(" | ".join(parts) if parts else "no data")
 
 
