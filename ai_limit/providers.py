@@ -17,6 +17,7 @@ CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 GOOGLE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
@@ -617,6 +618,125 @@ def has_google_oauth_creds() -> bool:
     return True
 
 
+def google_oauth_token_expired(creds: dict) -> bool:
+    expiry_date = creds.get("expiry_date")
+    if expiry_date is None:
+        return False
+    try:
+        expiry_ms = int(expiry_date)
+    except (TypeError, ValueError):
+        return False
+    return int(time.time() * 1000) >= expiry_ms - 60_000
+
+
+def save_google_oauth_creds(creds: dict):
+    try:
+        GEMINI_OAUTH_PATH.write_text(
+            json.dumps(creds, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise GoogleQuotaError(str(exc)) from exc
+
+
+def load_google_oauth_client_config() -> dict:
+    gemini_path = shutil.which("gemini")
+    if not gemini_path:
+        raise GoogleQuotaError("gemini command not found")
+
+    bundle_dir = pathlib.Path(gemini_path).resolve().parent
+    for bundle_file in bundle_dir.glob("chunk-*.js"):
+        try:
+            text = bundle_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        marker = 'var OAUTH_CLIENT_ID = "'
+        start = text.find(marker)
+        if start < 0:
+            continue
+        client_id_start = start + len(marker)
+        client_id_end = text.find('"', client_id_start)
+        secret_marker = 'var OAUTH_CLIENT_SECRET = "'
+        secret_start = text.find(secret_marker, client_id_end)
+        if client_id_end < 0 or secret_start < 0:
+            continue
+        secret_value_start = secret_start + len(secret_marker)
+        secret_value_end = text.find('"', secret_value_start)
+        if secret_value_end < 0:
+            continue
+        return {
+            "client_id": text[client_id_start:client_id_end],
+            "client_secret": text[secret_value_start:secret_value_end],
+        }
+
+    raise GoogleQuotaError("could not locate Gemini OAuth client config")
+
+
+def refresh_google_oauth_creds(creds: dict | None = None, timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict:
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    current = dict(creds or load_google_oauth_creds())
+    refresh_token = str(current.get("refresh_token") or "").strip()
+    if not refresh_token:
+        raise GoogleQuotaAuthError(
+            t(
+                "Gemini / Antigravity 登录态缺少 refresh token，请重新登录",
+                "Gemini / Antigravity auth is missing a refresh token. Please sign in again",
+            )
+        )
+    client_config = load_google_oauth_client_config()
+
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_config["client_id"],
+            "client_secret": client_config["client_secret"],
+        }
+    ).encode()
+    req = urllib.request.Request(GOOGLE_OAUTH_TOKEN_URL, data=payload, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            raise GoogleQuotaAuthError(
+                t(
+                    f"HTTP {exc.code}：Google CLI 登录已失效，请重新登录 Antigravity / Gemini",
+                    f"HTTP {exc.code}: Google CLI auth expired. Please sign in to Antigravity / Gemini again",
+                )
+            ) from exc
+        raise GoogleQuotaError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise GoogleQuotaError(str(exc)) from exc
+
+    try:
+        refreshed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise GoogleQuotaError("non-JSON token refresh response") from exc
+
+    access_token = str(refreshed.get("access_token") or "").strip()
+    expires_in = refreshed.get("expires_in")
+    if not access_token or expires_in is None:
+        raise GoogleQuotaAuthError(
+            t(
+                "Google CLI token 刷新失败，请重新登录 Antigravity / Gemini",
+                "Google CLI token refresh failed. Please sign in to Antigravity / Gemini again",
+            )
+        )
+
+    updated = dict(current)
+    updated["access_token"] = access_token
+    updated["token_type"] = refreshed.get("token_type") or current.get("token_type") or "Bearer"
+    updated["expiry_date"] = int(time.time() * 1000) + int(expires_in) * 1000
+    if refreshed.get("id_token"):
+        updated["id_token"] = refreshed["id_token"]
+    save_google_oauth_creds(updated)
+    return updated
+
+
 def load_google_project_id() -> str:
     default_project = "default-cli-project"
     try:
@@ -688,30 +808,43 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     import urllib.error
     import urllib.request
 
-    creds = load_google_oauth_creds()
-    req = urllib.request.Request(
-        GOOGLE_QUOTA_URL,
-        data=json.dumps({"project": load_google_project_id()}).encode(),
-        headers={
-            "Authorization": f"Bearer {creds['access_token']}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "ai-limit/0.3.5",
-        },
-        method="POST",
-    )
-    try:
+    def fetch(creds: dict) -> bytes:
+        req = urllib.request.Request(
+            GOOGLE_QUOTA_URL,
+            data=json.dumps({"project": load_google_project_id()}).encode(),
+            headers={
+                "Authorization": f"Bearer {creds['access_token']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "ai-limit/0.3.5",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            body = response.read()
+            return response.read()
+
+    creds = load_google_oauth_creds()
+    if google_oauth_token_expired(creds):
+        creds = refresh_google_oauth_creds(creds, timeout=timeout)
+
+    try:
+        body = fetch(creds)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            raise GoogleQuotaAuthError(
-                t(
-                    f"HTTP {exc.code}：Google CLI 登录已失效，请重新登录 Antigravity / Gemini",
-                    f"HTTP {exc.code}: Google CLI auth expired. Please sign in to Antigravity / Gemini again",
-                )
-            ) from exc
-        raise GoogleQuotaError(f"HTTP {exc.code}") from exc
+            try:
+                creds = refresh_google_oauth_creds(creds, timeout=timeout)
+                body = fetch(creds)
+            except urllib.error.HTTPError as retry_exc:
+                if retry_exc.code in (401, 403):
+                    raise GoogleQuotaAuthError(
+                        t(
+                            f"HTTP {retry_exc.code}：Google CLI 登录已失效，请重新登录 Antigravity / Gemini",
+                            f"HTTP {retry_exc.code}: Google CLI auth expired. Please sign in to Antigravity / Gemini again",
+                        )
+                    ) from retry_exc
+                raise GoogleQuotaError(f"HTTP {retry_exc.code}") from retry_exc
+        else:
+            raise GoogleQuotaError(f"HTTP {exc.code}") from exc
     except Exception as exc:
         raise GoogleQuotaError(str(exc)) from exc
 

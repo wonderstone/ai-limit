@@ -729,32 +729,30 @@ class AiLimitApp(rumps.App):
             callback=lambda _: webbrowser.open(_GOOGLE_QUOTA_DOCS_URL),
         )
 
-        # 关于子菜单
-        about_label = f"关于（ai-limit {__version__}）" if lang == "zh" else f"About (ai-limit {__version__})"
+        # 项目信息子菜单
+        about_label = f"项目信息（ai-limit {__version__}）" if lang == "zh" else f"Project (ai-limit {__version__})"
         self._about_menu   = rumps.MenuItem(about_label)
-        self._about_ver    = rumps.MenuItem(f"ai-limit {__version__}",
-                                            callback=lambda _: webbrowser.open(_PROJECT_URL))
-        self._about_author = rumps.MenuItem(
-            "作者：zhuchenxi" if lang == "zh" else "Author: zhuchenxi",
-            callback=lambda _: webbrowser.open(_AUTHOR_URL_ZH if self._state["lang"] == "zh" else _AUTHOR_URL_EN),
-        )
-        self._about_desc   = _disable(rumps.MenuItem(
-            "Claude Code / CodeX 额度监控" if lang == "zh" else "Claude Code / CodeX quota monitor"
-        ))
-        self._about_src    = _disable(rumps.MenuItem(
-            "数据来源：本地日志 + 官方网页接口" if lang == "zh" else "Source: local logs + official web endpoints"
-        ))
-        self._about_menu.add(self._about_ver)
-        self._about_menu.add(self._about_author)
-        self._about_menu.add(self._about_desc)
-        self._about_menu.add(self._about_src)
-
-        # Star on GitHub（放在关于子菜单里，_about_menu 之后才 add）
-        self._star_item = rumps.MenuItem(
-            "⭐ 给个 Star，鼓励作者" if lang == "zh" else "⭐ Star on GitHub — support the author",
+        self._about_repo   = rumps.MenuItem(
+            "打开项目仓库" if lang == "zh" else "Open project repository",
             callback=lambda _: webbrowser.open(_PROJECT_URL),
         )
-        self._about_menu.add(self._star_item)
+        self._about_ver    = _disable(rumps.MenuItem(
+            f"版本：ai-limit {__version__}" if lang == "zh" else f"Version: ai-limit {__version__}"
+        ))
+        self._about_scope  = _disable(rumps.MenuItem(
+            "监控：Claude / CodeX / DeepSeek / Google" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google"
+        ))
+        self._about_surfaces = _disable(rumps.MenuItem(
+            "界面：菜单栏 / CLI / daemon" if lang == "zh" else "Surfaces: menu bar / CLI / daemon"
+        ))
+        self._about_status = _disable(rumps.MenuItem(
+            "状态：当前版本已接入 Google 配额" if lang == "zh" else "Status: current build includes Google quota"
+        ))
+        self._about_menu.add(self._about_repo)
+        self._about_menu.add(self._about_ver)
+        self._about_menu.add(self._about_scope)
+        self._about_menu.add(self._about_surfaces)
+        self._about_menu.add(self._about_status)
 
         # 退出
         self._quit_item = rumps.MenuItem(
@@ -1112,21 +1110,28 @@ class AiLimitApp(rumps.App):
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
+        self._about_repo.title = _tr(lang, "打开项目仓库", "Open project repository")
         self._about_menu.title  = _tr(lang,
-            f"关于（ai-limit {__version__}）",
-            f"About (ai-limit {__version__})",
+            f"项目信息（ai-limit {__version__}）",
+            f"Project (ai-limit {__version__})",
         )
-        self._about_author.title = _tr(lang, "作者：zhuchenxi", "Author: zhuchenxi")
-        self._about_desc.title   = _tr(lang,
-            "Claude Code / CodeX / Google 额度监控",
-            "Claude Code / CodeX / Google quota monitor",
+        self._about_ver.title = _tr(lang,
+            f"版本：ai-limit {__version__}",
+            f"Version: ai-limit {__version__}",
         )
-        self._about_src.title    = _tr(lang,
-            "数据来源：本地日志 + 官方网页接口",
-            "Source: local logs + official web endpoints",
+        self._about_scope.title = _tr(lang,
+            "监控：Claude / CodeX / DeepSeek / Google",
+            "Monitors: Claude / CodeX / DeepSeek / Google",
+        )
+        self._about_surfaces.title = _tr(lang,
+            "界面：菜单栏 / CLI / daemon",
+            "Surfaces: menu bar / CLI / daemon",
+        )
+        self._about_status.title = _tr(lang,
+            "状态：当前版本已接入 Google 配额",
+            "Status: current build includes Google quota",
         )
         self._update_login_item_check()
-        self._star_item.title    = _tr(lang, "⭐ 给个 Star，鼓励作者", "⭐ Star on GitHub — support the author")
         self._quit_item.title    = _tr(lang, "退出", "Quit")
 
     def _update_lang_checks(self):
