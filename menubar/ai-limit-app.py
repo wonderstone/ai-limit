@@ -14,6 +14,10 @@ import threading
 import webbrowser
 import atexit
 
+os.environ.setdefault("LANG", "en_US.UTF-8")
+os.environ.setdefault("LC_ALL", "en_US.UTF-8")
+os.environ.setdefault("PYTHONUTF8", "1")
+
 import rumps
 import AppKit
 
@@ -37,12 +41,19 @@ from ai_limit.providers import (
     current_codex_rate_limits as resolve_codex_rate_limits,
     DeepSeekAuthError,
     DeepSeekError,
+    GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
     has_deepseek_api_key,
+    has_gemini_app_cookies,
     has_google_oauth_creds,
     live_deepseek_balance,
+    live_gemini_app_usage,
     live_google_quota,
+)
+from ai_limit.llm_api import (
+    has_llm_api_provider_config,
+    live_llm_api_balances,
 )
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -53,16 +64,17 @@ _CACHE_TTL    = 55
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
-_SERVICES      = ("claude", "codex", "deepseek", "google")
+_SERVICES      = ("claude", "codex", "deepseek", "google", "gemini", "llm_api")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _EN_RESET_PAD  = 8
-_PROJECT_URL   = "https://github.com/zhuchenxi113/ai-limit"
+_PROJECT_URL   = "https://github.com/wonderstone/ai-limit/tree/main"
 _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
 _DEEPSEEK_USAGE_URL = "https://platform.deepseek.com/usage"
 _GOOGLE_QUOTA_DOCS_URL = "https://antigravity.google/docs/cli-credits"
+_GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
 _LAUNCH_AGENT_PLIST = pathlib.Path.home() / "Library/LaunchAgents" / f"{_LAUNCH_AGENT_LABEL}.plist"
 _APP_EXECUTABLE     = pathlib.Path("/Applications/ai-limit.app/Contents/MacOS/ai-limit")
@@ -80,6 +92,10 @@ def _default_services():
         services.append("deepseek")
     if has_google_oauth_creds():
         services.append("google")
+    if has_gemini_app_cookies():
+        services.append("gemini")
+    if has_llm_api_provider_config():
+        services.append("llm_api")
     return services
 
 
@@ -236,6 +252,8 @@ def _status_service_label(service):
         "codex": "X",
         "deepseek": "D",
         "google": "G",
+        "gemini": "M",
+        "llm_api": "LLM",
     }.get(service, service[:1].upper())
 
 
@@ -294,7 +312,7 @@ def _fmt_reset_iso(iso, lang="zh"):
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
-    state = {"global": "5h", "lang": "zh", "services": _default_services()}
+    state = {"global": "5h", "lang": "zh", "services": _default_services(), "widget": True}
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -302,8 +320,15 @@ def _load_state():
                 state["global"] = raw["global"]
             if raw.get("lang") in _LANGS:
                 state["lang"] = raw["lang"]
+            if isinstance(raw.get("widget"), bool):
+                state["widget"] = raw["widget"]
             if isinstance(raw.get("services"), list):
-                svc = [s for s in raw["services"] if s in _SERVICES]
+                svc = ["llm_api" if s == "infoweave" else s for s in raw["services"]]
+                svc = [s for s in svc if s in _SERVICES]
+                if "gemini" not in svc and has_gemini_app_cookies():
+                    svc.append("gemini")
+                if "llm_api" not in svc and has_llm_api_provider_config():
+                    svc.append("llm_api")
                 if svc:
                     state["services"] = svc
     except Exception:
@@ -341,6 +366,7 @@ def _save_cache(claude, codex):
         )
     except Exception:
         pass
+
 
 # ── 数据获取 ─────────────────────────────────────────────────────────────────
 
@@ -390,13 +416,21 @@ def _fetch_codex(lang):
             return {"error": _tr(lang, "未找到 Codex 数据", "No Codex data found")}
         primary   = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
+        summary = rl.get("summary") or {}
+        buckets = rl.get("buckets") or []
+        five_hour_left = summary.get("5h_remaining_percent")
+        weekly_left = summary.get("weekly_remaining_percent")
         return {
-            "5h_left":  int(round(100 - primary.get("used_percent", 0))),
-            "7d_left":  int(round(100 - secondary.get("used_percent", 0))),
+            "5h_left":  int(round(five_hour_left if five_hour_left is not None else 100 - primary.get("used_percent", 0))),
+            "7d_left":  int(round(weekly_left if weekly_left is not None else 100 - secondary.get("used_percent", 0))),
             "5h_reset": primary.get("resets_at"),
             "7d_reset": secondary.get("resets_at"),
             "plan":     rl.get("plan_type") or "?",
             "source":   source,
+            "groups":   rl.get("groups") or [],
+            "buckets":  buckets,
+            "group_count": summary.get("group_count") or len(rl.get("groups") or []),
+            "bucket_count": summary.get("bucket_count") or len(buckets),
         }
     except CodexAuthError:
         return {"error": _tr(lang,
@@ -445,13 +479,19 @@ def _fetch_google(lang):
         _ts, data = live_google_quota()
         summary = data.get("summary") or {}
         primary = data.get("primary") or {}
+        primary_model = primary.get("model_id") or " / ".join(
+            item for item in (primary.get("group_display_name"), primary.get("display_name")) if item
+        )
         return {
             "daily_left": summary.get("remaining_percent"),
             "daily_reset": summary.get("reset_time"),
             "bucket_count": summary.get("bucket_count", 0),
-            "primary_model": primary.get("model_id"),
+            "group_count": summary.get("group_count"),
+            "primary_model": primary_model,
             "buckets": data.get("buckets") or [],
-            "source": "oauth live",
+            "quota_groups": data.get("quota_groups") or [],
+            "antigravity": data.get("antigravity"),
+            "source": data.get("source") or "oauth live",
         }
     except GoogleQuotaAuthError as e:
         return {"error": str(e)}
@@ -461,6 +501,42 @@ def _fetch_google(lang):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
         return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fetch_gemini_app(lang):
+    import socket, urllib.error
+    try:
+        _ts, data = live_gemini_app_usage()
+        summary = data.get("summary") or {}
+        return {
+            "left": summary.get("remaining_percent"),
+            "used": summary.get("used_percent"),
+            "reset": summary.get("reset_time"),
+            "reset_text": summary.get("reset_text"),
+            "bucket_count": summary.get("bucket_count", 0),
+            "model_count": summary.get("model_count", 0),
+            "available": data.get("available"),
+            "unavailable_reason": data.get("unavailable_reason"),
+            "buckets": data.get("buckets") or [],
+            "models": data.get("models") or [],
+            "source": data.get("source") or "gemini.google.com/usage",
+            "final_url": data.get("final_url"),
+        }
+    except GeminiAppUsageError as e:
+        return {"error": str(e)}
+    except (socket.timeout, TimeoutError):
+        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+    except urllib.error.URLError:
+        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fetch_llm_api(lang):
+    try:
+        return live_llm_api_balances(cache_ttl_seconds=300)
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -599,6 +675,31 @@ def _set_bar_with_batteries(app, items):
     btn.setTitle_("")
     btn.setAttributedTitle_(_render_attributed_title(items))
 
+
+def _set_bar_icon(app):
+    """系统栏只放一个 template icon；额度细节交给浮窗。"""
+    btn = _status_button(app)
+    if btn is None:
+        app.title = "AI"
+        return
+    img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_("gauge.with.dots.needle.67percent", "AI Limit")
+    if img is None:
+        img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_("gauge", "AI Limit")
+    if img is None:
+        btn.setImage_(None)
+        btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_(""))
+        btn.setTitle_("AI")
+        return
+    cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        14, AppKit.NSFontWeightSemibold
+    )
+    img = img.imageWithSymbolConfiguration_(cfg) or img
+    img.setTemplate_(True)
+    btn.setTitle_("")
+    btn.setAttributedTitle_(AppKit.NSAttributedString.alloc().initWithString_(""))
+    btn.setImage_(img)
+    btn.setImagePosition_(getattr(AppKit, "NSImageOnly", 1))
+
 def _noop(_):
     """无副作用 callback，仅用于让 macOS 把无动作菜单项也按常规文字色渲染。
     AppKit 会把 NSMenuItem.target=nil 的项自动灰化，setEnabled_(True) 也救不了；
@@ -622,6 +723,76 @@ def _detail_text(mode, pct, reset, lang):
         return f"  {mode}\t{pct:>3}% left   \t↻ {reset}"
     return f"  {mode}\t{pct:>3}% 剩余\t↻ {reset}"
 
+
+def _appkit_color(hex_color, alpha=1.0):
+    hex_color = hex_color.lstrip("#")
+    red = int(hex_color[0:2], 16) / 255
+    green = int(hex_color[2:4], 16) / 255
+    blue = int(hex_color[4:6], 16) / 255
+    return AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(red, green, blue, alpha)
+
+
+def _window_style_mask(*names):
+    style = 0
+    for name in names:
+        style |= getattr(AppKit, f"NSWindowStyleMask{name}", getattr(AppKit, f"NS{name}WindowMask", 0))
+    return style
+
+
+def _fmt_widget_pct(value, lang="zh", remaining=True):
+    if value is None:
+        return "?"
+    label = _tr(lang, "剩余", "left") if remaining else _tr(lang, "已用", "used")
+    try:
+        value = int(round(float(value)))
+    except Exception:
+        return f"{label} {value}%"
+    return f"{label} {value}%"
+
+
+def _fmt_widget_reset_epoch_or_iso(value, lang="zh"):
+    if not value:
+        return "?"
+    if isinstance(value, (int, float)) or str(value).isdigit():
+        return _fmt_reset_epoch(value, lang)
+    formatted = _fmt_reset_iso(value, lang)
+    return str(value) if formatted == "?" else formatted
+
+
+def _short_widget_error(value):
+    text = str(value or "")
+    return text if len(text) <= 86 else text[:83] + "..."
+
+
+def _widget_pct_value(value, default=0):
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except Exception:
+        return default
+
+
+def _widget_risk_color(pct):
+    pct = _widget_pct_value(pct)
+    if pct <= 5:
+        return "#fb7185"
+    if pct <= 20:
+        return "#fbbf24"
+    return "#4ade80"
+
+
+def _widget_risk_tone(pct):
+    pct = _widget_pct_value(pct)
+    if pct <= 5:
+        return "#3f1d25", "#7f1d1d", "#fecdd3", "exclamationmark.triangle.fill"
+    if pct <= 20:
+        return "#3a2c16", "#854d0e", "#fde68a", "exclamationmark.circle.fill"
+    return "#143320", "#166534", "#bbf7d0", "checkmark.circle.fill"
+
+
+def _short_widget_name(value, limit=38):
+    text = str(value or "?")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
 # ── 主 App ────────────────────────────────────────────────────────────────────
 
 class AiLimitApp(rumps.App):
@@ -632,6 +803,11 @@ class AiLimitApp(rumps.App):
         self._codex  = None
         self._deepseek = None
         self._google = None
+        self._gemini = None
+        self._llm_api = None
+        self._widget_panel = None
+        self._widget_content = None
+        self._widget_last_layout_size = None
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
@@ -653,6 +829,9 @@ class AiLimitApp(rumps.App):
         self._codex_source = _inert(rumps.MenuItem("  source  …"))
         self._codex_5h     = _inert(rumps.MenuItem("  5h  …"))
         self._codex_7d     = _inert(rumps.MenuItem("  7d  …"))
+        self._codex_bucket_items = [
+            _inert(rumps.MenuItem("  bucket  …")) for _ in range(8)
+        ]
 
         self._deepseek_header  = _inert(rumps.MenuItem("DeepSeek"))
         self._deepseek_source  = _inert(rumps.MenuItem("  source  …"))
@@ -667,15 +846,23 @@ class AiLimitApp(rumps.App):
             _inert(rumps.MenuItem("  bucket  …")) for _ in range(8)
         ]
 
+        self._gemini_header    = _inert(rumps.MenuItem("Gemini App"))
+        self._gemini_source    = _inert(rumps.MenuItem("  source  …"))
+        self._gemini_main      = _inert(rumps.MenuItem("  quota  …"))
+        self._gemini_detail    = _inert(rumps.MenuItem("  detail  …"))
+        self._gemini_items = [
+            _inert(rumps.MenuItem("  item  …")) for _ in range(8)
+        ]
+
         # 上次刷新（次要信息，刻意灰色）
         self._last_refresh = _disable(rumps.MenuItem("…"))
 
-        # 菜单栏显示子菜单
+        # 默认窗口子菜单
         self._mode_5h = rumps.MenuItem("5 小时" if lang == "zh" else "5 hours",
                                        callback=self._set_mode_5h)
         self._mode_7d = rumps.MenuItem("7 天" if lang == "zh" else "7 days",
                                        callback=self._set_mode_7d)
-        mode_label = "菜单栏显示" if lang == "zh" else "Menu bar display"
+        mode_label = "默认窗口" if lang == "zh" else "Default window"
         self._mode_menu = rumps.MenuItem(mode_label)
         self._mode_menu.add(self._mode_5h)
         self._mode_menu.add(self._mode_7d)
@@ -693,12 +880,16 @@ class AiLimitApp(rumps.App):
         self._svc_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_codex)
         self._svc_deepseek = rumps.MenuItem("DeepSeek",  callback=self._toggle_deepseek)
         self._svc_google = rumps.MenuItem("Google", callback=self._toggle_google)
+        self._svc_gemini = rumps.MenuItem("Gemini App", callback=self._toggle_gemini)
+        self._svc_llm_api = rumps.MenuItem("LLM API", callback=self._toggle_llm_api)
         svc_label = "监控服务" if lang == "zh" else "Services"
         self._svc_menu = rumps.MenuItem(svc_label)
         self._svc_menu.add(self._svc_claude)
         self._svc_menu.add(self._svc_codex)
         self._svc_menu.add(self._svc_deepseek)
         self._svc_menu.add(self._svc_google)
+        self._svc_menu.add(self._svc_gemini)
+        self._svc_menu.add(self._svc_llm_api)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -711,6 +902,10 @@ class AiLimitApp(rumps.App):
         self._refresh_item = rumps.MenuItem(
             "立即刷新" if lang == "zh" else "Refresh now",
             callback=self._force_refresh,
+        )
+        self._widget_item = rumps.MenuItem(
+            "打开独立额度浮窗" if lang == "zh" else "Open quota widget",
+            callback=self._toggle_widget,
         )
         self._codex_dash = rumps.MenuItem(
             "打开 CodeX 分析页" if lang == "zh" else "Open CodeX analytics",
@@ -728,6 +923,10 @@ class AiLimitApp(rumps.App):
             "打开 Google 配额说明页" if lang == "zh" else "Open Google quota docs",
             callback=lambda _: webbrowser.open(_GOOGLE_QUOTA_DOCS_URL),
         )
+        self._gemini_dash = rumps.MenuItem(
+            "打开 Gemini App 用量页" if lang == "zh" else "Open Gemini App usage",
+            callback=lambda _: webbrowser.open(_GEMINI_APP_USAGE_URL),
+        )
 
         # 项目信息子菜单
         about_label = f"项目信息（ai-limit {__version__}）" if lang == "zh" else f"Project (ai-limit {__version__})"
@@ -740,13 +939,13 @@ class AiLimitApp(rumps.App):
             f"版本：ai-limit {__version__}" if lang == "zh" else f"Version: ai-limit {__version__}"
         ))
         self._about_scope  = _disable(rumps.MenuItem(
-            "监控：Claude / CodeX / DeepSeek / Google" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google"
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / LLM API" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / LLM API"
         ))
         self._about_surfaces = _disable(rumps.MenuItem(
             "界面：菜单栏 / CLI / daemon" if lang == "zh" else "Surfaces: menu bar / CLI / daemon"
         ))
         self._about_status = _disable(rumps.MenuItem(
-            "状态：当前版本已接入 Google 配额" if lang == "zh" else "Status: current build includes Google quota"
+            "状态：当前版本已接入 Google、Gemini App 与 LLM API 配额" if lang == "zh" else "Status: current build includes Google, Gemini App, and LLM API quota"
         ))
         self._about_menu.add(self._about_repo)
         self._about_menu.add(self._about_ver)
@@ -761,39 +960,19 @@ class AiLimitApp(rumps.App):
         )
 
         self.menu = [
-            self._claude_header,
-            self._claude_source,
-            self._claude_5h,
-            self._claude_7d,
-            None,
-            self._codex_header,
-            self._codex_source,
-            self._codex_5h,
-            self._codex_7d,
-            None,
-            self._deepseek_header,
-            self._deepseek_source,
-            self._deepseek_main,
-            self._deepseek_detail,
-            None,
-            self._google_header,
-            self._google_source,
-            self._google_main,
-            self._google_detail,
-            *self._google_bucket_items,
-            None,
-            self._last_refresh,
+            self._widget_item,
+            self._refresh_item,
             None,
             self._mode_menu,
             self._lang_menu,
             self._svc_menu,
             self._login_item,
             None,
-            self._refresh_item,
             self._codex_dash,
             self._claude_dash,
             self._deepseek_dash,
             self._google_dash,
+            self._gemini_dash,
             None,
             self._about_menu,
             None,
@@ -821,6 +1000,7 @@ class AiLimitApp(rumps.App):
     def _init_render(self, sender):
         """启动后立即用缓存重画 + 后台拉一次最新数据。"""
         self._refresh_from_cache()
+        self._show_widget_if_enabled()
         self._kick_background_fetch()
         sender.stop()
 
@@ -828,6 +1008,16 @@ class AiLimitApp(rumps.App):
     def _auto_refresh(self, _):
         """每 60s 后台拉一次。"""
         self._kick_background_fetch()
+
+    @rumps.timer(0.35)
+    def _widget_resize_tick(self, _):
+        """浮窗尺寸变化时重排 dashboard；不触发任何网络刷新。"""
+        if not self._widget_is_visible() or self._widget_panel is None:
+            return
+        size = self._widget_panel.contentView().bounds().size
+        current = (int(size.width), int(size.height))
+        if self._widget_last_layout_size != current:
+            self._render_widget()
 
     @rumps.timer(0.4)
     def _apply_pending(self, _):
@@ -842,7 +1032,7 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is None:
             return
-        claude, codex, deepseek, google = pending
+        claude, codex, deepseek, google, gemini, llm_api = pending
         if claude is not None:
             self._claude = claude
         if codex is not None:
@@ -851,9 +1041,19 @@ class AiLimitApp(rumps.App):
             self._deepseek = deepseek
         if google is not None:
             self._google = google
+        if gemini is not None:
+            self._gemini = gemini
+        if llm_api is not None:
+            self._llm_api = llm_api
         _save_cache(
             self._claude,
-            {"codex": self._codex, "deepseek": self._deepseek, "google": self._google},
+            {
+                "codex": self._codex,
+                "deepseek": self._deepseek,
+                "google": self._google,
+                "gemini": self._gemini,
+                "llm_api": self._llm_api,
+            },
         )
         self._render()
 
@@ -863,10 +1063,16 @@ class AiLimitApp(rumps.App):
         codex = None
         deepseek = None
         google = None
-        if isinstance(cached, dict) and ("codex" in cached or "deepseek" in cached or "google" in cached):
+        gemini = None
+        llm_api = None
+        if isinstance(cached, dict) and (
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "llm_api" in cached
+        ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             google = cached.get("google")
+            gemini = cached.get("gemini")
+            llm_api = cached.get("llm_api")
         else:
             codex = cached
         # 不按 services 过滤——内存里保留两份数据，UI 显示由 _render 控
@@ -878,6 +1084,10 @@ class AiLimitApp(rumps.App):
             self._deepseek = deepseek
         if google is not None:
             self._google = google
+        if gemini is not None:
+            self._gemini = gemini
+        if llm_api is not None:
+            self._llm_api = llm_api
         self._render()
 
     def _kick_background_fetch(self):
@@ -893,8 +1103,10 @@ class AiLimitApp(rumps.App):
         codex  = _fetch_codex(lang)  if "codex"  in services else None
         deepseek = _fetch_deepseek(lang) if "deepseek" in services else None
         google = _fetch_google(lang) if "google" in services else None
+        gemini = _fetch_gemini_app(lang) if "gemini" in services else None
+        llm_api = _fetch_llm_api(lang) if "llm_api" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google)
+            self._pending = (claude, codex, deepseek, google, gemini, llm_api)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -904,45 +1116,17 @@ class AiLimitApp(rumps.App):
         show_codex  = "codex"  in services
         show_deepseek = "deepseek" in services
         show_google = "google" in services
+        show_gemini = "gemini" in services
+        show_llm_api = "llm_api" in services
         claude = self._claude or {}
         codex  = self._codex  or {}
         deepseek = self._deepseek or {}
         google = self._google or {}
+        gemini = self._gemini or {}
+        llm_api = self._llm_api or {}
 
-        # 菜单栏标题保持紧凑，避免 4 个服务同时显示时把系统状态项挤掉。
-        bar_items = []
-        if show_claude:
-            if "error" in claude:
-                bar_items.append((_status_service_label("claude"), 0, "percent", True))
-            elif claude:
-                pct = claude["5h_left"] if mode == "5h" else claude["7d_left"]
-                bar_items.append((_status_service_label("claude"), pct, "percent", False))
-        if show_codex:
-            if "error" in codex:
-                bar_items.append((_status_service_label("codex"), 0, "percent", True))
-            elif codex:
-                pct = codex["5h_left"] if mode == "5h" else codex["7d_left"]
-                bar_items.append((_status_service_label("codex"), pct, "percent", False))
-        if show_deepseek:
-            if "error" in deepseek:
-                bar_items.append((_status_service_label("deepseek"), "", "text", True))
-            elif deepseek:
-                primary = deepseek.get("primary") or {}
-                bar_items.append((_status_service_label("deepseek"), _fmt_balance_compact(primary), "text", False))
-        if show_google:
-            if "error" in google:
-                bar_items.append((_status_service_label("google"), 0, "percent", True))
-            elif google and google.get("daily_left") is not None:
-                bar_items.append((_status_service_label("google"), google["daily_left"], "percent", False))
-        try:
-            _set_bar_with_batteries(self, bar_items)
-        except Exception:
-            # SF Symbol 不可用时（很老的 macOS）回退到 ▰▱ 文字版
-            parts = [
-                f"{lbl} ⚠️" if err else (f"{lbl} {value}% {_native_bar(value)}" if kind == "percent" else f"{lbl} {value}")
-                for lbl, value, kind, err in bar_items
-            ]
-            _set_bar_title(self, "  ".join(parts) if parts else "ai-limit ⚠️")
+        # 系统栏只显示入口图标；额度细节交给独立浮窗。
+        _set_bar_icon(self)
 
         # Claude 区块 —— 服务被关时整段隐藏
         self._claude_header._menuitem.setHidden_(not show_claude)
@@ -969,12 +1153,16 @@ class AiLimitApp(rumps.App):
         self._codex_source._menuitem.setHidden_(not show_codex)
         self._codex_5h._menuitem.setHidden_(not show_codex)
         self._codex_7d._menuitem.setHidden_(not show_codex)
+        for item in self._codex_bucket_items:
+            item._menuitem.setHidden_(not show_codex)
         if show_codex:
             if "error" in codex:
                 self._codex_header.title = "CodeX ⚠️"
                 self._codex_source.title = _tr(lang, "  来源：browser error", "  Source: browser error")
                 self._codex_5h.title = f"  {codex['error'][:60]}"
                 self._codex_7d._menuitem.setHidden_(True)
+                for item in self._codex_bucket_items:
+                    item._menuitem.setHidden_(True)
             elif codex:
                 plan = _fmt_plan(codex.get("plan"), lang)
                 self._codex_header.title = f"CodeX{plan}"
@@ -989,6 +1177,27 @@ class AiLimitApp(rumps.App):
                 x7_reset = _fmt_reset_epoch(codex["7d_reset"], lang)
                 self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)
                 self._codex_7d.title = _detail_text("7d", codex["7d_left"], x7_reset, lang)
+                buckets = codex.get("buckets") or []
+                for index, item in enumerate(self._codex_bucket_items):
+                    if index >= len(buckets):
+                        item._menuitem.setHidden_(True)
+                        continue
+                    bucket = buckets[index]
+                    group_name = bucket.get("group_display_name") or ""
+                    bucket_name = bucket.get("display_name") or bucket.get("window") or "limit"
+                    pct = bucket.get("remaining_percent")
+                    if pct is None and bucket.get("used_percent") is not None:
+                        pct = max(0, min(100, int(round(100 - bucket.get("used_percent")))))
+                    pct_text = "?" if pct is None else f"{pct}%"
+                    reset = bucket.get("resets_at") or bucket.get("reset_time")
+                    reset_text = _fmt_reset_epoch(reset, lang) if reset else "?"
+                    label = f"{group_name} / {bucket_name}" if group_name else bucket_name
+                    item.title = _tr(
+                        lang,
+                        f"  {index + 1}. {label}\t{pct_text} 剩余\t↻ {reset_text}",
+                        f"  {index + 1}. {label}\t{pct_text} left\t↻ {reset_text}",
+                    )
+                    item._menuitem.setHidden_(False)
 
         self._deepseek_header._menuitem.setHidden_(not show_deepseek)
         self._deepseek_source._menuitem.setHidden_(not show_deepseek)
@@ -1031,21 +1240,47 @@ class AiLimitApp(rumps.App):
                 daily_text = "?" if daily is None else f"{daily}%"
                 primary_model = google.get("primary_model") or "?"
                 bucket_count = google.get("bucket_count", 0)
-                self._google_header.title = "Google"
-                self._google_source.title = _tr(lang, "  来源：antigravity oauth live", "  Source: antigravity oauth live")
-                self._google_main.title = _tr(lang, f"  日额度\t{daily_text}\t{primary_model}", f"  Daily\t{daily_text}\t{primary_model}")
-                reset = google.get("daily_reset")
-                reset_text = _fmt_reset_iso(reset, lang) if reset else "?"
-                self._google_detail.title = _tr(lang, f"  重置 {reset_text}  |  {bucket_count} 个模型桶", f"  Reset {reset_text}  |  {bucket_count} buckets")
+                quota_groups = google.get("quota_groups") or []
+                any_empty = any(
+                    bucket.get("remaining_percent") == 0 and not bucket.get("disabled")
+                    for bucket in (google.get("buckets") or [])
+                )
+                self._google_header.title = "Google ⚠️" if any_empty else "Google"
+                source = google.get("source") or ""
+                source_label = "agy usage fallback" if "agy /usage" in source else ("antigravity app live" if quota_groups else "antigravity fallback")
+                self._google_source.title = _tr(lang, f"  来源：{source_label}", f"  Source: {source_label}")
+                if quota_groups:
+                    group_count = google.get("group_count") or len(quota_groups)
+                    self._google_main.title = _tr(
+                        lang,
+                        f"  Model Quota\t{daily_text}\t{primary_model}",
+                        f"  Model Quota\t{daily_text}\t{primary_model}",
+                    )
+                    self._google_detail.title = _tr(
+                        lang,
+                        f"  {group_count} 个额度组  |  {bucket_count} 个窗口",
+                        f"  {group_count} groups  |  {bucket_count} windows",
+                    )
+                else:
+                    self._google_main.title = _tr(lang, f"  日额度\t{daily_text}\t{primary_model}", f"  Daily\t{daily_text}\t{primary_model}")
+                    self._google_detail.title = _tr(lang, f"  fallback  |  {bucket_count} 项", f"  fallback  |  {bucket_count} items")
                 buckets = google.get("buckets") or []
                 for index, item in enumerate(self._google_bucket_items):
                     if index >= len(buckets):
                         item._menuitem.setHidden_(True)
                         continue
                     bucket = buckets[index]
-                    model_id = bucket.get("model_id") or "?"
+                    model_id = " / ".join(
+                        value for value in (
+                            bucket.get("group_display_name"),
+                            bucket.get("display_name") or bucket.get("model_id"),
+                        )
+                        if value
+                    ) or "?"
                     pct = bucket.get("remaining_percent")
                     pct_text = "?" if pct is None else f"{pct}%"
+                    if bucket.get("disabled"):
+                        pct_text += _tr(lang, " 不适用", " disabled")
                     reset = bucket.get("reset_time")
                     reset_bucket_text = _fmt_reset_iso(reset, lang) if reset else "?"
                     item.title = _tr(
@@ -1055,9 +1290,1046 @@ class AiLimitApp(rumps.App):
                     )
                     item._menuitem.setHidden_(False)
 
+        self._gemini_header._menuitem.setHidden_(not show_gemini)
+        self._gemini_source._menuitem.setHidden_(not show_gemini)
+        self._gemini_main._menuitem.setHidden_(not show_gemini)
+        self._gemini_detail._menuitem.setHidden_(not show_gemini)
+        for item in self._gemini_items:
+            item._menuitem.setHidden_(not show_gemini)
+        if show_gemini:
+            if "error" in gemini:
+                self._gemini_header.title = "Gemini App ⚠️"
+                self._gemini_source.title = _tr(lang, "  来源：browser cookie error", "  Source: browser cookie error")
+                self._gemini_main.title = f"  {gemini['error'][:60]}"
+                self._gemini_detail._menuitem.setHidden_(True)
+                for item in self._gemini_items:
+                    item._menuitem.setHidden_(True)
+            elif gemini:
+                left = gemini.get("left")
+                used = gemini.get("used")
+                left_text = "?" if left is None else f"{left}%"
+                used_text = "?" if used is None else f"{used}%"
+                unavailable = gemini.get("unavailable_reason")
+                self._gemini_header.title = "Gemini App ⚠️" if unavailable else "Gemini App"
+                self._gemini_source.title = _tr(lang, "  来源：gemini app live", "  Source: gemini app live")
+                self._gemini_main.title = _tr(
+                    lang,
+                    f"  Usage\t已用 {used_text}\t剩余 {left_text}",
+                    f"  Usage\tused {used_text}\tleft {left_text}",
+                )
+                self._gemini_detail.title = _tr(
+                    lang,
+                    f"  {gemini.get('bucket_count', 0)} 个额度项  |  {gemini.get('model_count', 0)} 个模型入口",
+                    f"  {gemini.get('bucket_count', 0)} quota items  |  {gemini.get('model_count', 0)} model entries",
+                )
+                rows = []
+                if unavailable:
+                    rows.append({"text": _tr(lang, f"页面未返回额度：{unavailable}", f"Usage page did not return quota: {unavailable}")})
+                for bucket in gemini.get("buckets") or []:
+                    pct = bucket.get("remaining_percent")
+                    used_pct = bucket.get("used_percent")
+                    pct_text = "?" if pct is None else f"剩余 {pct}%"
+                    if used_pct is not None:
+                        pct_text = _tr(lang, f"已用 {used_pct}% / {pct_text}", f"used {used_pct}% / left {pct}%")
+                    reset = bucket.get("reset_time")
+                    reset_text = _fmt_reset_iso(reset, lang) if reset else (bucket.get("reset_text") or "?")
+                    rows.append({"text": f"{bucket.get('display_name') or 'Gemini App quota'}\t{pct_text}\t↻ {reset_text}"})
+                if not rows:
+                    for model in (gemini.get("models") or [])[:8]:
+                        name = model.get("display_name") or model.get("label") or model.get("model_id") or "?"
+                        desc = model.get("description") or ""
+                        rows.append({"text": f"{name}\t{desc}"})
+                for index, item in enumerate(self._gemini_items):
+                    if index >= len(rows):
+                        item._menuitem.setHidden_(True)
+                        continue
+                    item.title = f"  {index + 1}. {rows[index]['text']}"
+                    item._menuitem.setHidden_(False)
+
         # 刷新时间
+        self._apply_compact_menu(
+            show_claude,
+            show_codex,
+            show_deepseek,
+            show_google,
+            show_gemini,
+            claude,
+            codex,
+            deepseek,
+            google,
+            gemini,
+        )
         now = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
         self._last_refresh.title = _tr(lang, f"上次刷新: {now}", f"Last refresh: {now}")
+        self._render_widget()
+
+    def _apply_compact_menu(self, show_claude, show_codex, show_deepseek, show_google, show_gemini, claude, codex, deepseek, google, gemini):
+        # The floating widget is now the quota surface. Keep the menu as an
+        # action panel only, so it does not repeat incomplete group summaries.
+        self._last_refresh._menuitem.setHidden_(True)
+        self._claude_header._menuitem.setHidden_(True)
+        self._claude_source._menuitem.setHidden_(True)
+        self._claude_5h._menuitem.setHidden_(True)
+        self._claude_7d._menuitem.setHidden_(True)
+
+        self._codex_header._menuitem.setHidden_(True)
+        self._codex_source._menuitem.setHidden_(True)
+        self._codex_5h._menuitem.setHidden_(True)
+        self._codex_7d._menuitem.setHidden_(True)
+        for item in self._codex_bucket_items:
+            item._menuitem.setHidden_(True)
+
+        self._deepseek_header._menuitem.setHidden_(True)
+        self._deepseek_source._menuitem.setHidden_(True)
+        self._deepseek_main._menuitem.setHidden_(True)
+        self._deepseek_detail._menuitem.setHidden_(True)
+
+        self._google_header._menuitem.setHidden_(True)
+        self._google_source._menuitem.setHidden_(True)
+        self._google_main._menuitem.setHidden_(True)
+        self._google_detail._menuitem.setHidden_(True)
+        for item in self._google_bucket_items:
+            item._menuitem.setHidden_(True)
+
+        self._gemini_header._menuitem.setHidden_(True)
+        self._gemini_source._menuitem.setHidden_(True)
+        self._gemini_main._menuitem.setHidden_(True)
+        self._gemini_detail._menuitem.setHidden_(True)
+        for item in self._gemini_items:
+            item._menuitem.setHidden_(True)
+
+    def _worst_menu_entry(self, entries):
+        entries = entries or []
+        return min(entries, key=lambda item: item.get("pct", 100)) if entries else None
+
+    def _compact_menu_summary(self, entry, count=None):
+        lang = self._state["lang"]
+        if not entry:
+            return _tr(lang, "  等待数据", "  Waiting")
+        count_text = ""
+        if count:
+            count_text = _tr(lang, f"  ·  {count} 项", f"  ·  {count} items")
+        name = _short_widget_name(entry.get("name"), 34)
+        return _tr(lang, f"  最低 {entry.get('pct', '?')}%  ·  {name}{count_text}", f"  lowest {entry.get('pct', '?')}%  ·  {name}{count_text}")
+
+    # ── 桌面浮窗 ────────────────────────────────────────────────────────────
+
+    def _toggle_widget(self, _):
+        self._ensure_widget()
+        if self._widget_panel.isVisible():
+            self._widget_panel.orderOut_(None)
+            self._state["widget"] = False
+        else:
+            self._render_widget()
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            self._widget_panel.makeKeyAndOrderFront_(None)
+            self._state["widget"] = True
+        _save_state(self._state)
+        self._update_widget_item()
+
+    def _show_widget_if_enabled(self):
+        if not self._state.get("widget", True):
+            self._update_widget_item()
+            return
+        self._ensure_widget()
+        self._render_widget()
+        self._widget_panel.makeKeyAndOrderFront_(None)
+        self._update_widget_item()
+
+    def _ensure_widget(self):
+        if self._widget_panel is not None:
+            return
+
+        width, height = 760, 680
+        screen = AppKit.NSScreen.mainScreen()
+        visible = screen.visibleFrame() if screen is not None else AppKit.NSMakeRect(80, 80, width, height)
+        origin_x = visible.origin.x + max(24, visible.size.width - width - 28)
+        origin_y = visible.origin.y + max(24, visible.size.height - height - 36)
+        frame = AppKit.NSMakeRect(origin_x, origin_y, width, height)
+        style = _window_style_mask("Titled", "Closable", "Resizable", "Miniaturizable")
+        panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            style,
+            AppKit.NSBackingStoreBuffered,
+            False,
+        )
+        panel.setTitle_("AI Limit")
+        panel.setReleasedWhenClosed_(False)
+        panel.setHidesOnDeactivate_(False)
+        panel.setLevel_(getattr(AppKit, "NSFloatingWindowLevel", 3))
+        panel.setMinSize_(AppKit.NSMakeSize(520, 520))
+        panel.setBackgroundColor_(_appkit_color("#171717", 0.96))
+        panel.setOpaque_(False)
+
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
+        scroll.setAutoresizingMask_(getattr(AppKit, "NSViewWidthSizable", 2) | getattr(AppKit, "NSViewHeightSizable", 16))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setBorderType_(getattr(AppKit, "NSNoBorder", 0))
+        scroll.setDrawsBackground_(False)
+
+        content = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
+        content.setWantsLayer_(True)
+        content.layer().setBackgroundColor_(_appkit_color("#171717", 0.96).CGColor())
+
+        scroll.setDocumentView_(content)
+        panel.setContentView_(scroll)
+        self._widget_panel = panel
+        self._widget_content = content
+        self._render_widget()
+        self._update_widget_item()
+
+    def _widget_is_visible(self):
+        return bool(self._widget_panel is not None and self._widget_panel.isVisible())
+
+    def _update_widget_item(self):
+        if not hasattr(self, "_widget_item"):
+            return
+        lang = self._state["lang"]
+        self._widget_item.title = _tr(
+            lang,
+            "隐藏独立额度浮窗" if self._widget_is_visible() else "打开独立额度浮窗",
+            "Hide quota widget" if self._widget_is_visible() else "Open quota widget",
+        )
+
+    def _render_widget(self):
+        if self._widget_content is not None:
+            self._render_widget_dashboard()
+        self._update_widget_item()
+
+    def _clear_widget_content(self):
+        for view in list(self._widget_content.subviews()):
+            view.removeFromSuperview()
+
+    def _widget_add_box(self, x, y, w, h, color, radius=10, border=None):
+        view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, w, h))
+        view.setWantsLayer_(True)
+        layer = view.layer()
+        layer.setBackgroundColor_(_appkit_color(color).CGColor())
+        layer.setCornerRadius_(radius)
+        if border:
+            layer.setBorderColor_(_appkit_color(border).CGColor())
+            layer.setBorderWidth_(1)
+        self._widget_content.addSubview_(view)
+        return view
+
+    def _widget_add_label(self, text, x, y, w, h, size=12, weight="regular", color="#f4f4f5", align="left"):
+        label = AppKit.NSTextField.labelWithString_(str(text))
+        label.setFrame_(AppKit.NSMakeRect(x, y, w, h))
+        label.setTextColor_(_appkit_color(color))
+        font_weight = AppKit.NSFontWeightRegular
+        if weight == "bold":
+            font_weight = AppKit.NSFontWeightBold
+        elif weight == "medium":
+            font_weight = AppKit.NSFontWeightMedium
+        label.setFont_(AppKit.NSFont.systemFontOfSize_weight_(size, font_weight))
+        label.setLineBreakMode_(getattr(AppKit, "NSLineBreakByTruncatingTail", 4))
+        if align == "right":
+            label.setAlignment_(getattr(AppKit, "NSTextAlignmentRight", 2))
+        elif align == "center":
+            label.setAlignment_(getattr(AppKit, "NSTextAlignmentCenter", 1))
+        self._widget_content.addSubview_(label)
+        return label
+
+    def _widget_add_symbol(self, name, x, y, size=18, color="#ffffff"):
+        image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if image is None:
+            return None
+        image.setTemplate_(True)
+        cfg = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, AppKit.NSFontWeightSemibold)
+        image = image.imageWithSymbolConfiguration_(cfg) or image
+        image_view = AppKit.NSImageView.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, size + 4, size + 4))
+        image_view.setImage_(image)
+        if hasattr(image_view, "setContentTintColor_"):
+            image_view.setContentTintColor_(_appkit_color(color))
+        self._widget_content.addSubview_(image_view)
+        return image_view
+
+    def _widget_add_progress(self, x, y, w, h, pct):
+        pct = _widget_pct_value(pct)
+        color = _widget_risk_color(pct)
+        self._widget_add_box(x, y, w, h, "#2b2b2f", radius=h / 2)
+        self._widget_add_box(x, y, max(h, w * pct / 100), h, color, radius=h / 2)
+
+    def _widget_add_ring(self, x, y, size, pct):
+        pct = _widget_pct_value(pct)
+        view = AppKit.NSView.alloc().initWithFrame_(AppKit.NSMakeRect(x, y, size, size))
+        view.setWantsLayer_(True)
+        layer = view.layer()
+
+        center = AppKit.NSMakePoint(size / 2, size / 2)
+        radius = max(2, size / 2 - 3)
+        track_path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(AppKit.NSMakeRect(3, 3, size - 6, size - 6))
+        arc_path = AppKit.NSBezierPath.bezierPath()
+        arc_path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+            center, radius, 90, 90 - 360 * pct / 100, True
+        )
+
+        track = AppKit.CAShapeLayer.layer()
+        track.setPath_(track_path.CGPath())
+        track.setFillColor_(None)
+        track.setStrokeColor_(_appkit_color("#3a3a40").CGColor())
+        track.setLineWidth_(3)
+
+        arc = AppKit.CAShapeLayer.layer()
+        arc.setPath_(arc_path.CGPath())
+        arc.setFillColor_(None)
+        arc.setStrokeColor_(_appkit_color(_widget_risk_color(pct)).CGColor())
+        arc.setLineWidth_(3)
+        if hasattr(arc, "setLineCap_"):
+            arc.setLineCap_("round")
+
+        layer.addSublayer_(track)
+        layer.addSublayer_(arc)
+        self._widget_content.addSubview_(view)
+        return view
+
+    def _render_widget_dashboard(self):
+        lang = self._state["lang"]
+        cards = self._widget_summary_cards()
+        alerts = self._widget_alert_rows()
+        details = self._widget_detail_rows()
+        bounds = self._widget_panel.contentView().bounds() if self._widget_panel is not None else AppKit.NSMakeRect(0, 0, 480, 560)
+        content_w = max(360, int(bounds.size.width))
+        self._widget_last_layout_size = (int(bounds.size.width), int(bounds.size.height))
+        margin = 18
+        gap = 14
+        cols = 3 if content_w >= 960 else (2 if content_w >= 560 else 1)
+        card_w = int((content_w - margin * 2 - gap * (cols - 1)) / cols)
+        card_h = 100
+        card_rows = max(1, (len(cards) + cols - 1) // cols)
+        alerts_h = 0 if not alerts else 36 + min(len(alerts), 5) * 34
+        details_h = 42 + sum(26 if row.get("type") == "section" else (42 if row.get("reset") else 34) for row in details)
+        total_h = max(560, 70 + card_rows * (card_h + 12) + alerts_h + details_h + 34)
+        self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, total_h))
+        self._clear_widget_content()
+
+        def y(top, h):
+            return total_h - top - h
+
+        top = 18
+        self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
+        self._widget_add_label(
+            _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
+            max(margin + 170, content_w - 188),
+            y(top + 3, 20),
+            170,
+            20,
+            size=12,
+            color="#a1a1aa",
+            align="right",
+        )
+        top += 46
+
+        for index, card in enumerate(cards):
+            col = index % cols
+            row = index // cols
+            x = margin + col * (card_w + gap)
+            cy = y(top + row * (card_h + 12), card_h)
+            self._draw_widget_card(card, x, cy, card_w, card_h)
+        top += card_rows * (card_h + 12) + 6
+
+        if alerts:
+            self._widget_add_label(_tr(lang, "需要注意", "Needs attention"), margin, y(top, 22), 180, 22, size=15, weight="bold")
+            top += 30
+            for alert in alerts[:5]:
+                cy = y(top, 28)
+                row_w = content_w - margin * 2
+                self._widget_add_box(margin, cy, row_w, 28, alert["bg"], radius=8, border=alert["border"])
+                self._widget_add_symbol(alert["symbol"], margin + 10, cy + 5, size=14, color=alert["fg"])
+                self._widget_add_label(alert["text"], margin + 34, cy + 5, max(120, row_w - 120), 18, size=12, weight="medium", color=alert["fg"])
+                self._widget_add_label(alert["value"], margin + row_w - 86, cy + 5, 72, 18, size=12, weight="bold", color=alert["fg"], align="right")
+                top += 34
+            top += 10
+
+        self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
+        top += 32
+        value_w = 72
+        progress_w = max(76, min(180, int((content_w - margin * 2) * 0.28)))
+        name_x = margin + 4
+        value_x = content_w - margin - value_w
+        progress_x = value_x - progress_w - 10
+        name_w = max(110, progress_x - name_x - 12)
+        for row in details:
+            if row.get("type") == "section":
+                cy = y(top, 20)
+                self._widget_add_label(row["name"], name_x, cy + 2, 200, 16, size=12, weight="bold", color=row["color"])
+                self._widget_add_box(progress_x, cy + 8, max(40, content_w - progress_x - margin), 1, "#323238", radius=0)
+                top += 26
+                continue
+            row_h = 42 if row.get("reset") else 28
+            cy = y(top, row_h)
+            self._widget_add_label(row["name"], name_x, cy + 8, name_w, 16, size=11, color="#d4d4d8")
+            if row.get("reset"):
+                self._widget_add_label(f"↻ {row['reset']}", name_x, cy - 5, name_w, 14, size=9, color="#8b8b93")
+            self._widget_add_progress(progress_x, cy + 10, progress_w, 8, row["pct"])
+            self._widget_add_label(row["value"], value_x, cy + 5, value_w, 18, size=12, weight="bold", color=row["color"], align="right")
+            top += row_h + 6
+
+    def _draw_widget_card(self, card, x, y, w, h):
+        self._widget_add_box(x, y, w, h, card["bg"], radius=12, border=card["border"])
+        self._widget_add_box(x + 12, y + h - 43, 32, 32, card["accent"], radius=16)
+        self._widget_add_symbol(card["symbol"], x + 18, y + h - 37, size=18, color="#ffffff")
+        self._widget_add_label(card["title"], x + 52, y + h - 31, w - 68, 18, size=12, weight="bold")
+
+        metrics = card.get("metrics") or []
+        if metrics:
+            reset_text = self._card_reset_text(metrics)
+            if reset_text:
+                self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
+            row_x = x + 16
+            row_w = max(120, w - 30)
+            value_w = 44
+            label_w = 28
+            bar_x = row_x + label_w + 6
+            bar_w = max(46, row_w - label_w - value_w - 14)
+            first_y = y + 37
+            for index, metric in enumerate(metrics[:2]):
+                row_y = first_y - index * 21
+                self._widget_add_label(metric["label"], row_x, row_y, label_w, 13, size=10, weight="medium", color="#a1a1aa")
+                self._widget_add_progress(bar_x, row_y + 3, bar_w, 7, metric["pct"])
+                self._widget_add_label(metric["value"], x + w - 14 - value_w, row_y - 3, value_w, 18, size=14, weight="bold", color=metric["color"], align="right")
+        else:
+            self._widget_add_label(card["value"], x + 14, y + 45, w - 28, 22, size=17, weight="bold", color=card["value_color"], align="right")
+            self._widget_add_label(card["subtitle"], x + 14, y + 27, w - 28, 16, size=11, color="#a1a1aa")
+
+    def _widget_summary_cards(self):
+        services = self._state.get("services") or list(_SERVICES)
+        cards = []
+        specs = [
+            ("claude", "Claude", "sparkles", "#7c3aed", self._claude or {}),
+            ("codex", "CodeX", "terminal.fill", "#2563eb", self._codex or {}),
+            ("google", "Antigravity", "globe", "#dc2626", self._google or {}),
+            ("gemini", "Gemini", "sparkles", "#9333ea", self._gemini or {}),
+            ("llm_api", "LLM API", "rectangle.stack.badge.person.crop", "#0f766e", self._llm_api or {}),
+            ("deepseek", "DeepSeek", "dollarsign.circle.fill", "#0891b2", self._deepseek or {}),
+        ]
+        for service, title, symbol, accent, data in specs:
+            if service not in services:
+                continue
+            card = self._widget_card_for_service(service, title, symbol, accent, data)
+            cards.append(card)
+        return cards
+
+    def _widget_card_for_service(self, service, title, symbol, accent, data):
+        lang = self._state["lang"]
+        if data.get("error"):
+            return {
+                "title": title,
+                "symbol": "xmark.octagon.fill",
+                "accent": "#ef4444",
+                "pct": 0,
+                "value": "!",
+                "value_color": "#fecdd3",
+                "subtitle": _short_widget_error(data.get("error")),
+                "bg": "#2a171a",
+                "border": "#7f1d1d",
+            }
+        pct, subtitle, value, metrics = None, _tr(lang, "等待数据", "Waiting"), "…", []
+        if service == "claude" and data:
+            metrics = self._quota_card_metrics([
+                ("5h", data.get("5h_left"), data.get("5h_reset")),
+                (_tr(lang, "1周", "1w"), data.get("7d_left"), data.get("7d_reset")),
+            ])
+            pct = self._metric_floor(metrics)
+        elif service == "codex" and data:
+            five_h, five_h_reset, weekly, weekly_reset = self._codex_balance_summary(data)
+            if five_h is None and weekly is None:
+                five_h, five_h_reset, weekly, weekly_reset = self._window_summary_from_buckets(
+                    data.get("buckets") or [],
+                    data.get("5h_left"),
+                    data.get("5h_reset"),
+                    data.get("7d_left"),
+                    data.get("7d_reset"),
+                )
+            metrics = self._quota_card_metrics([
+                ("5h", five_h, five_h_reset),
+                (_tr(lang, "1周", "1w"), weekly, weekly_reset),
+            ])
+            pct = self._metric_floor(metrics)
+        elif service == "deepseek" and data:
+            primary = data.get("primary") or {}
+            pct = 100 if data.get("available") and _balance_amount(primary) > 0 else 0
+            value = _fmt_balance_compact(primary)
+            subtitle = _tr(lang, "API balance", "API balance")
+        elif service == "google" and data:
+            five_h, five_h_reset, weekly, weekly_reset = self._google_gemini_models_summary(data)
+            if five_h is None and weekly is None:
+                five_h, five_h_reset, weekly, weekly_reset = self._window_summary_from_buckets(
+                    data.get("buckets") or [],
+                    data.get("daily_left"),
+                    data.get("daily_reset"),
+                    data.get("daily_left"),
+                    data.get("daily_reset"),
+                )
+            metrics = self._quota_card_metrics([
+                ("5h", five_h, five_h_reset),
+                (_tr(lang, "1周", "1w"), weekly, weekly_reset),
+            ])
+            pct = self._metric_floor(metrics)
+        elif service == "gemini" and data:
+            current, current_reset, weekly, weekly_reset = self._gemini_card_windows(data)
+            metrics = self._quota_card_metrics([
+                (_tr(lang, "当前", "Now"), current, current_reset),
+                (_tr(lang, "1周", "1w"), weekly, weekly_reset),
+            ])
+            pct = self._metric_floor(metrics)
+        elif service == "llm_api" and data:
+            providers = data.get("providers") or []
+            ready = int(data.get("ready_provider_count") or sum(1 for provider in providers if provider.get("configured")))
+            total = int(data.get("provider_count") or len(providers))
+            warnings = sum(1 for provider in providers if str(provider.get("warning_level")) in {"critical", "warning"})
+            pct = 100 if warnings == 0 and ready == total and total > 0 else (35 if warnings else 70)
+            value = f"{ready}/{total}" if total else "?"
+            subtitle = _tr(lang, f"{warnings} 个余额告警", f"{warnings} balance warnings") if warnings else _tr(lang, "provider 余额", "provider balances")
+
+        pct = _widget_pct_value(pct)
+        value_color = _widget_risk_color(pct)
+        bg, border, _, _ = _widget_risk_tone(pct)
+        if pct > 20:
+            bg, border = "#202124", "#34343a"
+        return {
+            "title": title,
+            "symbol": symbol,
+            "accent": accent,
+            "pct": pct,
+            "value": value,
+            "value_color": value_color,
+            "subtitle": subtitle,
+            "metrics": metrics,
+            "bg": bg,
+            "border": border,
+        }
+
+    def _quota_card_metrics(self, pairs):
+        metrics = []
+        for item in pairs:
+            label = item[0]
+            pct = item[1] if len(item) > 1 else None
+            reset = item[2] if len(item) > 2 else None
+            pct = _widget_pct_value(pct)
+            metrics.append({
+                "label": label,
+                "value": f"{pct}%",
+                "pct": pct,
+                "color": _widget_risk_color(pct),
+                "reset": reset,
+            })
+        return metrics
+
+    def _metric_floor(self, metrics):
+        values = [item["pct"] for item in (metrics or [])]
+        return min(values) if values else None
+
+    def _bucket_remaining(self, bucket):
+        remaining = bucket.get("remaining_percent")
+        if remaining is None and bucket.get("used_percent") is not None:
+            remaining = 100 - float(bucket.get("used_percent"))
+        return _widget_pct_value(remaining)
+
+    def _bucket_reset(self, bucket):
+        return bucket.get("resets_at") or bucket.get("reset_time") or bucket.get("reset_text")
+
+    def _codex_balance_summary(self, data):
+        balance_buckets = [
+            bucket for bucket in data.get("buckets") or []
+            if str(bucket.get("group_display_name") or "").strip().lower() == "balance"
+        ]
+        return self._window_summary_from_buckets(
+            balance_buckets,
+            data.get("5h_left"),
+            data.get("5h_reset"),
+            data.get("7d_left"),
+            data.get("7d_reset"),
+        )
+
+    def _google_gemini_models_summary(self, data):
+        gemini_buckets = [
+            bucket for bucket in data.get("buckets") or []
+            if str(bucket.get("group_display_name") or "").strip().lower() == "gemini models"
+        ]
+        return self._window_summary_from_buckets(
+            gemini_buckets,
+            data.get("daily_left"),
+            data.get("daily_reset"),
+            data.get("daily_left"),
+            data.get("daily_reset"),
+        )
+
+    def _window_summary_from_buckets(self, buckets, fallback_5h=None, fallback_5h_reset=None, fallback_weekly=None, fallback_weekly_reset=None):
+        windows = {"5h": [], "weekly": []}
+        for bucket in buckets or []:
+            if bucket.get("disabled"):
+                continue
+            window = (bucket.get("window") or "").lower()
+            name = " ".join(str(bucket.get(key) or "") for key in ("display_name", "bucket_name", "group_display_name")).lower()
+            entry = (self._bucket_remaining(bucket), self._bucket_reset(bucket))
+            if window == "5h" or "five hour" in name or "5 hour" in name or "5h" in name:
+                windows["5h"].append(entry)
+            elif window == "weekly" or "weekly" in name or "week" in name:
+                windows["weekly"].append(entry)
+        five_h, five_h_reset = min(windows["5h"], key=lambda item: item[0]) if windows["5h"] else (fallback_5h, fallback_5h_reset)
+        weekly, weekly_reset = min(windows["weekly"], key=lambda item: item[0]) if windows["weekly"] else (fallback_weekly, fallback_weekly_reset)
+        return five_h, five_h_reset, weekly, weekly_reset
+
+    def _window_floor_from_buckets(self, buckets, fallback_5h=None, fallback_weekly=None):
+        windows = {"5h": [], "weekly": []}
+        for bucket in buckets or []:
+            if bucket.get("disabled"):
+                continue
+            window = (bucket.get("window") or "").lower()
+            name = " ".join(str(bucket.get(key) or "") for key in ("display_name", "bucket_name", "group_display_name")).lower()
+            if window == "5h" or "five hour" in name or "5 hour" in name or "5h" in name:
+                windows["5h"].append(self._bucket_remaining(bucket))
+            elif window == "weekly" or "weekly" in name or "week" in name:
+                windows["weekly"].append(self._bucket_remaining(bucket))
+        five_h = min(windows["5h"]) if windows["5h"] else fallback_5h
+        weekly = min(windows["weekly"]) if windows["weekly"] else fallback_weekly
+        return five_h, weekly
+
+    def _gemini_card_windows(self, data):
+        current = data.get("left")
+        current_reset = data.get("reset") or data.get("reset_text")
+        weekly = None
+        weekly_reset = None
+        for bucket in data.get("buckets") or []:
+            window = (bucket.get("window") or "").lower()
+            name = (bucket.get("display_name") or "").lower()
+            pct = bucket.get("remaining_percent")
+            reset = bucket.get("reset_time") or bucket.get("reset_text")
+            if window == "current" or "当前" in name or "current" in name:
+                current = pct
+                current_reset = reset
+            elif window == "weekly" or "每周" in name or "weekly" in name:
+                weekly = pct
+                weekly_reset = reset
+        return current, current_reset, weekly, weekly_reset
+
+    def _card_reset_text(self, metrics):
+        parts = []
+        for metric in (metrics or [])[:2]:
+            reset = metric.get("reset")
+            if reset is None:
+                continue
+            formatted = _fmt_widget_reset_epoch_or_iso(reset, self._state["lang"])
+            if not formatted or formatted == "?":
+                formatted = str(reset)
+            parts.append(f"{metric.get('label')} ↻ {formatted}")
+        return " · ".join(parts)
+
+    def _format_detail_reset(self, reset):
+        if reset is None:
+            return None
+        formatted = _fmt_widget_reset_epoch_or_iso(reset, self._state["lang"])
+        if not formatted or formatted == "?":
+            formatted = str(reset)
+        return formatted
+
+    def _llm_api_provider_name(self, provider):
+        aliases = {
+            "openrouter": "OpenRoute",
+            "openai": "OpenAI",
+            "xai": "xAI",
+            "moonshot": "Kimi",
+            "dashscope": "Qwen",
+            "ark": "Doubao",
+            "deepseek": "DeepSeek",
+        }
+        profile_id = str(provider.get("provider_profile_id") or "")
+        return aliases.get(profile_id) or provider.get("display_name") or profile_id or "LLM"
+
+    def _llm_api_provider_metric(self, provider):
+        balance = provider.get("balance") if isinstance(provider.get("balance"), dict) else {}
+        amount = balance.get("amount")
+        currency = balance.get("currency")
+        if str(balance.get("status")) == "ok" and isinstance(amount, (int, float)):
+            return f"{amount:.2f} {currency}" if currency else f"{amount:.2f}"
+        if not provider.get("configured"):
+            return _tr(self._state["lang"], "未配置", "missing")
+        status = str(balance.get("status") or "")
+        if status == "missing_credentials":
+            return _tr(self._state["lang"], "缺账务密钥", "no billing key")
+        if status == "error":
+            return _tr(self._state["lang"], "余额失败", "balance error")
+        if status == "unsupported":
+            return _tr(self._state["lang"], "无接口", "unsupported")
+        return _tr(self._state["lang"], "待同步", "syncing")
+
+    def _llm_api_provider_health_pct(self, provider):
+        if not provider.get("configured"):
+            return 0
+        level = str(provider.get("warning_level") or "normal")
+        if level == "critical":
+            return 10
+        if level == "warning":
+            return 35
+        if level == "info":
+            return 70
+        return 100
+
+    def _widget_alert_rows(self):
+        rows = []
+        for item in self._widget_detail_rows(include_disabled=False):
+            if item.get("type") == "section":
+                continue
+            pct = item["pct"]
+            if pct > 20:
+                continue
+            bg, border, fg, symbol = _widget_risk_tone(pct)
+            rows.append({
+                "text": _short_widget_name(item["name"], 42),
+                "value": item["value"],
+                "bg": bg,
+                "border": border,
+                "fg": fg,
+                "symbol": symbol,
+                "pct": pct,
+            })
+        rows.sort(key=lambda item: item["pct"])
+        return rows
+
+    def _compact_bar_items(self):
+        error_services = []
+        for service, data in (
+            ("claude", self._claude or {}),
+            ("codex", self._codex or {}),
+            ("deepseek", self._deepseek or {}),
+            ("google", self._google or {}),
+            ("gemini", self._gemini or {}),
+            ("llm_api", self._llm_api or {}),
+        ):
+            if service in (self._state.get("services") or list(_SERVICES)) and data.get("error"):
+                error_services.append(service)
+        if error_services:
+            return [("AI", 0, "percent", True)]
+
+        rows = [
+            row for row in self._widget_detail_rows(include_disabled=False)
+            if row.get("type") != "section" and not row.get("disabled")
+        ]
+        if not rows:
+            return [("AI", "OK", "text", False)]
+        worst = min(rows, key=lambda row: row["pct"])
+        if worst["pct"] <= 20:
+            label = self._compact_bar_label(worst["name"])
+            return [(label, worst["pct"], "percent", False)]
+        return [("AI", "OK", "text", False)]
+
+    def _compact_bar_label(self, name):
+        text = str(name or "").lower()
+        if text.startswith("5h") or text.startswith("weekly"):
+            return "C"
+        if "balance" in text or "spark" in text or "codex" in text:
+            return "X"
+        if "gemini models" in text or "claude and gpt" in text:
+            return "AG"
+        if "current" in text or "usage" in text or "每周" in text or "当前" in text:
+            return "M"
+        if "kimi" in text or "moonshot" in text:
+            return "KM"
+        if "doubao" in text or "ark" in text:
+            return "DB"
+        if "qwen" in text or "dashscope" in text:
+            return "QW"
+        if "openroute" in text or "openrouter" in text:
+            return "OR"
+        if "xai" in text:
+            return "xAI"
+        if "deepseek" in text:
+            return "D"
+        return "AI"
+
+    def _widget_detail_rows(self, include_disabled=True):
+        rows = []
+        services = self._state.get("services") or list(_SERVICES)
+
+        def section(name, color):
+            rows.append({"type": "section", "name": name, "color": color})
+
+        def append(name, pct, disabled=False, value=None, reset=None):
+            if disabled and not include_disabled:
+                return
+            pct = _widget_pct_value(pct)
+            suffix = " off" if disabled and self._state["lang"] == "en" else (" 不适用" if disabled else "")
+            rows.append({
+                "name": _short_widget_name(name, 44),
+                "pct": pct,
+                "value": f"{value}{suffix}" if value is not None else f"{pct}%{suffix}",
+                "reset": self._format_detail_reset(reset),
+                "color": "#71717a" if disabled else _widget_risk_color(pct),
+                "disabled": disabled,
+            })
+
+        if "claude" in services and self._claude and not self._claude.get("error"):
+            section("Claude", "#c4b5fd")
+            append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
+            append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
+        if "codex" in services:
+            entries = self._widget_codex_entries()
+            if entries:
+                section("CodeX", "#93c5fd")
+                for item in entries:
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
+        if "deepseek" in services and self._deepseek and not self._deepseek.get("error"):
+            primary = self._deepseek.get("primary") or {}
+            section("DeepSeek", "#67e8f9")
+            append(_fmt_balance_compact(primary), 100 if _balance_amount(primary) > 0 else 0)
+        if "google" in services:
+            entries = self._widget_google_entries()
+            if entries:
+                section("Antigravity", "#fca5a5")
+                for item in entries:
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
+        if "gemini" in services:
+            entries = self._widget_gemini_entries()
+            if entries:
+                section("Gemini", "#d8b4fe")
+                for item in entries:
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
+        if "llm_api" in services:
+            entries = self._widget_llm_api_entries()
+            if entries:
+                section("LLM API", "#5eead4")
+                for item in entries:
+                    append(item["name"], item["pct"], item.get("disabled", False), item.get("value"))
+        return rows[:34]
+
+    def _widget_codex_entries(self):
+        data = self._codex or {}
+        if data.get("error"):
+            return []
+        entries = []
+        buckets = data.get("buckets") or []
+        if buckets:
+            for bucket in buckets:
+                remaining = bucket.get("remaining_percent")
+                if remaining is None and bucket.get("used_percent") is not None:
+                    remaining = 100 - float(bucket.get("used_percent"))
+                name = " / ".join(
+                    value for value in (
+                        bucket.get("group_display_name"),
+                        bucket.get("display_name") or bucket.get("window"),
+                    )
+                    if value
+                )
+                entries.append({
+                    "name": name or "limit",
+                    "pct": _widget_pct_value(remaining),
+                    "reset": self._bucket_reset(bucket),
+                })
+        elif data:
+            entries.append({"name": "Balance / 5h", "pct": _widget_pct_value(data.get("5h_left")), "reset": data.get("5h_reset")})
+            entries.append({"name": "Balance / weekly", "pct": _widget_pct_value(data.get("7d_left")), "reset": data.get("7d_reset")})
+        return entries
+
+    def _widget_google_entries(self):
+        data = self._google or {}
+        if data.get("error"):
+            return []
+        entries = []
+        buckets = data.get("buckets") or []
+        for bucket in buckets:
+            name = " / ".join(
+                value for value in (
+                    bucket.get("group_display_name"),
+                    bucket.get("display_name") or bucket.get("model_id"),
+                )
+                if value
+            )
+            entries.append({
+                "name": name or "limit",
+                "pct": _widget_pct_value(bucket.get("remaining_percent")),
+                "reset": self._bucket_reset(bucket),
+                "disabled": bool(bucket.get("disabled")),
+            })
+        if not entries and data:
+            entries.append({"name": data.get("primary_model") or "daily", "pct": _widget_pct_value(data.get("daily_left")), "reset": data.get("daily_reset")})
+        return entries
+
+    def _widget_gemini_entries(self):
+        data = self._gemini or {}
+        if data.get("error"):
+            return []
+        entries = []
+        buckets = data.get("buckets") or []
+        for bucket in buckets:
+            entries.append({
+                "name": bucket.get("display_name") or "Gemini App quota",
+                "pct": _widget_pct_value(bucket.get("remaining_percent")),
+                "reset": self._bucket_reset(bucket),
+                "disabled": bool(bucket.get("disabled")),
+            })
+        if not entries and data:
+            entries.append({"name": "Usage", "pct": _widget_pct_value(data.get("left")), "reset": data.get("reset") or data.get("reset_text")})
+        return entries
+
+    def _widget_llm_api_entries(self):
+        data = self._llm_api or {}
+        if data.get("error"):
+            return []
+        entries = []
+        for provider in data.get("providers") or []:
+            entries.append({
+                "name": self._llm_api_provider_name(provider),
+                "pct": self._llm_api_provider_health_pct(provider),
+                "value": self._llm_api_provider_metric(provider),
+                "disabled": not bool(provider.get("configured")),
+            })
+        return entries
+
+    def _widget_text_body(self):
+        lang = self._state["lang"]
+        services = self._state.get("services") or list(_SERVICES)
+        lines = [
+            "AI Limit",
+            _tr(
+                lang,
+                f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}    菜单栏模式 {self._state['global']}",
+                f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}    Menu mode {self._state['global']}",
+            ),
+            "",
+        ]
+        if "claude" in services:
+            lines.extend(self._widget_claude_lines())
+        if "codex" in services:
+            lines.extend(self._widget_codex_lines())
+        if "deepseek" in services:
+            lines.extend(self._widget_deepseek_lines())
+        if "google" in services:
+            lines.extend(self._widget_google_lines())
+        if "gemini" in services:
+            lines.extend(self._widget_gemini_lines())
+        if "llm_api" in services:
+            lines.extend(self._widget_llm_api_lines())
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _widget_section(self, title, data, source=None):
+        lines = [title]
+        if data.get("error"):
+            lines.append(f"  ! {_short_widget_error(data.get('error'))}")
+        elif source:
+            lines.append(_tr(self._state["lang"], f"  来源: {source}", f"  Source: {source}"))
+        return lines
+
+    def _widget_quota_row(self, name, remaining=None, used=None, reset=None, disabled=False):
+        lang = self._state["lang"]
+        parts = [f"  {name}"]
+        if remaining is not None:
+            parts.append(_fmt_widget_pct(remaining, lang, True))
+        elif used is not None:
+            parts.append(_fmt_widget_pct(used, lang, False))
+        else:
+            parts.append("?")
+        if used is not None and remaining is not None:
+            parts.append(_fmt_widget_pct(used, lang, False))
+        if disabled:
+            parts.append(_tr(lang, "不适用", "disabled"))
+        if reset:
+            parts.append(f"↻ {_fmt_widget_reset_epoch_or_iso(reset, lang)}")
+        return "    ".join(parts)
+
+    def _widget_claude_lines(self):
+        lang = self._state["lang"]
+        data = self._claude or {}
+        lines = self._widget_section("Claude Code", data, data.get("source") or "browser live")
+        if data and not data.get("error"):
+            plan = data.get("plan")
+            if plan:
+                lines.append(f"  Plan: {plan}")
+            lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
+            lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
+        lines.append("")
+        return lines
+
+    def _widget_codex_lines(self):
+        lang = self._state["lang"]
+        data = self._codex or {}
+        lines = self._widget_section("CodeX", data, data.get("source") or "")
+        if data and not data.get("error"):
+            buckets = data.get("buckets") or []
+            if buckets:
+                current_group = None
+                for bucket in buckets:
+                    group = bucket.get("group_display_name") or _tr(lang, "未分组", "Ungrouped")
+                    if group != current_group:
+                        lines.append(f"  {group}")
+                        current_group = group
+                    name = bucket.get("display_name") or bucket.get("window") or "limit"
+                    remaining = bucket.get("remaining_percent")
+                    if remaining is None and bucket.get("used_percent") is not None:
+                        remaining = max(0, min(100, int(round(100 - bucket.get("used_percent")))))
+                    lines.append(self._widget_quota_row(name, remaining, bucket.get("used_percent"), bucket.get("resets_at") or bucket.get("reset_time")))
+            else:
+                lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
+                lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
+        lines.append("")
+        return lines
+
+    def _widget_deepseek_lines(self):
+        lang = self._state["lang"]
+        data = self._deepseek or {}
+        lines = self._widget_section("DeepSeek", data, data.get("source") or "api key live")
+        if data and not data.get("error"):
+            balances = data.get("balances") or []
+            if not balances and data.get("primary"):
+                balances = [data.get("primary")]
+            for balance in balances:
+                currency = balance.get("currency", "USD")
+                total = _fmt_balance_short(balance)
+                granted = fmt_money(balance.get("granted_balance", "0"), currency)
+                topped = fmt_money(balance.get("topped_up_balance", "0"), currency)
+                lines.append(_tr(lang, f"  {currency}: {total}    赠送 {granted} / 充值 {topped}", f"  {currency}: {total}    granted {granted} / topped {topped}"))
+        lines.append("")
+        return lines
+
+    def _widget_google_lines(self):
+        lang = self._state["lang"]
+        data = self._google or {}
+        lines = self._widget_section("Google / Antigravity", data, data.get("source") or "")
+        if data and not data.get("error"):
+            buckets = data.get("buckets") or []
+            current_group = None
+            if buckets:
+                for bucket in buckets:
+                    group = bucket.get("group_display_name") or _tr(lang, "未分组", "Ungrouped")
+                    if group != current_group:
+                        lines.append(f"  {group}")
+                        current_group = group
+                    name = bucket.get("display_name") or bucket.get("model_id") or "limit"
+                    lines.append(self._widget_quota_row(name, bucket.get("remaining_percent"), bucket.get("used_percent"), bucket.get("reset_time"), bucket.get("disabled")))
+            else:
+                lines.append(self._widget_quota_row(data.get("primary_model") or "daily", data.get("daily_left"), reset=data.get("daily_reset")))
+        lines.append("")
+        return lines
+
+    def _widget_gemini_lines(self):
+        lang = self._state["lang"]
+        data = self._gemini or {}
+        lines = self._widget_section("Gemini App", data, data.get("source") or "gemini.google.com/usage")
+        if data and not data.get("error"):
+            if data.get("unavailable_reason"):
+                lines.append(f"  ! {_short_widget_error(data.get('unavailable_reason'))}")
+            buckets = data.get("buckets") or []
+            if buckets:
+                for bucket in buckets:
+                    name = bucket.get("display_name") or "Gemini App quota"
+                    reset = bucket.get("reset_time") or bucket.get("reset_text")
+                    lines.append(self._widget_quota_row(name, bucket.get("remaining_percent"), bucket.get("used_percent"), reset))
+            else:
+                lines.append(self._widget_quota_row("Usage", data.get("left"), data.get("used"), data.get("reset") or data.get("reset_text")))
+        lines.append("")
+        return lines
+
+    def _widget_llm_api_lines(self):
+        data = self._llm_api or {}
+        lines = self._widget_section("LLM API", data, data.get("source") or "ai-limit native llm balance adapters")
+        if data and not data.get("error"):
+            ready = data.get("ready_provider_count")
+            total = data.get("provider_count")
+            lines.append(_tr(self._state["lang"], f"  Provider: {ready}/{total}", f"  Providers: {ready}/{total}"))
+            for provider in data.get("providers") or []:
+                lines.append(f"  {self._llm_api_provider_name(provider)}    {self._llm_api_provider_metric(provider)}")
+        lines.append("")
+        return lines
 
     # ── 模式 / 语言切换 ──────────────────────────────────────────────────────
 
@@ -1079,8 +2351,8 @@ class AiLimitApp(rumps.App):
         self._mode_5h.title = ("✓ " if mode == "5h" else "  ") + _tr(lang, "5 小时", "5 hours")
         self._mode_7d.title = ("✓ " if mode == "7d" else "  ") + _tr(lang, "7 天", "7 days")
         self._mode_menu.title = _tr(lang,
-            f"菜单栏显示（{_tr(lang, '5 小时', '5 hours') if mode == '5h' else _tr(lang, '7 天', '7 days')}）",
-            f"Menu bar display ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
+            f"默认窗口（{_tr(lang, '5 小时', '5 hours') if mode == '5h' else _tr(lang, '7 天', '7 days')}）",
+            f"Default window ({_tr(lang, '5 hours', '5 hours') if mode == '5h' else '7 days'})",
         )
 
     def _set_lang_zh(self, _):
@@ -1110,6 +2382,7 @@ class AiLimitApp(rumps.App):
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
+        self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")
         self._about_repo.title = _tr(lang, "打开项目仓库", "Open project repository")
         self._about_menu.title  = _tr(lang,
             f"项目信息（ai-limit {__version__}）",
@@ -1120,18 +2393,19 @@ class AiLimitApp(rumps.App):
             f"Version: ai-limit {__version__}",
         )
         self._about_scope.title = _tr(lang,
-            "监控：Claude / CodeX / DeepSeek / Google",
-            "Monitors: Claude / CodeX / DeepSeek / Google",
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / LLM API",
+            "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / LLM API",
         )
         self._about_surfaces.title = _tr(lang,
             "界面：菜单栏 / CLI / daemon",
             "Surfaces: menu bar / CLI / daemon",
         )
         self._about_status.title = _tr(lang,
-            "状态：当前版本已接入 Google 配额",
-            "Status: current build includes Google quota",
+            "状态：当前版本已接入 Google、Gemini App 与 LLM API 配额",
+            "Status: current build includes Google, Gemini App, and LLM API quota",
         )
         self._update_login_item_check()
+        self._update_widget_item()
         self._quit_item.title    = _tr(lang, "退出", "Quit")
 
     def _update_lang_checks(self):
@@ -1156,6 +2430,12 @@ class AiLimitApp(rumps.App):
 
     def _toggle_google(self, _):
         self._toggle_service("google")
+
+    def _toggle_gemini(self, _):
+        self._toggle_service("gemini")
+
+    def _toggle_llm_api(self, _):
+        self._toggle_service("llm_api")
 
     def _toggle_service(self, service):
         svc = list(self._state.get("services") or list(_SERVICES))
@@ -1192,6 +2472,8 @@ class AiLimitApp(rumps.App):
         self._svc_codex.title  = ("✓ " if "codex"  in svc else "  ") + "CodeX"
         self._svc_deepseek.title = ("✓ " if "deepseek" in svc else "  ") + "DeepSeek"
         self._svc_google.title = ("✓ " if "google" in svc else "  ") + "Google"
+        self._svc_gemini.title = ("✓ " if "gemini" in svc else "  ") + "Gemini App"
+        self._svc_llm_api.title = ("✓ " if "llm_api" in svc else "  ") + "LLM API"
         enabled = []
         if "claude" in svc:
             enabled.append("Claude Code")
@@ -1201,6 +2483,10 @@ class AiLimitApp(rumps.App):
             enabled.append("DeepSeek")
         if "google" in svc:
             enabled.append("Google")
+        if "gemini" in svc:
+            enabled.append("Gemini App")
+        if "llm_api" in svc:
+            enabled.append("LLM API")
         summary = _tr(lang, "全部", "All") if len(svc) == len(_SERVICES) else ", ".join(enabled)
         self._svc_menu.title = _tr(lang, f"监控服务（{summary}）", f"Services ({summary})")
 

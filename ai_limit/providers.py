@@ -3,13 +3,17 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import select
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 
 from ai_limit.i18n import t
 
@@ -17,12 +21,32 @@ CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 GOOGLE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
+GEMINI_APP_BATCHEXECUTE_URL = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
+GEMINI_APP_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "gemini-app-usage.json"
+GEMINI_APP_USAGE_CACHE_TTL_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC", 30 * 60))
+GEMINI_APP_PROFILE_COPY_DIR = pathlib.Path("/tmp/ai-limit-gemini-profile-copy")
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
 GEMINI_OAUTH_PATH = pathlib.Path.home() / ".gemini" / "oauth_creds.json"
 GEMINI_PROJECT_PATH = pathlib.Path.home() / ".gemini" / "config" / "projects" / "default-cli-project.json"
+ANTIGRAVITY_LOG_DIR = pathlib.Path.home() / ".gemini" / "antigravity-cli" / "log"
+ANTIGRAVITY_QUOTA_LOG_MAX_AGE_SEC = 36 * 60 * 60
+ANTIGRAVITY_CLI_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "antigravity-cli-usage.json"
+ANTIGRAVITY_CLI_USAGE_CACHE_TTL_SEC = 5 * 60
+ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC = 18
+ANTIGRAVITY_DEFAULT_MODELS = (
+    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.5 Flash (High)",
+    "Gemini 3.5 Flash (Low)",
+    "Gemini 3.1 Pro (Low)",
+    "Gemini 3.1 Pro (High)",
+    "Claude Sonnet 4.6 (Thinking)",
+    "Claude Opus 4.6 (Thinking)",
+    "GPT-OSS 120B (Medium)",
+)
 DEEPSEEK_KEY_PATHS = (
     pathlib.Path.home() / ".deepseek_api_key",
     pathlib.Path.home() / ".config" / "ai-limit" / "deepseek_api_key",
@@ -36,6 +60,17 @@ GOOGLE_MODEL_PRIORITY = (
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash-lite",
+)
+ANTIGRAVITY_MODEL_LABEL_RE = re.compile(r'Propagating selected model override to backend: label="([^"]+)"')
+ANTIGRAVITY_QUOTA_RE = re.compile(
+    r"RESOURCE_EXHAUSTED \(code 429\): Individual quota reached\..*?Resets in "
+    r"(?P<duration>(?:(?:\d+)h)?(?:(?:\d+)m)?(?:(?:\d+)s)?)"
+)
+ANTIGRAVITY_LOG_TIME_RE = re.compile(r"^[A-Z](?P<month>\d{2})(?P<day>\d{2}) (?P<time>\d{2}:\d{2}:\d{2})\.(?P<micro>\d{1,6})")
+ANTIGRAVITY_LOG_FILE_RE = re.compile(r"cli-(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})_")
+ANTIGRAVITY_CSRF_RE = re.compile(r"--csrf_token\s+(\S+)")
+ANSI_RE = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~])"
 )
 
 
@@ -68,6 +103,10 @@ class GoogleQuotaError(Exception):
 
 
 class GoogleQuotaAuthError(GoogleQuotaError):
+    pass
+
+
+class GeminiAppUsageError(Exception):
     pass
 
 
@@ -450,27 +489,87 @@ def _get_chatgpt_access_token(cookie_header: str, timeout: int) -> str:
 
 
 def _normalize_web_rate_limits(data: dict) -> dict:
-    rate_limit = data.get("rate_limit") or {}
+    def window_kind(window_minutes):
+        if window_minutes is None:
+            return None
+        if window_minutes <= 5 * 60:
+            return "5h"
+        if window_minutes >= 7 * 24 * 60:
+            return "weekly"
+        return f"{window_minutes}m"
 
     def window(window_data):
         if not window_data:
             return None
         window_seconds = window_data.get("limit_window_seconds")
+        window_minutes = window_seconds // 60 if window_seconds else None
+        used_percent = window_data.get("used_percent", 0) or 0
         return {
-            "used_percent": window_data.get("used_percent", 0),
-            "window_minutes": window_seconds // 60 if window_seconds else None,
+            "used_percent": used_percent,
+            "remaining_percent": max(0, min(100, int(round(100 - used_percent)))),
+            "window_minutes": window_minutes,
+            "window": window_kind(window_minutes),
             "resets_at": window_data.get("reset_at"),
+            "reset_time": window_data.get("reset_at"),
         }
 
-    return {
+    def group_from_rate_limit(name: str, raw_rate_limit: dict, *, default_group: bool = False) -> dict:
+        primary = window((raw_rate_limit or {}).get("primary_window"))
+        secondary = window((raw_rate_limit or {}).get("secondary_window"))
+        buckets = []
+        for label, bucket in (
+            ("5 hour usage limit", primary),
+            ("Weekly usage limit", secondary),
+        ):
+            if not bucket:
+                continue
+            buckets.append(
+                {
+                    **bucket,
+                    "display_name": label,
+                    "group_display_name": name,
+                    "default_group": default_group,
+                }
+            )
+        return {
+            "display_name": name,
+            "default_group": default_group,
+            "allowed": bool((raw_rate_limit or {}).get("allowed", True)),
+            "limit_reached": bool((raw_rate_limit or {}).get("limit_reached", False)),
+            "buckets": buckets,
+        }
+
+    rate_limit = data.get("rate_limit") or {}
+    groups = [group_from_rate_limit("Balance", rate_limit, default_group=True)]
+    for item in data.get("additional_rate_limits") or []:
+        groups.append(
+            group_from_rate_limit(
+                item.get("limit_name") or item.get("metered_feature") or "Additional Codex limit",
+                item.get("rate_limit") or {},
+            )
+        )
+    buckets = [bucket for group in groups for bucket in group.get("buckets") or []]
+    five_hour = [bucket for bucket in buckets if bucket.get("window") == "5h"]
+    weekly = [bucket for bucket in buckets if bucket.get("window") == "weekly"]
+
+    normalized = {
         "limit_id": None,
         "limit_name": None,
         "primary": window(rate_limit.get("primary_window")),
         "secondary": window(rate_limit.get("secondary_window")),
+        "groups": groups,
+        "buckets": buckets,
+        "summary": {
+            "5h_remaining_percent": min((bucket["remaining_percent"] for bucket in five_hour), default=None),
+            "weekly_remaining_percent": min((bucket["remaining_percent"] for bucket in weekly), default=None),
+            "bucket_count": len(buckets),
+            "group_count": len(groups),
+        },
         "credits": data.get("credits"),
         "plan_type": data.get("plan_type"),
         "rate_limit_reached_type": rate_limit.get("rate_limit_reached_type"),
     }
+    return normalized
 
 
 def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
@@ -760,6 +859,531 @@ def _google_bucket_priority(bucket: dict) -> tuple[int, float, str]:
     return rank, -remaining, model_id
 
 
+def _iso_local(dt: datetime.datetime) -> str:
+    return dt.astimezone().isoformat()
+
+
+def _parse_antigravity_duration(value: str) -> datetime.timedelta | None:
+    match = re.fullmatch(r"(?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>\d+)s)?", value or "")
+    if not match or not any(match.groupdict().values()):
+        return None
+    return datetime.timedelta(
+        hours=int(match.group("h") or 0),
+        minutes=int(match.group("m") or 0),
+        seconds=int(match.group("s") or 0),
+    )
+
+
+def _antigravity_log_year(path: pathlib.Path) -> int:
+    match = ANTIGRAVITY_LOG_FILE_RE.search(path.name)
+    if match:
+        try:
+            return int(match.group("year"))
+        except ValueError:
+            pass
+    return datetime.datetime.now().year
+
+
+def _parse_antigravity_log_time(line: str, path: pathlib.Path, tzinfo) -> datetime.datetime | None:
+    match = ANTIGRAVITY_LOG_TIME_RE.match(line)
+    if not match:
+        return None
+    try:
+        micro = match.group("micro")[:6].ljust(6, "0")
+        return datetime.datetime(
+            _antigravity_log_year(path),
+            int(match.group("month")),
+            int(match.group("day")),
+            *[int(part) for part in match.group("time").split(":")],
+            int(micro),
+            tzinfo=tzinfo,
+        )
+    except ValueError:
+        return None
+
+
+def latest_antigravity_quota_limit() -> dict | None:
+    """Return the newest still-active Antigravity CLI quota block found in agy logs."""
+    try:
+        log_paths = sorted(
+            ANTIGRAVITY_LOG_DIR.glob("cli-*.log"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    now = datetime.datetime.now().astimezone()
+    latest = None
+    for path in log_paths[:60]:
+        try:
+            if now.timestamp() - path.stat().st_mtime > ANTIGRAVITY_QUOTA_LOG_MAX_AGE_SEC:
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        current_model = None
+        for line in lines:
+            model_match = ANTIGRAVITY_MODEL_LABEL_RE.search(line)
+            if model_match:
+                current_model = model_match.group(1)
+
+            quota_match = ANTIGRAVITY_QUOTA_RE.search(line)
+            if not quota_match:
+                continue
+            event_time = _parse_antigravity_log_time(line, path, now.tzinfo)
+            reset_delta = _parse_antigravity_duration(quota_match.group("duration"))
+            if event_time is None or reset_delta is None:
+                continue
+            reset_time = event_time + reset_delta
+            if reset_time <= now:
+                continue
+            if latest and event_time <= latest["_event_dt"]:
+                continue
+            latest = {
+                "_event_dt": event_time,
+                "limited": True,
+                "source": "antigravity-cli-log",
+                "model_label": current_model,
+                "reset_in": quota_match.group("duration"),
+                "reset_time": _iso_local(reset_time),
+                "event_time": _iso_local(event_time),
+                "log_path": str(path),
+            }
+
+    if not latest:
+        return None
+    latest.pop("_event_dt", None)
+    return latest
+
+
+def list_antigravity_models(timeout: int = 8) -> list[str]:
+    agy_path = shutil.which("agy")
+    if not agy_path:
+        return list(ANTIGRAVITY_DEFAULT_MODELS)
+    try:
+        result = subprocess.run(
+            [agy_path, "models"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return list(ANTIGRAVITY_DEFAULT_MODELS)
+    if result.returncode != 0:
+        return list(ANTIGRAVITY_DEFAULT_MODELS)
+    models = []
+    for line in result.stdout.splitlines():
+        model = line.strip()
+        if model and model not in models:
+            models.append(model)
+    return models or list(ANTIGRAVITY_DEFAULT_MODELS)
+
+
+def _antigravity_devtools_port() -> int | None:
+    try:
+        raw = (pathlib.Path.home() / "Library" / "Application Support" / "Antigravity" / "DevToolsActivePort").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        return None
+    first = raw.splitlines()[0].strip() if raw.splitlines() else ""
+    try:
+        return int(first)
+    except ValueError:
+        return None
+
+
+def _antigravity_sidecar_origin(timeout: int) -> str | None:
+    import urllib.error
+    import urllib.request
+
+    port = _antigravity_devtools_port()
+    if not port:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=timeout) as response:
+            targets = json.loads(response.read())
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    for target in targets:
+        url = str(target.get("url") or "")
+        if "/sidecars" not in url:
+            continue
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "https" and parsed.hostname in ("127.0.0.1", "localhost") and parsed.port:
+            return f"https://127.0.0.1:{parsed.port}"
+    return None
+
+
+def _antigravity_csrf_token() -> str | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-ax", "-o", "args="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        if "language_server" not in line or "--override_ide_name antigravity" not in line:
+            continue
+        match = ANTIGRAVITY_CSRF_RE.search(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _grpc_web_json_body(payload: dict) -> bytes:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return b"\x00" + len(raw).to_bytes(4, "big") + raw
+
+
+def _parse_grpc_web_json(raw: bytes) -> dict:
+    offset = 0
+    while offset + 5 <= len(raw):
+        frame_type = raw[offset]
+        frame_len = int.from_bytes(raw[offset + 1 : offset + 5], "big")
+        offset += 5
+        frame = raw[offset : offset + frame_len]
+        offset += frame_len
+        if frame_type == 0:
+            return json.loads(frame)
+    raise GoogleQuotaError("empty grpc-web quota response")
+
+
+def _antigravity_quota_bucket(raw_bucket: dict) -> dict:
+    remaining_fraction = raw_bucket.get("remainingFraction")
+    try:
+        remaining_fraction = float(remaining_fraction) if remaining_fraction is not None else None
+    except (TypeError, ValueError):
+        remaining_fraction = None
+    remaining_percent = None
+    if remaining_fraction is not None:
+        remaining_percent = max(0, min(100, int(round(remaining_fraction * 100))))
+    return {
+        "bucket_id": raw_bucket.get("bucketId"),
+        "display_name": raw_bucket.get("displayName"),
+        "description": raw_bucket.get("description"),
+        "window": raw_bucket.get("window"),
+        "remaining_fraction": remaining_fraction,
+        "remaining_percent": remaining_percent,
+        "reset_time": raw_bucket.get("resetTime"),
+        "disabled": bool(raw_bucket.get("disabled")),
+    }
+
+
+def _normalize_antigravity_quota_summary(data: dict, source: str = "Antigravity app RetrieveUserQuotaSummary") -> dict:
+    response = data.get("response") or data
+    groups = []
+    flat_buckets = []
+    for raw_group in response.get("groups") or []:
+        buckets = [_antigravity_quota_bucket(bucket) for bucket in raw_group.get("buckets") or []]
+        group = {
+            "display_name": raw_group.get("displayName"),
+            "description": raw_group.get("description"),
+            "buckets": buckets,
+        }
+        groups.append(group)
+        for bucket in buckets:
+            flat_buckets.append({**bucket, "group_display_name": group["display_name"]})
+
+    active_buckets = [bucket for bucket in flat_buckets if not bucket.get("disabled")]
+    percent_values = [bucket["remaining_percent"] for bucket in active_buckets if bucket.get("remaining_percent") is not None]
+    primary = None
+    if active_buckets:
+        primary = min(
+            active_buckets,
+            key=lambda bucket: (
+                101 if bucket.get("remaining_percent") is None else bucket.get("remaining_percent"),
+                bucket.get("group_display_name") or "",
+                bucket.get("display_name") or "",
+            ),
+        )
+    return {
+        "source": source,
+        "quota_groups": groups,
+        "primary": primary,
+        "buckets": flat_buckets,
+        "summary": {
+            "remaining_percent": min(percent_values) if percent_values else None,
+            "reset_time": (primary or {}).get("reset_time"),
+            "bucket_count": len(flat_buckets),
+            "group_count": len(groups),
+            "quota_state": "live",
+            "description": response.get("description"),
+        },
+    }
+
+
+def live_antigravity_quota_summary(timeout: int = 8) -> dict:
+    import urllib.error
+    import urllib.request
+
+    origin = _antigravity_sidecar_origin(timeout)
+    csrf_token = _antigravity_csrf_token()
+    if not origin or not csrf_token:
+        raise GoogleQuotaError("Antigravity app quota endpoint unavailable")
+    req = urllib.request.Request(
+        f"{origin}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+        data=_grpc_web_json_body({"forceRefresh": True}),
+        headers={
+            "Content-Type": "application/grpc-web+json",
+            "Accept": "application/grpc-web+json",
+            "x-grpc-web": "1",
+            "x-codeium-csrf-token": csrf_token,
+            "x-user-agent": "CONNECT_ES_USER_AGENT",
+            "Referer": f"{origin}/sidecars?settingsOpen=true&settingsScreen=Models",
+            "User-Agent": "ai-limit/0.3.5 Antigravity",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=timeout,
+            context=ssl._create_unverified_context(),
+        ) as response:
+            body = response.read()
+    except Exception as exc:
+        raise GoogleQuotaError(str(exc)) from exc
+    return _normalize_antigravity_quota_summary(_parse_grpc_web_json(body))
+
+
+def _load_antigravity_cli_usage_cache() -> dict | None:
+    try:
+        raw = json.loads(ANTIGRAVITY_CLI_USAGE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    cached_at = raw.get("cached_at")
+    try:
+        age = time.time() - float(cached_at)
+    except (TypeError, ValueError):
+        return None
+    if age < 0 or age > ANTIGRAVITY_CLI_USAGE_CACHE_TTL_SEC:
+        return None
+    data = raw.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _save_antigravity_cli_usage_cache(data: dict):
+    try:
+        ANTIGRAVITY_CLI_USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        ANTIGRAVITY_CLI_USAGE_CACHE.write_text(
+            json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _strip_terminal_control(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\r", "\n")
+    return "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+
+
+def _duration_text_to_reset_time(value: str, now: datetime.datetime) -> str | None:
+    hours = minutes = seconds = 0
+    for amount, unit in re.findall(r"(\d+)\s*([hms])", value or ""):
+        if unit == "h":
+            hours += int(amount)
+        elif unit == "m":
+            minutes += int(amount)
+        elif unit == "s":
+            seconds += int(amount)
+    if hours == minutes == seconds == 0:
+        return None
+    return _iso_local(now + datetime.timedelta(hours=hours, minutes=minutes, seconds=seconds))
+
+
+def _parse_antigravity_cli_usage_text(text: str) -> dict:
+    clean = _strip_terminal_control(text)
+    upper = clean.upper()
+    if "MODELS & QUOTA" not in upper:
+        raise GoogleQuotaError("agy /usage output did not contain quota data")
+
+    group_defs = [
+        ("Gemini Models", "GEMINI MODELS"),
+        ("Claude and GPT models", "CLAUDE AND GPT MODELS"),
+    ]
+    groups = []
+    now = datetime.datetime.now().astimezone()
+    for index, (display_name, marker) in enumerate(group_defs):
+        start = upper.find(marker)
+        if start < 0:
+            continue
+        next_starts = [upper.find(next_marker, start + len(marker)) for _, next_marker in group_defs[index + 1 :]]
+        next_starts = [pos for pos in next_starts if pos >= 0]
+        end = min(next_starts) if next_starts else len(clean)
+        section = clean[start:end]
+        lines = [line.strip() for line in section.splitlines() if line.strip()]
+        description = next((line for line in lines if line.startswith("Models within this group:")), None)
+        buckets = []
+        for bucket_name, window in (("Weekly Limit", "weekly"), ("Five Hour Limit", "5h")):
+            bucket_start = section.rfind(bucket_name)
+            if bucket_start < 0:
+                continue
+            next_bucket_positions = [
+                section.find(other, bucket_start + len(bucket_name))
+                for other in ("Weekly Limit", "Five Hour Limit")
+                if other != bucket_name
+            ]
+            next_bucket_positions = [pos for pos in next_bucket_positions if pos >= 0]
+            bucket_end = min(next_bucket_positions) if next_bucket_positions else len(section)
+            bucket_text = section[bucket_start:bucket_end]
+            percent_match = re.search(r"(\d+(?:\.\d+)?)%", bucket_text)
+            remaining_percent = int(round(float(percent_match.group(1)))) if percent_match else None
+            duration_match = re.search(r"Refreshes in\s+((?:\d+\s*h)?\s*(?:\d+\s*m)?\s*(?:\d+\s*s)?)", bucket_text)
+            disabled = "Disabled:" in bucket_text
+            buckets.append(
+                {
+                    "bucket_id": f"{display_name.lower().replace(' ', '-').replace('&', 'and')}-{window}",
+                    "display_name": bucket_name,
+                    "description": " ".join(bucket_text.split()),
+                    "window": window,
+                    "remaining_fraction": remaining_percent / 100 if remaining_percent is not None else None,
+                    "remaining_percent": remaining_percent,
+                    "reset_time": _duration_text_to_reset_time(duration_match.group(1), now) if duration_match else None,
+                    "disabled": disabled,
+                }
+            )
+        groups.append({"display_name": display_name, "description": description, "buckets": buckets})
+
+    if not groups:
+        raise GoogleQuotaError("agy /usage output did not include known quota groups")
+    return _normalize_antigravity_quota_summary(
+        {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": group["display_name"],
+                        "description": group.get("description"),
+                        "buckets": [
+                            {
+                                "bucketId": bucket.get("bucket_id"),
+                                "displayName": bucket.get("display_name"),
+                                "description": bucket.get("description"),
+                                "window": bucket.get("window"),
+                                "remainingFraction": bucket.get("remaining_fraction"),
+                                "resetTime": bucket.get("reset_time"),
+                                "disabled": bucket.get("disabled"),
+                            }
+                            for bucket in group.get("buckets") or []
+                        ],
+                    }
+                    for group in groups
+                ],
+                "description": "Parsed from Antigravity CLI /usage.",
+            }
+        },
+        source="agy /usage fallback",
+    )
+
+
+def _run_antigravity_cli_usage_text(timeout: int) -> str:
+    import fcntl
+    import pty
+    import termios
+
+    agy_path = shutil.which("agy")
+    if not agy_path:
+        raise GoogleQuotaError("agy command not found")
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    proc = subprocess.Popen(
+        [agy_path],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=str(pathlib.Path.home()),
+        env={**os.environ, "TERM": os.environ.get("TERM") or "xterm-256color"},
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    chunks: list[bytes] = []
+    sent_trust = False
+    sent_usage = False
+    page_down_count = 0
+    last_page_down = 0.0
+    sent_exit = False
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 8192)
+                except BlockingIOError:
+                    chunk = b""
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            text = _strip_terminal_control(b"".join(chunks).decode("utf-8", errors="replace"))
+            if "Do you trust the contents of this project?" in text and not sent_trust:
+                os.write(master_fd, b"\r")
+                sent_trust = True
+                continue
+            if (
+                "Antigravity CLI" in text
+                and "Do you trust the contents of this project?" not in text
+                and not sent_usage
+                and re.search(r"(?:^|\n)>\s*(?:\n|$)", text)
+            ):
+                os.write(master_fd, b"/usage\r")
+                sent_usage = True
+                continue
+            if "Models & Quota" in text and page_down_count < 2 and time.monotonic() - last_page_down > 0.6:
+                os.write(master_fd, b"\x1b[6~")
+                page_down_count += 1
+                last_page_down = time.monotonic()
+                continue
+            if (
+                "GEMINI MODELS" in text
+                and "CLAUDE AND GPT MODELS" in text
+                and text.count("Five Hour Limit") >= 2
+                and text.count("Refreshes in") >= 3
+                and not sent_exit
+            ):
+                os.write(master_fd, b"\x1b/exit\r")
+                sent_exit = True
+                time.sleep(0.3)
+                break
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def live_antigravity_cli_usage(timeout: int = ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC) -> dict:
+    cached = _load_antigravity_cli_usage_cache()
+    if cached:
+        return cached
+    data = _parse_antigravity_cli_usage_text(_run_antigravity_cli_usage_text(timeout))
+    _save_antigravity_cli_usage_cache(data)
+    return data
+
+
 def _normalize_google_quota(data: dict) -> dict:
     buckets = []
     for raw_bucket in data.get("buckets") or []:
@@ -794,6 +1418,7 @@ def _normalize_google_quota(data: dict) -> dict:
     reset_times = sorted({bucket.get("reset_time") for bucket in buckets if bucket.get("reset_time")})
 
     return {
+        "source": "cloudcode-pa.googleapis.com v1internal:retrieveUserQuota",
         "primary": primary,
         "buckets": buckets,
         "summary": {
@@ -804,9 +1429,87 @@ def _normalize_google_quota(data: dict) -> dict:
     }
 
 
+def _antigravity_model_buckets(models: list[str], limit: dict | None) -> list[dict]:
+    limited_model = (limit or {}).get("model_label")
+    buckets = []
+    for model in models:
+        limited = bool(limit and limited_model == model)
+        buckets.append(
+            {
+                "model_id": model,
+                "remaining_amount": 0 if limited else None,
+                "remaining_fraction": 0.0 if limited else None,
+                "remaining_percent": 0 if limited else None,
+                "reset_time": (limit or {}).get("reset_time") if limited else None,
+                "quota_state": "limited" if limited else "unknown",
+                "quota_source": (limit or {}).get("source") if limited else "agy models",
+            }
+        )
+    if limit and limited_model and all(bucket.get("model_id") != limited_model for bucket in buckets):
+        buckets.insert(
+            0,
+            {
+                "model_id": limited_model,
+                "remaining_amount": 0,
+                "remaining_fraction": 0.0,
+                "remaining_percent": 0,
+                "reset_time": limit.get("reset_time"),
+                "quota_state": "limited",
+                "quota_source": limit.get("source"),
+            },
+        )
+    return buckets
+
+
+def _with_antigravity_view(normalized: dict, limit: dict | None, models: list[str]) -> dict:
+    agy_buckets = _antigravity_model_buckets(models, limit)
+    primary = next((bucket for bucket in agy_buckets if bucket.get("quota_state") == "limited"), None)
+    if primary is None:
+        primary = agy_buckets[0] if agy_buckets else normalized.get("primary")
+
+    summary = dict(normalized.get("summary") or {})
+    if limit:
+        summary.update(
+            {
+                "remaining_percent": 0,
+                "reset_time": limit.get("reset_time") or summary.get("reset_time"),
+                "bucket_count": len(agy_buckets),
+                "quota_state": "limited",
+            }
+        )
+    else:
+        summary.update(
+            {
+                "remaining_percent": None,
+                "reset_time": None,
+                "bucket_count": len(agy_buckets),
+                "quota_state": "unknown",
+            }
+        )
+    return {
+        **normalized,
+        "source": "agy models + antigravity-cli-log",
+        "primary": primary,
+        "buckets": agy_buckets,
+        "legacy_google_buckets": normalized.get("buckets") or [],
+        "legacy_google_source": normalized.get("source"),
+        "summary": summary,
+        "antigravity": limit,
+    }
+
+
 def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     import urllib.error
     import urllib.request
+
+    try:
+        return datetime.datetime.now(datetime.timezone.utc), live_antigravity_quota_summary(timeout=min(timeout, 8))
+    except GoogleQuotaError:
+        pass
+    try:
+        return datetime.datetime.now(datetime.timezone.utc), live_antigravity_cli_usage()
+    except GoogleQuotaError:
+        pass
 
     def fetch(creds: dict) -> bytes:
         req = urllib.request.Request(
@@ -853,7 +1556,660 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     except json.JSONDecodeError as exc:
         raise GoogleQuotaError("non-JSON response") from exc
 
-    return datetime.datetime.now(datetime.timezone.utc), _normalize_google_quota(data)
+    normalized = _normalize_google_quota(data)
+    normalized = _with_antigravity_view(
+        normalized,
+        latest_antigravity_quota_limit(),
+        list_antigravity_models(),
+    )
+    return datetime.datetime.now(datetime.timezone.utc), normalized
+
+
+def _gemini_app_cookie_context(timeout: int):
+    try:
+        import browser_cookie3
+    except ImportError as exc:
+        raise GeminiAppUsageError(
+            t(
+                "未安装 browser_cookie3，无法读取 Chrome 中的 Gemini 登录态",
+                "browser_cookie3 not installed; cannot read Gemini Chrome cookies",
+            )
+        ) from exc
+
+    import urllib.request
+
+    try:
+        jar = browser_cookie3.chrome(domain_name=".google.com")
+    except Exception as exc:
+        raise GeminiAppUsageError(f"cannot read Chrome cookies: {exc}") from exc
+
+    if not any(cookie.name in {"SID", "__Secure-1PSID", "__Secure-3PSID"} for cookie in jar):
+        raise GeminiAppUsageError(
+            t(
+                "未找到 Google 登录 cookie，请先在 Chrome 打开 gemini.google.com/usage 并登录",
+                "Google login cookies not found; open gemini.google.com/usage in Chrome first",
+            )
+        )
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(GEMINI_APP_USAGE_URL, headers=headers)
+    with opener.open(req, timeout=timeout) as response:
+        html = response.read().decode("utf-8", "replace")
+        final_url = response.geturl()
+    return opener, html, final_url
+
+
+def has_gemini_app_cookies() -> bool:
+    try:
+        import browser_cookie3
+
+        jar = browser_cookie3.chrome(domain_name=".google.com")
+        return any(cookie.name in {"SID", "__Secure-1PSID", "__Secure-3PSID"} for cookie in jar)
+    except Exception:
+        return False
+
+
+def _gemini_app_page_param(html: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}":"([^"]+)"', html)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _parse_batchexecute_payload(raw: str) -> list:
+    payloads = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.isdigit() or line.startswith(")]}'"):
+            continue
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, list):
+            continue
+        for row in chunk:
+            if isinstance(row, list) and len(row) >= 3 and row[0] == "wrb.fr":
+                value = row[2]
+                if isinstance(value, str):
+                    try:
+                        payloads.append(json.loads(value))
+                    except json.JSONDecodeError:
+                        payloads.append(value)
+                elif value is not None:
+                    payloads.append(value)
+    return payloads
+
+
+def _gemini_app_batchexecute(opener, html: str, rpc: str, arg, timeout: int):
+    import urllib.request
+
+    bl = _gemini_app_page_param(html, "cfb2h")
+    fsid = _gemini_app_page_param(html, "FdrFJe")
+    at = _gemini_app_page_param(html, "SNlM0e")
+    if not bl or not fsid or not at:
+        raise GeminiAppUsageError("Gemini page did not expose batchexecute tokens")
+
+    query = urllib.parse.urlencode(
+        {
+            "rpcids": rpc,
+            "source-path": "/usage",
+            "bl": bl,
+            "f.sid": fsid,
+            "hl": "en-US",
+            "_reqid": int(time.time() * 1000) % 1_000_000,
+            "rt": "c",
+        }
+    )
+    body = urllib.parse.urlencode(
+        {
+            "f.req": json.dumps(
+                [[[rpc, json.dumps(arg, separators=(",", ":")), None, "generic"]]],
+                separators=(",", ":"),
+            ),
+            "at": at,
+        }
+    ) + "&"
+    req = urllib.request.Request(
+        f"{GEMINI_APP_BATCHEXECUTE_URL}?{query}",
+        data=body.encode(),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+            ),
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://gemini.google.com",
+            "Referer": GEMINI_APP_USAGE_URL,
+            "X-Same-Domain": "1",
+        },
+        method="POST",
+    )
+    with opener.open(req, timeout=timeout) as response:
+        return _parse_batchexecute_payload(response.read().decode("utf-8", "replace"))
+
+
+def _walk_json(value):
+    yield value
+    if isinstance(value, list):
+        for item in value:
+            yield from _walk_json(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_json(item)
+
+
+def _extract_gemini_app_models(payloads: list) -> list[dict]:
+    models = []
+    seen = set()
+    for value in _walk_json(payloads):
+        if not isinstance(value, list) or len(value) < 16:
+            continue
+        model_id, label, description = value[0], value[1], value[2]
+        if not (isinstance(model_id, str) and isinstance(label, str)):
+            continue
+        display = None
+        for candidate in (value[15], value[10] if len(value) > 10 else None, label):
+            if isinstance(candidate, str) and candidate.strip():
+                display = candidate.strip()
+                break
+        if not display or model_id in seen:
+            continue
+        if not re.search(r"(gemini|flash|pro|thinking|lite|veo|imagen)", " ".join([display, label, str(description)]), re.I):
+            continue
+        seen.add(model_id)
+        models.append(
+            {
+                "model_id": model_id,
+                "display_name": display,
+                "label": label,
+                "description": description if isinstance(description, str) else None,
+            }
+        )
+    return models
+
+
+def _extract_gemini_app_quota_buckets(payloads: list) -> list[dict]:
+    buckets = []
+    seen = set()
+    for value in _walk_json(payloads):
+        if not isinstance(value, dict):
+            continue
+        quota = value.get("quotaInfo") or value.get("quota") or value.get("usage")
+        if not isinstance(quota, dict):
+            continue
+        reset = quota.get("Cfa") or quota.get("resetTime") or quota.get("reset_time")
+        remaining = quota.get("remainingPercent") or quota.get("remaining_percent") or quota.get("L7c")
+        limit = quota.get("limit") or quota.get("Hna")
+        key = json.dumps([reset, remaining, limit], sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            remaining = int(round(float(remaining)))
+        except Exception:
+            remaining = None
+        buckets.append(
+            {
+                "display_name": value.get("displayName") or value.get("name") or "Gemini App quota",
+                "remaining_percent": remaining,
+                "reset_time": reset,
+                "raw_limit": limit,
+            }
+        )
+    return buckets
+
+
+def _gemini_epoch_seconds(value):
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, list) and value:
+        return _gemini_epoch_seconds(value[0])
+    return None
+
+
+def _gemini_epoch_iso(value):
+    seconds = _gemini_epoch_seconds(value)
+    if seconds is None:
+        return None
+    return datetime.datetime.fromtimestamp(seconds, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_gemini_app_usage_rpc(payloads: list) -> dict:
+    response = payloads[0] if payloads else None
+    if not isinstance(response, list) or len(response) < 2 or not isinstance(response[1], list):
+        raise GeminiAppUsageError("Gemini usage RPC returned an unexpected payload")
+
+    buckets = []
+    for raw_bucket in response[1]:
+        if not isinstance(raw_bucket, list) or len(raw_bucket) < 4:
+            continue
+        usage_fraction = raw_bucket[1]
+        bucket_kind = raw_bucket[2]
+        reset_time = _gemini_epoch_iso(raw_bucket[3])
+        try:
+            used_percent = max(0, min(100, int(round(float(usage_fraction) * 100))))
+        except (TypeError, ValueError):
+            used_percent = None
+        remaining_percent = None if used_percent is None else max(0, min(100, 100 - used_percent))
+        if bucket_kind == 1:
+            display_name = "当前用量"
+            window = "current"
+        elif bucket_kind == 2:
+            display_name = "每周限额"
+            window = "weekly"
+        else:
+            display_name = "Gemini App quota"
+            window = str(bucket_kind) if bucket_kind is not None else None
+        buckets.append(
+            {
+                "display_name": display_name,
+                "used_percent": used_percent,
+                "remaining_percent": remaining_percent,
+                "reset_time": reset_time,
+                "window": window,
+                "source": "jSf9Qc",
+            }
+        )
+
+    if not buckets:
+        raise GeminiAppUsageError("Gemini usage RPC did not contain quota buckets")
+    primary = min(
+        buckets,
+        key=lambda bucket: 101 if bucket.get("remaining_percent") is None else bucket["remaining_percent"],
+    )
+    return {
+        "source": "gemini.google.com/usage RPC jSf9Qc",
+        "final_url": GEMINI_APP_USAGE_URL,
+        "available": True,
+        "unavailable_reason": None,
+        "summary": {
+            "remaining_percent": primary.get("remaining_percent"),
+            "used_percent": primary.get("used_percent"),
+            "reset_time": primary.get("reset_time"),
+            "reset_text": None,
+            "bucket_count": len(buckets),
+            "model_count": 0,
+        },
+        "primary": primary,
+        "buckets": buckets,
+        "models": [],
+    }
+
+
+def _live_gemini_app_usage_from_rpc(timeout: int) -> dict:
+    opener, html, _final_url = _gemini_app_cookie_context(timeout)
+    payloads = _gemini_app_batchexecute(opener, html, "jSf9Qc", [], timeout=min(timeout, 8))
+    data = _parse_gemini_app_usage_rpc(payloads)
+    _save_gemini_app_usage_cache(data)
+    return data
+
+
+def _load_gemini_app_usage_cache():
+    try:
+        data = json.loads(GEMINI_APP_USAGE_CACHE.read_text(encoding="utf-8"))
+        cached_at = float(data.get("cached_at", 0))
+        if time.time() - cached_at <= GEMINI_APP_USAGE_CACHE_TTL_SEC:
+            return data.get("data")
+    except Exception:
+        pass
+    return None
+
+
+def _save_gemini_app_usage_cache(data: dict):
+    try:
+        GEMINI_APP_USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        GEMINI_APP_USAGE_CACHE.write_text(
+            json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _chrome_executable() -> str:
+    candidates = (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    )
+    for candidate in candidates:
+        if pathlib.Path(candidate).exists():
+            return candidate
+    found = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chrome")
+    if found:
+        return found
+    raise GeminiAppUsageError("Google Chrome executable not found")
+
+
+def _copy_chrome_profile_for_gemini(timeout: int):
+    source = pathlib.Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    if not source.exists():
+        raise GeminiAppUsageError("Chrome profile directory not found")
+    GEMINI_APP_PROFILE_COPY_DIR.mkdir(parents=True, exist_ok=True)
+    for singleton in GEMINI_APP_PROFILE_COPY_DIR.glob("Singleton*"):
+        try:
+            singleton.unlink()
+        except OSError:
+            pass
+    cmd = [
+        "rsync",
+        "-a",
+        "--delete",
+        "--exclude=Singleton*",
+        "--exclude=*/Cache/***",
+        "--exclude=*/Code Cache/***",
+        "--exclude=*/GPUCache/***",
+        "--exclude=*/GrShaderCache/***",
+        "--exclude=*/ShaderCache/***",
+        "--exclude=*/Crashpad/***",
+        "--exclude=*/Service Worker/CacheStorage/***",
+        f"{source}/",
+        f"{GEMINI_APP_PROFILE_COPY_DIR}/",
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=max(timeout, 20), check=True)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace")[:300] if exc.stderr else str(exc)
+        raise GeminiAppUsageError(f"failed to copy Chrome profile: {detail}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GeminiAppUsageError("copying Chrome profile timed out") from exc
+
+
+def _read_http_json(url: str, timeout: int):
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def _cdp_websocket_call(ws_url: str, method: str, params: dict | None = None, timeout: int = 10):
+    parsed = urllib.parse.urlparse(ws_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(request.encode())
+        header = b""
+        while b"\r\n\r\n" not in header:
+            header += sock.recv(4096)
+        if b" 101 " not in header.split(b"\r\n", 1)[0]:
+            raise GeminiAppUsageError(f"CDP websocket handshake failed: {header[:120]!r}")
+
+        payload = json.dumps({"id": 1, "method": method, "params": params or {}}).encode()
+        mask = os.urandom(4)
+        frame = bytearray([0x81])
+        length = len(payload)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.extend([0x80 | 126])
+            frame.extend(struct.pack("!H", length))
+        else:
+            frame.extend([0x80 | 127])
+            frame.extend(struct.pack("!Q", length))
+        frame.extend(mask)
+        frame.extend(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        sock.sendall(bytes(frame))
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            first = sock.recv(2)
+            if not first:
+                break
+            byte1, byte2 = first
+            length = byte2 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", sock.recv(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", sock.recv(8))[0]
+            mask_key = sock.recv(4) if byte2 & 0x80 else None
+            data = bytearray()
+            while len(data) < length:
+                data.extend(sock.recv(length - len(data)))
+            if mask_key:
+                data = bytearray(byte ^ mask_key[index % 4] for index, byte in enumerate(data))
+            if byte1 & 0x0F == 1:
+                message = json.loads(data.decode())
+                if message.get("id") == 1:
+                    return message
+        raise GeminiAppUsageError("CDP websocket response timed out")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _parse_gemini_app_usage_text(text: str) -> dict:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bucket_labels = {"当前用量", "Current usage", "Current Usage", "每周限额", "Weekly limit", "Weekly Limit"}
+
+    def find_bucket(names: tuple[str, ...], display_name: str):
+        for index, line in enumerate(lines):
+            if line in names:
+                end = len(lines)
+                for next_index in range(index + 1, min(len(lines), index + 12)):
+                    if lines[next_index] in bucket_labels:
+                        end = next_index
+                        break
+                section = lines[index:end]
+                used = None
+                reset = None
+                for item in section:
+                    match = re.search(r"(?:已使用|Used)\s*(\d+(?:\.\d+)?)%", item, re.I)
+                    if match:
+                        used = float(match.group(1))
+                    reset_match = re.search(r"(?:重置时间|Reset(?:s)?(?: at| time)?)[：:]\s*(.+)", item, re.I)
+                    if reset_match:
+                        reset = reset_match.group(1).strip()
+                if used is not None:
+                    remaining = max(0, min(100, 100 - used))
+                    return {
+                        "display_name": display_name,
+                        "used_percent": int(round(used)),
+                        "remaining_percent": int(round(remaining)),
+                        "reset_text": reset,
+                        "source": "dom",
+                    }
+        return None
+
+    buckets = [
+        bucket
+        for bucket in (
+            find_bucket(("当前用量", "Current usage", "Current Usage"), "当前用量"),
+            find_bucket(("每周限额", "Weekly limit", "Weekly Limit"), "每周限额"),
+        )
+        if bucket
+    ]
+    if not buckets:
+        raise GeminiAppUsageError("Gemini usage page did not expose usage percentages")
+
+    primary = min(buckets, key=lambda bucket: bucket.get("remaining_percent", 100))
+    return {
+        "source": "gemini.google.com/usage DOM",
+        "final_url": GEMINI_APP_USAGE_URL,
+        "available": True,
+        "unavailable_reason": None,
+        "summary": {
+            "remaining_percent": primary.get("remaining_percent"),
+            "used_percent": primary.get("used_percent"),
+            "reset_time": None,
+            "reset_text": primary.get("reset_text"),
+            "bucket_count": len(buckets),
+            "model_count": 0,
+        },
+        "primary": primary,
+        "buckets": buckets,
+        "models": [],
+    }
+
+
+def _live_gemini_app_usage_from_profile(timeout: int) -> dict:
+    _copy_chrome_profile_for_gemini(timeout)
+    port = find_free_local_port()
+    chrome = _chrome_executable()
+    proc = subprocess.Popen(
+        [
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={GEMINI_APP_PROFILE_COPY_DIR}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            GEMINI_APP_USAGE_URL,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        version_url = f"http://127.0.0.1:{port}/json/version"
+        deadline = time.time() + max(timeout, 20)
+        while time.time() < deadline:
+            try:
+                _read_http_json(version_url, timeout=1)
+                break
+            except Exception:
+                time.sleep(0.25)
+        else:
+            raise GeminiAppUsageError("Chrome DevTools endpoint did not start")
+
+        target = None
+        text = ""
+        while time.time() < deadline:
+            pages = _read_http_json(f"http://127.0.0.1:{port}/json", timeout=2)
+            target = next((page for page in pages if "gemini.google.com/usage" in page.get("url", "")), None)
+            if target:
+                result = _cdp_websocket_call(
+                    target["webSocketDebuggerUrl"],
+                    "Runtime.evaluate",
+                    {
+                        "expression": "document.body.innerText",
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                    },
+                    timeout=5,
+                )
+                text = ((result.get("result") or {}).get("result") or {}).get("value") or ""
+                if "当前用量" in text or "Current usage" in text:
+                    break
+            time.sleep(0.5)
+        data = _parse_gemini_app_usage_text(text)
+        _save_gemini_app_usage_cache(data)
+        return data
+    except GeminiAppUsageError:
+        raise
+    except Exception as exc:
+        raise GeminiAppUsageError(str(exc) or exc.__class__.__name__) from exc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        for singleton in GEMINI_APP_PROFILE_COPY_DIR.glob("Singleton*"):
+            try:
+                singleton.unlink()
+            except OSError:
+                pass
+
+
+def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    cached = _load_gemini_app_usage_cache()
+    if cached:
+        cached["source"] = f"{cached.get('source', 'gemini.google.com/usage')} (cached)"
+        return datetime.datetime.now(datetime.timezone.utc), cached
+
+    try:
+        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage_from_rpc(timeout=timeout)
+    except GeminiAppUsageError:
+        pass
+
+    try:
+        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage_from_profile(timeout=max(timeout, 20))
+    except GeminiAppUsageError:
+        pass
+
+    opener, html, final_url = _gemini_app_cookie_context(timeout)
+    if not (
+        _gemini_app_page_param(html, "cfb2h")
+        and _gemini_app_page_param(html, "FdrFJe")
+        and _gemini_app_page_param(html, "SNlM0e")
+    ):
+        raise GeminiAppUsageError(
+            t(
+                "Gemini App 未登录，请先在 Chrome 打开 gemini.google.com/usage",
+                "Gemini App is not signed in; open gemini.google.com/usage in Chrome first",
+            )
+        )
+
+    payloads = []
+    rpc_errors = []
+    for rpc, arg in (
+        ("otAQ7b", []),
+        ("GPRiHf", []),
+        ("maGuAc", [1]),
+        ("sJBwce", []),
+        ("Te6DCf", [["en-US"], [1]]),
+    ):
+        try:
+            payloads.extend(_gemini_app_batchexecute(opener, html, rpc, arg, timeout=min(timeout, 8)))
+        except Exception as exc:
+            rpc_errors.append(f"{rpc}: {exc}")
+
+    buckets = _extract_gemini_app_quota_buckets(payloads)
+    models = _extract_gemini_app_models(payloads)
+    summary_remaining = None
+    reset_time = None
+    usable_buckets = [bucket for bucket in buckets if bucket.get("remaining_percent") is not None]
+    if usable_buckets:
+        primary = min(usable_buckets, key=lambda item: item.get("remaining_percent") or 0)
+        summary_remaining = primary.get("remaining_percent")
+        reset_time = primary.get("reset_time")
+    else:
+        primary = {}
+
+    unavailable_reason = None
+    if "/usage" not in final_url:
+        unavailable_reason = f"usage page redirected to {urllib.parse.urlparse(final_url).path or final_url}"
+    if not buckets and not models:
+        unavailable_reason = unavailable_reason or "Gemini usage RPC returned no quota payload"
+
+    data = {
+        "source": "gemini.google.com/usage",
+        "final_url": final_url,
+        "available": unavailable_reason is None or bool(buckets),
+        "unavailable_reason": unavailable_reason,
+        "summary": {
+            "remaining_percent": summary_remaining,
+            "reset_time": reset_time,
+            "bucket_count": len(buckets),
+            "model_count": len(models),
+        },
+        "primary": primary,
+        "buckets": buckets,
+        "models": models,
+    }
+    if rpc_errors and not payloads:
+        data["rpc_errors"] = rpc_errors
+    return datetime.datetime.now(datetime.timezone.utc), data
 
 
 def load_deepseek_api_key() -> str:

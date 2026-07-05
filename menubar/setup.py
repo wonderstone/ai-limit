@@ -21,8 +21,15 @@ APP = ["ai-limit-app.py"]
 OPTIONS = {
     "argv_emulation": False,
     "iconfile": "ai-limit.icns",
-    "packages": ["rumps", "browser_cookie3", "Cryptodome"],
-    "includes": ["usage"],
+    "packages": [
+        "rumps",
+        "browser_cookie3",
+        "Cryptodome",
+        "requests",
+        "alibabacloud_bssopenapi20171214",
+        "alibabacloud_tea_openapi",
+    ],
+    "includes": ["usage", "ai_limit.llm_api", "ai_limit.llm_balance"],
     "plist": {
         "LSUIElement": True,                          # 不在 Dock 显示
         "CFBundleName": "ai-limit",
@@ -31,6 +38,11 @@ OPTIONS = {
         "CFBundleVersion": "0.3.5",
         "CFBundleShortVersionString": "0.3.5",
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
+        "LSEnvironment": {
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "PYTHONUTF8": "1",
+        },
     },
 }
 

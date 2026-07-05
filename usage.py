@@ -20,11 +20,14 @@ from ai_limit.providers import (
     CodexAuthError,
     DeepSeekAuthError,
     DeepSeekError,
+    GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     has_deepseek_api_key,
+    has_gemini_app_cookies,
     has_google_oauth_creds,
+    live_gemini_app_usage,
     live_claude_plan,
     live_claude_usage,
     live_deepseek_balance,
@@ -467,6 +470,27 @@ def render_codex(since: datetime.datetime):
         if w_reset:
             print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(w_reset)}{_RST}")
 
+    buckets = rl.get("buckets") or []
+    if buckets:
+        print()
+        group_count = (rl.get("summary") or {}).get("group_count") or len(rl.get("groups") or [])
+        print(f"  {_BOLD}{t('Codex 额度组', 'Codex quota groups')}{_RST}  {_DIM}{group_count} groups / {len(buckets)} windows{_RST}")
+        for bucket in buckets:
+            group_name = bucket.get("group_display_name") or ""
+            bucket_name = bucket.get("display_name") or bucket.get("window") or "limit"
+            used = bucket.get("used_percent", 0)
+            left = bucket.get("remaining_percent")
+            if left is None:
+                left = remaining_percent(used)
+            reset_epoch = bucket.get("resets_at") or bucket.get("reset_time")
+            reset_text = fmt_reset_dt(epoch_to_local(reset_epoch)) if reset_epoch else "?"
+            label = f"{group_name} / {bucket_name}" if group_name else bucket_name
+            print(
+                f"  {label[:34]:<34} {_colored_bar(left)}  "
+                f"{t(f'剩余 {_bc(left)}{left:.0f}%{_RST}  {_DIM}(已用 {used:.0f}%){_RST}', f'left {_bc(left)}{left:.0f}%{_RST}  {_DIM}(used {used:.0f}%){_RST}')}  "
+                f"↻ {reset_text}"
+            )
+
     # remaining quota estimate
     if w_pct and w_reset:
         remaining_pct = 100 - w_pct
@@ -526,30 +550,129 @@ def render_google():
         print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
         return
 
-    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  (oauth live){_RST}")
-    print(f"  {_DIM}{t('数据来源', 'Source')}: cloudcode-pa.googleapis.com v1internal:retrieveUserQuota  (Gemini / Antigravity OAuth){_RST}")
+    source = data.get("source") or "cloudcode-pa.googleapis.com v1internal:retrieveUserQuota"
+    live_label = "agy usage fallback" if "agy /usage" in source else ("antigravity app live" if data.get("quota_groups") else "agy live")
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  ({live_label}){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: {source}  (Antigravity CLI){_RST}")
     print()
 
     summary = data.get("summary") or {}
     primary = data.get("primary") or {}
+    antigravity = data.get("antigravity") or {}
     remaining = summary.get("remaining_percent")
     remaining_label = "?" if remaining is None else f"{remaining:.0f}%"
-    primary_model = primary.get("model_id") or "?"
+    primary_model = primary.get("model_id") or " / ".join(
+        item for item in (primary.get("group_display_name"), primary.get("display_name")) if item
+    ) or "?"
     bucket_count = summary.get("bucket_count", 0)
-    print(f"  {t('保守汇总', 'Conservative summary')}: {_BOLD}{remaining_label}{_RST}  |  {t('模型桶', 'Buckets')}: {bucket_count}")
+    group_count = summary.get("group_count")
+    count_label = t(f"额度窗口: {bucket_count}", f"quota windows: {bucket_count}")
+    if group_count is not None:
+        count_label += t(f"  |  组: {group_count}", f"  |  groups: {group_count}")
+    print(f"  {t('保守汇总', 'Conservative summary')}: {_BOLD}{remaining_label}{_RST}  |  {count_label}")
     print(f"  {t('主参考模型', 'Primary reference model')}: {_BOLD}{primary_model}{_RST}")
     reset_time = summary.get("reset_time")
     if reset_time:
         print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(ts_to_local(reset_time))}{_RST}")
+    if antigravity.get("limited"):
+        model_label = antigravity.get("model_label") or "Antigravity CLI"
+        reset_in = antigravity.get("reset_in") or "?"
+        print(
+            f"  ⚠️  {t('Antigravity CLI 已触发额度限制', 'Antigravity CLI quota is exhausted')}: "
+            f"{_BOLD}{model_label}{_RST}  |  {t('日志显示还需', 'log reset in')} {reset_in}"
+        )
 
-    buckets = data.get("buckets") or []
-    if buckets:
-        print(f"\n  {_BOLD}{t('主要模型', 'Key models')}{_RST}")
-        for bucket in buckets[:4]:
+    quota_groups = data.get("quota_groups") or []
+    if quota_groups:
+        print(f"\n  {_BOLD}{t('Antigravity 额度组', 'Antigravity quota groups')}{_RST}")
+        for group in quota_groups:
+            print(f"  {_BOLD}{group.get('display_name') or '?'}{_RST}")
+            for bucket in group.get("buckets") or []:
+                name = bucket.get("display_name") or bucket.get("window") or "?"
+                pct = bucket.get("remaining_percent")
+                pct_text = "?" if pct is None else f"{pct:.0f}%"
+                disabled = t("  (不适用)", "  (disabled)") if bucket.get("disabled") else ""
+                reset = bucket.get("reset_time")
+                reset_text = f"  {_DIM}↻ {fmt_reset_dt(ts_to_local(reset))}{_RST}" if reset else ""
+                print(f"    {name:<17} {_bold_bar(pct or 0)}  {pct_text}{disabled}{reset_text}")
+    else:
+        buckets = data.get("buckets") or []
+        if not buckets:
+            return
+        print(f"\n  {_BOLD}{t('Antigravity 模型', 'Antigravity models')}{_RST}")
+        for bucket in buckets:
             model_id = bucket.get("model_id") or "?"
             pct = bucket.get("remaining_percent")
             pct_text = "?" if pct is None else f"{pct:.0f}%"
             print(f"  {model_id:<28} {_bold_bar(pct or 0)}  {pct_text}")
+
+
+def render_gemini_app():
+    title = "Gemini App"
+    print(f"\n{_DIM}{SEP}{_RST}")
+    print(f"{_BOLD}{title.center(52)}{_RST}")
+    print()
+    try:
+        ts, data = live_gemini_app_usage()
+    except GeminiAppUsageError as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  (browser cookie live){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('source') or 'gemini.google.com/usage'}  (Chrome cookie){_RST}")
+    print()
+
+    summary = data.get("summary") or {}
+    remaining = summary.get("remaining_percent")
+    used = summary.get("used_percent")
+    remaining_label = "?" if remaining is None else f"{remaining:.0f}%"
+    used_label = "?" if used is None else f"{used:.0f}%"
+    model_count = summary.get("model_count", 0)
+    bucket_count = summary.get("bucket_count", 0)
+    print(
+        f"  {t('保守汇总', 'Conservative summary')}: "
+        f"{_BOLD}{t(f'已用 {used_label} / 剩余 {remaining_label}', f'used {used_label} / left {remaining_label}')}{_RST}"
+        f"  |  {t(f'额度项: {bucket_count}', f'quota items: {bucket_count}')}  |  {t(f'模型: {model_count}', f'models: {model_count}')}"
+    )
+    reset_time = summary.get("reset_time")
+    if reset_time:
+        try:
+            print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(ts_to_local(reset_time))}{_RST}")
+        except Exception:
+            print(f"  {_DIM}{t('重置时间', 'Resets at')}: {reset_time}{_RST}")
+    elif summary.get("reset_text"):
+        print(f"  {_DIM}{t('重置时间', 'Resets at')}: {summary.get('reset_text')}{_RST}")
+    if data.get("unavailable_reason"):
+        print(f"  ⚠️  {t('Usage 页未返回额度', 'Usage page did not return quota')}: {data['unavailable_reason']}")
+
+    buckets = data.get("buckets") or []
+    if buckets:
+        print(f"\n  {_BOLD}{t('Gemini App 额度', 'Gemini App quota')}{_RST}")
+        for bucket in buckets:
+            name = bucket.get("display_name") or "Gemini App quota"
+            pct = bucket.get("remaining_percent")
+            used_pct = bucket.get("used_percent")
+            pct_text = "?" if pct is None else f"{pct:.0f}%"
+            if used_pct is not None:
+                pct_text = t(f"已用 {used_pct:.0f}% / 剩余 {pct_text}", f"used {used_pct:.0f}% / left {pct_text}")
+            reset = bucket.get("reset_time")
+            reset_text = ""
+            if reset:
+                try:
+                    reset_text = f"  {_DIM}↻ {fmt_reset_dt(ts_to_local(reset))}{_RST}"
+                except Exception:
+                    reset_text = f"  {_DIM}↻ {reset}{_RST}"
+            elif bucket.get("reset_text"):
+                reset_text = f"  {_DIM}↻ {bucket.get('reset_text')}{_RST}"
+            print(f"  {name:<28} {_bold_bar(pct or 0)}  {pct_text}{reset_text}")
+
+    models = data.get("models") or []
+    if models:
+        print(f"\n  {_BOLD}{t('Gemini App 模型入口', 'Gemini App model entries')}{_RST}")
+        for model in models[:8]:
+            name = model.get("display_name") or model.get("label") or model.get("model_id") or "?"
+            desc = model.get("description") or ""
+            print(f"  {name:<18} {_DIM}{desc}{_RST}")
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -595,6 +718,8 @@ def main():
         render_deepseek()
     if has_google_oauth_creds():
         render_google()
+    if has_gemini_app_cookies():
+        render_gemini_app()
     render_summary()
 
 
