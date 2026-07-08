@@ -669,7 +669,7 @@ def codex_5h_remaining_percent(rate_limits: dict):
     return None
 
 
-def current_codex_rate_limits(latest_codex_rate_limits_func):
+def current_codex_rate_limits(latest_codex_rate_limits_func, *, allow_app_server_fallback=True):
     reasons = []
 
     try:
@@ -689,7 +689,12 @@ def current_codex_rate_limits(latest_codex_rate_limits_func):
     now_unix = datetime.datetime.now(datetime.timezone.utc).timestamp()
     window_active = cached_expiry is not None and cached_expiry > now_unix
 
-    if window_active:
+    if not allow_app_server_fallback:
+        # 监控场景（daemon / 菜单栏）禁用 app-server 回退：它会 spawn codex
+        # app-server、触发 5h 冷却副作用，且只反映本机状态会少报用量。
+        allow_app_server = False
+        reasons.append("app-server: monitor_disabled")
+    elif window_active:
         allow_app_server = True
     elif sys.stdin.isatty() and sys.stdout.isatty():
         allow_app_server = prompt_app_server_confirm()

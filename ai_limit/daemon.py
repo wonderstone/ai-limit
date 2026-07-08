@@ -161,9 +161,17 @@ def _fetch_codex():
             from usage import latest_codex_rate_limits as _codex_snapshot
         except Exception:
             _codex_snapshot = lambda: (None, None)
-        _ts, rl, source, fallback_reason = current_codex_rate_limits(_codex_snapshot)
+        _ts, rl, source, fallback_reason = current_codex_rate_limits(
+            _codex_snapshot, allow_app_server_fallback=False
+        )
         if not rl:
             return {"error": fallback_reason or "no Codex data"}
+        # 只信任 web 权威源。live(app-server) 和 snapshot 都只反映本机状态、会
+        # 少报云端/其他设备用量（真实 26% 时可能显示 99%/77%），而且 live 每次
+        # 还会 spawn codex app-server 并触发 5h 冷却副作用。web 瞬时失败时拒绝
+        # 这些回退源，保留上一份好值，等待下一轮 web 自动纠正。
+        if source != "web":
+            return {"error": fallback_reason or "Codex live data unavailable"}
         primary = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
         # 缺 5h 窗口数据时不能伪造剩余 100%（详见 codex_5h_remaining_percent）。

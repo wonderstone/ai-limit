@@ -453,7 +453,9 @@ def _fetch_claude(lang):
 def _fetch_codex(lang):
     import socket, urllib.error
     try:
-        _ts, rl, source, fallback_reason = resolve_codex_rate_limits(latest_codex_rate_limits)
+        _ts, rl, source, fallback_reason = resolve_codex_rate_limits(
+            latest_codex_rate_limits, allow_app_server_fallback=False
+        )
         if not rl:
             if source == "no_access":
                 return {"error": _tr(
@@ -464,6 +466,16 @@ def _fetch_codex(lang):
             if fallback_reason:
                 return {"error": fallback_reason}
             return {"error": _tr(lang, "未找到 Codex 数据", "No Codex data found")}
+        # 只信任 web 权威源。live(app-server) 和 snapshot 都只反映本机状态、会
+        # 少报云端/其他设备用量（真实 26% 时可能显示 99%/77%），而且 live 每次
+        # 还会 spawn codex app-server 并触发 5h 冷却副作用。web 瞬时失败时拒绝
+        # 这些回退源，保留上一份缓存好值，等待下一轮 web 自动纠正。
+        if source != "web":
+            return {"error": _tr(
+                lang,
+                "Codex 实时数据暂不可用，请稍后重试",
+                "Codex live data temporarily unavailable, please retry",
+            )}
         primary   = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
         summary = rl.get("summary") or {}
