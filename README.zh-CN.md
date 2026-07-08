@@ -126,6 +126,8 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 ## 数据来源
 
+关于 ai-limit 如何在不做后台浏览器自动化的前提下获取额度数据，见维护者文档：[docs/data-source-architecture.md](docs/data-source-architecture.md)。
+
 ### Claude Code
 
 | 数据 | 来源 |
@@ -153,14 +155,18 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 | 数据 | 来源 |
 |------|------|
-| 实时剩余额度 | `~/.gemini/oauth_creds.json` 本地 OAuth 登录态 → `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Gemini App 实时额度 | Chrome Google Cookie → `gemini.google.com` batchexecute usage RPC |
+| Google Code Assist / Gemini CLI 额度 | `~/.gemini/oauth_creds.json` 本地 OAuth 登录态 → `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Antigravity 实时额度 | 正在运行的 Antigravity 本地 sidecar → `RetrieveUserQuotaSummary` |
+| Antigravity 回退 | `agy /usage` 与 `~/.gemini/antigravity-cli/log` |
 
-ai-limit 会复用你本机现有的 Gemini / Antigravity 登录态，读取 Google Code Assist 后端返回的 quota buckets，并显示一个保守汇总百分比以及几个主要模型桶。
+ai-limit 会复用你本机已经存在的登录态。Gemini App 和 Claude、ChatGPT 一样走浏览器登录态 + request；Antigravity 不同，优先走正在运行的本地 app sidecar，sidecar 不可用时再回退到 CLI/log/cache。
 
 ## 说明
 
 - 浏览器 Cookie 读取仅支持 macOS（依赖系统 Keychain 解密 Chrome Cookie）
 - Claude 额度使用的是 claude.ai 内部接口，**非官方 API**，可能随版本变化失效
+- **不做后台浏览器自动化**：额度采集不应复制浏览器 profile、不应自动启动 Chrome，也不应后台抓取渲染后的网页
 - `<synthetic>` 模型记录是 Claude Code 遇到 API 错误时写入的占位，不计入统计
 - 各模型输出占比仅 Claude Code 提供；CodeX 不区分模型，无此数据
 

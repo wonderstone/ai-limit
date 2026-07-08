@@ -126,6 +126,8 @@ AI_LIMIT_LANG=zh ai-limit   # force Chinese
 
 ## Data Sources
 
+For the maintenance-level explanation of how ai-limit obtains quota data without background browser automation, see [docs/data-source-architecture.md](docs/data-source-architecture.md).
+
 ### Claude Code
 
 | Data | Source |
@@ -153,14 +155,18 @@ The browser path (1) reuses the same analytics endpoint that powers the chatgpt.
 
 | Data | Source |
 |------|--------|
-| Live quota | `~/.gemini/oauth_creds.json` OAuth token → `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Gemini App live quota | Chrome Google cookies → `gemini.google.com` batchexecute usage RPC |
+| Google Code Assist / Gemini CLI quota | `~/.gemini/oauth_creds.json` OAuth token → `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
+| Antigravity live quota | Running Antigravity local sidecar → `RetrieveUserQuotaSummary` |
+| Antigravity fallback | `agy /usage` and `~/.gemini/antigravity-cli/log` |
 
-ai-limit reuses the local Gemini / Antigravity sign-in already present on your Mac. It reads the current quota buckets from Google's Code Assist backend and shows a conservative summary percentage plus key model buckets.
+ai-limit reuses local sign-in state already present on your Mac. Gemini App follows the same browser-session request pattern as Claude and ChatGPT. Antigravity is different: it prefers the running local app sidecar and falls back to CLI/log data when that sidecar is unavailable.
 
 ## Notes
 
 - **macOS only**: browser cookie reading relies on the system Keychain to decrypt Chrome cookies
 - **Unofficial API**: Claude quota is fetched from an internal claude.ai endpoint, not an official API — it may break with future updates
+- **No background browser automation**: usage collection must not copy browser profiles, launch Chrome, or scrape rendered pages in the background
 - `<synthetic>` model entries are error placeholders written by Claude Code on API failures; they are excluded from all statistics
 - Per-model output share is only available for Claude Code; Codex does not expose per-model breakdown
 

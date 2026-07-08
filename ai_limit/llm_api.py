@@ -126,6 +126,10 @@ def has_llm_api_provider_config() -> bool:
     return False
 
 
+def clear_llm_api_balance_cache() -> None:
+    _BALANCE_CACHE.clear()
+
+
 def live_llm_api_balances(cache_ttl_seconds: int = 300) -> dict[str, Any]:
     _load_env_files()
     env_values = {key: value for key, value in os.environ.items() if value}

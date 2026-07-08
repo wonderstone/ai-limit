@@ -39,6 +39,8 @@ from ai_limit.providers import (
     CodexWebError,
     CodexAuthError,
     current_codex_rate_limits as resolve_codex_rate_limits,
+    codex_5h_remaining_percent,
+    clear_provider_caches,
     DeepSeekAuthError,
     DeepSeekError,
     GeminiAppUsageError,
@@ -52,6 +54,7 @@ from ai_limit.providers import (
     live_google_quota,
 )
 from ai_limit.llm_api import (
+    clear_llm_api_balance_cache,
     has_llm_api_provider_config,
     live_llm_api_balances,
 )
@@ -61,6 +64,7 @@ from ai_limit.llm_api import (
 _STATE_PATH   = pathlib.Path.home() / ".ai-limit-menubar.json"
 _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
 _CACHE_TTL    = 55
+_ERROR_CACHE_TTL = 5
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
@@ -348,22 +352,68 @@ def _load_cache():
     try:
         raw = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
         age = datetime.datetime.now().timestamp() - float(raw.get("cached_at", 0))
-        if age <= _CACHE_TTL:
-            return raw.get("claude"), raw.get("codex")
+        claude = raw.get("claude")
+        ttl = _ERROR_CACHE_TTL if isinstance(claude, dict) and claude.get("error") else _CACHE_TTL
+        if age <= ttl:
+            cached = {
+                "codex": raw.get("codex"),
+                "deepseek": raw.get("deepseek"),
+                "google": raw.get("google"),
+                "gemini": raw.get("gemini"),
+                "llm_api": raw.get("llm_api"),
+            }
+            # Older builds stored only claude/codex. Keep accepting that shape
+            # so users do not need to delete their cache after upgrading.
+            if all(value is None for value in cached.values()):
+                return claude, raw.get("codex")
+            return claude, cached
     except Exception:
         pass
     return None, None
 
-def _save_cache(claude, codex):
+def _save_cache(claude, cached):
     try:
+        if isinstance(cached, dict) and (
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "llm_api" in cached
+        ):
+            codex = cached.get("codex")
+            deepseek = cached.get("deepseek")
+            google = cached.get("google")
+            gemini = cached.get("gemini")
+            llm_api = cached.get("llm_api")
+        else:
+            codex = cached
+            deepseek = google = gemini = llm_api = None
         _CACHE_PATH.write_text(
             json.dumps({
                 "cached_at": datetime.datetime.now().timestamp(),
                 "claude": claude,
                 "codex": codex,
+                "deepseek": deepseek,
+                "google": google,
+                "gemini": gemini,
+                "llm_api": llm_api,
             }, ensure_ascii=False),
             encoding="utf-8",
         )
+    except Exception:
+        pass
+
+
+def _clear_all_caches():
+    for path in (_CACHE_PATH,):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    try:
+        clear_provider_caches()
+    except Exception:
+        pass
+    try:
+        clear_llm_api_balance_cache()
     except Exception:
         pass
 
@@ -418,10 +468,18 @@ def _fetch_codex(lang):
         secondary = rl.get("secondary") or {}
         summary = rl.get("summary") or {}
         buckets = rl.get("buckets") or []
-        five_hour_left = summary.get("5h_remaining_percent")
+        five_hour_left = codex_5h_remaining_percent(rl)
         weekly_left = summary.get("weekly_remaining_percent")
+        # 缺 5h 窗口数据时不能伪造剩余 100%（详见 codex_5h_remaining_percent），
+        # 按错误处理以保留上一份缓存，等待下一轮轮询自动纠正。
+        if five_hour_left is None:
+            return {"error": _tr(
+                lang,
+                "Codex 额度数据暂不完整，请稍后重试",
+                "Codex usage data temporarily incomplete, please retry",
+            )}
         return {
-            "5h_left":  int(round(five_hour_left if five_hour_left is not None else 100 - primary.get("used_percent", 0))),
+            "5h_left":  int(round(five_hour_left)),
             "7d_left":  int(round(weekly_left if weekly_left is not None else 100 - secondary.get("used_percent", 0))),
             "5h_reset": primary.get("resets_at"),
             "7d_reset": secondary.get("resets_at"),
@@ -769,6 +827,17 @@ def _widget_pct_value(value, default=0):
         return max(0, min(100, int(round(float(value)))))
     except Exception:
         return default
+
+
+def _has_windowed_quota(data):
+    for bucket in data.get("buckets") or []:
+        if bucket.get("disabled"):
+            continue
+        window = str(bucket.get("window") or "").lower()
+        name = " ".join(str(bucket.get(key) or "") for key in ("display_name", "bucket_name", "group_display_name", "model_id")).lower()
+        if window or "5h" in name or "5 hour" in name or "weekly" in name or "week" in name:
+            return True
+    return False
 
 
 def _widget_risk_color(pct):
@@ -1752,20 +1821,30 @@ class AiLimitApp(rumps.App):
             value = _fmt_balance_compact(primary)
             subtitle = _tr(lang, "API balance", "API balance")
         elif service == "google" and data:
-            five_h, five_h_reset, weekly, weekly_reset = self._google_gemini_models_summary(data)
-            if five_h is None and weekly is None:
-                five_h, five_h_reset, weekly, weekly_reset = self._window_summary_from_buckets(
-                    data.get("buckets") or [],
-                    data.get("daily_left"),
-                    data.get("daily_reset"),
-                    data.get("daily_left"),
-                    data.get("daily_reset"),
-                )
-            metrics = self._quota_card_metrics([
-                ("5h", five_h, five_h_reset),
-                (_tr(lang, "1周", "1w"), weekly, weekly_reset),
-            ])
-            pct = self._metric_floor(metrics)
+            if _has_windowed_quota(data):
+                five_h, five_h_reset, weekly, weekly_reset = self._google_gemini_models_summary(data)
+                if five_h is None and weekly is None:
+                    five_h, five_h_reset, weekly, weekly_reset = self._window_summary_from_buckets(
+                        data.get("buckets") or [],
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                metrics = self._quota_card_metrics([
+                    ("5h", five_h, five_h_reset),
+                    (_tr(lang, "1周", "1w"), weekly, weekly_reset),
+                ])
+                pct = self._metric_floor(metrics)
+            else:
+                antigravity = data.get("antigravity") or {}
+                limited = bool(antigravity.get("limited"))
+                pct = 0 if limited else 70
+                value = _tr(lang, "受限", "Limited") if limited else _tr(lang, "未知", "Unknown")
+                model = antigravity.get("model_label") or data.get("primary_model") or "Antigravity"
+                reset = self._format_detail_reset(antigravity.get("reset_time") or data.get("daily_reset"))
+                subtitle = _short_widget_name(f"{model} ↻ {reset}" if reset else model, 38)
+                metrics = []
         elif service == "gemini" and data:
             current, current_reset, weekly, weekly_reset = self._gemini_card_windows(data)
             metrics = self._quota_card_metrics([
@@ -2045,18 +2124,26 @@ class AiLimitApp(rumps.App):
         def section(name, color):
             rows.append({"type": "section", "name": name, "color": color})
 
-        def append(name, pct, disabled=False, value=None, reset=None):
+        def append(name, pct, disabled=False, value=None, reset=None, unknown=False):
             if disabled and not include_disabled:
+                return
+            if unknown and not include_disabled:
                 return
             pct = _widget_pct_value(pct)
             suffix = " off" if disabled and self._state["lang"] == "en" else (" 不适用" if disabled else "")
+            if value is not None:
+                display_value = f"{value}{suffix}"
+            elif unknown:
+                display_value = _tr(self._state["lang"], "未知", "unknown")
+            else:
+                display_value = f"{pct}%{suffix}"
             rows.append({
                 "name": _short_widget_name(name, 44),
                 "pct": pct,
-                "value": f"{value}{suffix}" if value is not None else f"{pct}%{suffix}",
+                "value": display_value,
                 "reset": self._format_detail_reset(reset),
-                "color": "#71717a" if disabled else _widget_risk_color(pct),
-                "disabled": disabled,
+                "color": "#71717a" if (disabled or unknown) else _widget_risk_color(pct),
+                "disabled": disabled or unknown,
             })
 
         if "claude" in services and self._claude and not self._claude.get("error"):
@@ -2068,7 +2155,7 @@ class AiLimitApp(rumps.App):
             if entries:
                 section("CodeX", "#93c5fd")
                 for item in entries:
-                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
         if "deepseek" in services and self._deepseek and not self._deepseek.get("error"):
             primary = self._deepseek.get("primary") or {}
             section("DeepSeek", "#67e8f9")
@@ -2078,7 +2165,7 @@ class AiLimitApp(rumps.App):
             if entries:
                 section("Antigravity", "#fca5a5")
                 for item in entries:
-                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
         if "gemini" in services:
             entries = self._widget_gemini_entries()
             if entries:
@@ -2135,14 +2222,18 @@ class AiLimitApp(rumps.App):
                 )
                 if value
             )
+            remaining = bucket.get("remaining_percent")
+            unknown = remaining is None
             entries.append({
                 "name": name or "limit",
-                "pct": _widget_pct_value(bucket.get("remaining_percent")),
+                "pct": _widget_pct_value(remaining),
                 "reset": self._bucket_reset(bucket),
                 "disabled": bool(bucket.get("disabled")),
+                "unknown": unknown,
             })
         if not entries and data:
-            entries.append({"name": data.get("primary_model") or "daily", "pct": _widget_pct_value(data.get("daily_left")), "reset": data.get("daily_reset")})
+            daily = data.get("daily_left")
+            entries.append({"name": data.get("primary_model") or "Antigravity", "pct": _widget_pct_value(daily), "reset": data.get("daily_reset"), "unknown": daily is None})
         return entries
 
     def _widget_gemini_entries(self):
@@ -2493,10 +2584,7 @@ class AiLimitApp(rumps.App):
     # ── 立即刷新 ──────────────────────────────────────────────────────────────
 
     def _force_refresh(self, _):
-        try:
-            _CACHE_PATH.unlink()
-        except Exception:
-            pass
+        _clear_all_caches()
         # 后台拉，不卡 UI；新数据 ≤几秒内通过 _apply_pending 落到菜单上
         self._kick_background_fetch()
 

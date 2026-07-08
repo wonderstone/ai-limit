@@ -35,6 +35,7 @@ from ai_limit.providers import (
     DeepSeekError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
+    codex_5h_remaining_percent,
     current_codex_rate_limits,
     has_deepseek_api_key,
     has_google_oauth_creds,
@@ -165,8 +166,12 @@ def _fetch_codex():
             return {"error": fallback_reason or "no Codex data"}
         primary = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
+        # 缺 5h 窗口数据时不能伪造剩余 100%（详见 codex_5h_remaining_percent）。
+        five_h_left = codex_5h_remaining_percent(rl)
+        if five_h_left is None:
+            return {"error": fallback_reason or "incomplete Codex data"}
         return {
-            "5h_left": int(round(100 - primary.get("used_percent", 0))),
+            "5h_left": int(round(five_h_left)),
             "7d_left": int(round(100 - secondary.get("used_percent", 0))),
             "5h_reset": primary.get("resets_at"),
             "7d_reset": secondary.get("resets_at"),

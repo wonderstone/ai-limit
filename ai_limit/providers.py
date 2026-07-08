@@ -25,7 +25,6 @@ GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
 GEMINI_APP_BATCHEXECUTE_URL = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
 GEMINI_APP_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "gemini-app-usage.json"
 GEMINI_APP_USAGE_CACHE_TTL_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC", 30 * 60))
-GEMINI_APP_PROFILE_COPY_DIR = pathlib.Path("/tmp/ai-limit-gemini-profile-copy")
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
@@ -108,6 +107,16 @@ class GoogleQuotaAuthError(GoogleQuotaError):
 
 class GeminiAppUsageError(Exception):
     pass
+
+
+def clear_provider_caches() -> None:
+    for path in (GEMINI_APP_USAGE_CACHE, ANTIGRAVITY_CLI_USAGE_CACHE, CODEX_WINDOW_CACHE):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
 
 def find_free_local_port() -> int:
@@ -637,6 +646,29 @@ def prompt_app_server_confirm() -> bool:
     return ans in ("y", "yes")
 
 
+def codex_5h_remaining_percent(rate_limits: dict):
+    """返回 Codex 5 小时窗口的剩余百分比，数据缺失时返回 None。
+
+    优先用 web 归一化后的 ``summary["5h_remaining_percent"]``，其次回退到
+    ``primary.used_percent``（本地快照没有 summary，只有 primary）。
+
+    瞬时/不完整的 chatgpt.com usage 响应会缺失 primary_window，若把「缺数据」
+    当成 used_percent=0 就会错误闪现剩余 100%。真正重置的窗口仍会返回带
+    used_percent=0 的 primary_window，因此缺 used_percent 即代表无数据 → None，
+    调用方据此保留上一份状态、等待下一轮轮询纠正。
+    """
+    if not rate_limits:
+        return None
+    summary = rate_limits.get("summary") or {}
+    remaining = summary.get("5h_remaining_percent")
+    if remaining is not None:
+        return remaining
+    primary = rate_limits.get("primary") or {}
+    if "used_percent" in primary:
+        return 100 - primary["used_percent"]
+    return None
+
+
 def current_codex_rate_limits(latest_codex_rate_limits_func):
     reasons = []
 
@@ -1012,8 +1044,13 @@ def _antigravity_sidecar_origin(timeout: int) -> str | None:
         return None
     for target in targets:
         url = str(target.get("url") or "")
-        if "/sidecars" not in url:
-            continue
+        title = str(target.get("title") or "")
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "https" and parsed.hostname in ("127.0.0.1", "localhost") and parsed.port:
+            if "/sidecars" in url or title.lower() == "antigravity":
+                return f"https://127.0.0.1:{parsed.port}"
+    for target in targets:
+        url = str(target.get("url") or "")
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme == "https" and parsed.hostname in ("127.0.0.1", "localhost") and parsed.port:
             return f"https://127.0.0.1:{parsed.port}"
@@ -1877,259 +1914,6 @@ def _save_gemini_app_usage_cache(data: dict):
         pass
 
 
-def _chrome_executable() -> str:
-    candidates = (
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-    )
-    for candidate in candidates:
-        if pathlib.Path(candidate).exists():
-            return candidate
-    found = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chrome")
-    if found:
-        return found
-    raise GeminiAppUsageError("Google Chrome executable not found")
-
-
-def _copy_chrome_profile_for_gemini(timeout: int):
-    source = pathlib.Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-    if not source.exists():
-        raise GeminiAppUsageError("Chrome profile directory not found")
-    GEMINI_APP_PROFILE_COPY_DIR.mkdir(parents=True, exist_ok=True)
-    for singleton in GEMINI_APP_PROFILE_COPY_DIR.glob("Singleton*"):
-        try:
-            singleton.unlink()
-        except OSError:
-            pass
-    cmd = [
-        "rsync",
-        "-a",
-        "--delete",
-        "--exclude=Singleton*",
-        "--exclude=*/Cache/***",
-        "--exclude=*/Code Cache/***",
-        "--exclude=*/GPUCache/***",
-        "--exclude=*/GrShaderCache/***",
-        "--exclude=*/ShaderCache/***",
-        "--exclude=*/Crashpad/***",
-        "--exclude=*/Service Worker/CacheStorage/***",
-        f"{source}/",
-        f"{GEMINI_APP_PROFILE_COPY_DIR}/",
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=max(timeout, 20), check=True)
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode(errors="replace")[:300] if exc.stderr else str(exc)
-        raise GeminiAppUsageError(f"failed to copy Chrome profile: {detail}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GeminiAppUsageError("copying Chrome profile timed out") from exc
-
-
-def _read_http_json(url: str, timeout: int):
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return json.loads(response.read())
-
-
-def _cdp_websocket_call(ws_url: str, method: str, params: dict | None = None, timeout: int = 10):
-    parsed = urllib.parse.urlparse(ws_url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 80
-    path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-    sock = socket.create_connection((host, port), timeout=timeout)
-    try:
-        key = base64.b64encode(os.urandom(16)).decode()
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        )
-        sock.sendall(request.encode())
-        header = b""
-        while b"\r\n\r\n" not in header:
-            header += sock.recv(4096)
-        if b" 101 " not in header.split(b"\r\n", 1)[0]:
-            raise GeminiAppUsageError(f"CDP websocket handshake failed: {header[:120]!r}")
-
-        payload = json.dumps({"id": 1, "method": method, "params": params or {}}).encode()
-        mask = os.urandom(4)
-        frame = bytearray([0x81])
-        length = len(payload)
-        if length < 126:
-            frame.append(0x80 | length)
-        elif length < 65536:
-            frame.extend([0x80 | 126])
-            frame.extend(struct.pack("!H", length))
-        else:
-            frame.extend([0x80 | 127])
-            frame.extend(struct.pack("!Q", length))
-        frame.extend(mask)
-        frame.extend(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        sock.sendall(bytes(frame))
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            first = sock.recv(2)
-            if not first:
-                break
-            byte1, byte2 = first
-            length = byte2 & 0x7F
-            if length == 126:
-                length = struct.unpack("!H", sock.recv(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", sock.recv(8))[0]
-            mask_key = sock.recv(4) if byte2 & 0x80 else None
-            data = bytearray()
-            while len(data) < length:
-                data.extend(sock.recv(length - len(data)))
-            if mask_key:
-                data = bytearray(byte ^ mask_key[index % 4] for index, byte in enumerate(data))
-            if byte1 & 0x0F == 1:
-                message = json.loads(data.decode())
-                if message.get("id") == 1:
-                    return message
-        raise GeminiAppUsageError("CDP websocket response timed out")
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-
-def _parse_gemini_app_usage_text(text: str) -> dict:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    bucket_labels = {"当前用量", "Current usage", "Current Usage", "每周限额", "Weekly limit", "Weekly Limit"}
-
-    def find_bucket(names: tuple[str, ...], display_name: str):
-        for index, line in enumerate(lines):
-            if line in names:
-                end = len(lines)
-                for next_index in range(index + 1, min(len(lines), index + 12)):
-                    if lines[next_index] in bucket_labels:
-                        end = next_index
-                        break
-                section = lines[index:end]
-                used = None
-                reset = None
-                for item in section:
-                    match = re.search(r"(?:已使用|Used)\s*(\d+(?:\.\d+)?)%", item, re.I)
-                    if match:
-                        used = float(match.group(1))
-                    reset_match = re.search(r"(?:重置时间|Reset(?:s)?(?: at| time)?)[：:]\s*(.+)", item, re.I)
-                    if reset_match:
-                        reset = reset_match.group(1).strip()
-                if used is not None:
-                    remaining = max(0, min(100, 100 - used))
-                    return {
-                        "display_name": display_name,
-                        "used_percent": int(round(used)),
-                        "remaining_percent": int(round(remaining)),
-                        "reset_text": reset,
-                        "source": "dom",
-                    }
-        return None
-
-    buckets = [
-        bucket
-        for bucket in (
-            find_bucket(("当前用量", "Current usage", "Current Usage"), "当前用量"),
-            find_bucket(("每周限额", "Weekly limit", "Weekly Limit"), "每周限额"),
-        )
-        if bucket
-    ]
-    if not buckets:
-        raise GeminiAppUsageError("Gemini usage page did not expose usage percentages")
-
-    primary = min(buckets, key=lambda bucket: bucket.get("remaining_percent", 100))
-    return {
-        "source": "gemini.google.com/usage DOM",
-        "final_url": GEMINI_APP_USAGE_URL,
-        "available": True,
-        "unavailable_reason": None,
-        "summary": {
-            "remaining_percent": primary.get("remaining_percent"),
-            "used_percent": primary.get("used_percent"),
-            "reset_time": None,
-            "reset_text": primary.get("reset_text"),
-            "bucket_count": len(buckets),
-            "model_count": 0,
-        },
-        "primary": primary,
-        "buckets": buckets,
-        "models": [],
-    }
-
-
-def _live_gemini_app_usage_from_profile(timeout: int) -> dict:
-    _copy_chrome_profile_for_gemini(timeout)
-    port = find_free_local_port()
-    chrome = _chrome_executable()
-    proc = subprocess.Popen(
-        [
-            chrome,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={GEMINI_APP_PROFILE_COPY_DIR}",
-            "--profile-directory=Default",
-            "--no-first-run",
-            "--no-default-browser-check",
-            GEMINI_APP_USAGE_URL,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        version_url = f"http://127.0.0.1:{port}/json/version"
-        deadline = time.time() + max(timeout, 20)
-        while time.time() < deadline:
-            try:
-                _read_http_json(version_url, timeout=1)
-                break
-            except Exception:
-                time.sleep(0.25)
-        else:
-            raise GeminiAppUsageError("Chrome DevTools endpoint did not start")
-
-        target = None
-        text = ""
-        while time.time() < deadline:
-            pages = _read_http_json(f"http://127.0.0.1:{port}/json", timeout=2)
-            target = next((page for page in pages if "gemini.google.com/usage" in page.get("url", "")), None)
-            if target:
-                result = _cdp_websocket_call(
-                    target["webSocketDebuggerUrl"],
-                    "Runtime.evaluate",
-                    {
-                        "expression": "document.body.innerText",
-                        "returnByValue": True,
-                        "awaitPromise": True,
-                    },
-                    timeout=5,
-                )
-                text = ((result.get("result") or {}).get("result") or {}).get("value") or ""
-                if "当前用量" in text or "Current usage" in text:
-                    break
-            time.sleep(0.5)
-        data = _parse_gemini_app_usage_text(text)
-        _save_gemini_app_usage_cache(data)
-        return data
-    except GeminiAppUsageError:
-        raise
-    except Exception as exc:
-        raise GeminiAppUsageError(str(exc) or exc.__class__.__name__) from exc
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        for singleton in GEMINI_APP_PROFILE_COPY_DIR.glob("Singleton*"):
-            try:
-                singleton.unlink()
-            except OSError:
-                pass
-
 
 def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     cached = _load_gemini_app_usage_cache()
@@ -2137,15 +1921,11 @@ def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         cached["source"] = f"{cached.get('source', 'gemini.google.com/usage')} (cached)"
         return datetime.datetime.now(datetime.timezone.utc), cached
 
+    rpc_error = None
     try:
         return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage_from_rpc(timeout=timeout)
-    except GeminiAppUsageError:
-        pass
-
-    try:
-        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage_from_profile(timeout=max(timeout, 20))
-    except GeminiAppUsageError:
-        pass
+    except GeminiAppUsageError as exc:
+        rpc_error = exc
 
     opener, html, final_url = _gemini_app_cookie_context(timeout)
     if not (
@@ -2158,7 +1938,7 @@ def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                 "Gemini App 未登录，请先在 Chrome 打开 gemini.google.com/usage",
                 "Gemini App is not signed in; open gemini.google.com/usage in Chrome first",
             )
-        )
+        ) from rpc_error
 
     payloads = []
     rpc_errors = []
