@@ -26,6 +26,11 @@ OPTIONS = {
         "browser_cookie3",
         "Cryptodome",
         "requests",
+        # certifi must stay an on-disk package: from inside python311.zip its
+        # cacert.pem is extracted to a temp file that macOS eventually deletes
+        # under a long-running app, breaking every TLS call.
+        "certifi",
+        "charset_normalizer",
         "alibabacloud_bssopenapi20171214",
         "alibabacloud_tea_openapi",
     ],

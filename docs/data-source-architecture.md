@@ -106,6 +106,13 @@ Flow:
 6. Fall back to other batchexecute RPCs that expose model/quota-like payloads.
 7. Normalize quota buckets and model entries.
 
+Caching:
+
+- A fresh snapshot is reused for `AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC` (default 120s) to avoid hammering the endpoint on every 60s refresh.
+- An older snapshot is served only when the live request fails, up to `AI_LIMIT_GEMINI_APP_CACHE_STALE_SEC` (default 30 min).
+- Cached readings are labelled in `source` (`(cached Ns)` / `(stale cache Ns)`) and carry `cached`, `cache_age_seconds`, and `cache_stale`.
+- The cache must never be a long-lived first data source: the 5-hour bucket can move tens of percent within one window, and a stale reading visibly disagrees with the vendor page.
+
 Important boundary:
 
 - ai-limit must not copy Chrome profiles, launch Chrome with remote debugging, or use CDP to scrape the DOM in the background.

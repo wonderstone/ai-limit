@@ -32,3 +32,29 @@
 1. `POST /api/v5/repos/{owner}/{repo}/releases` 创建 Release，需带 `target_commitish`
 2. `POST /api/v5/repos/{owner}/{repo}/releases/{id}/attach_files` 上传附件
 用完后在 Gitee 令牌页撤销 token。
+
+---
+
+## 004 · Gemini 额度与 gemini.google.com/usage 对不上
+
+**现象**：菜单栏/悬浮窗里的 Gemini 当前用量显示 2%，同一时刻 https://gemini.google.com/usage 显示 25%，之后实测已到 47%。
+
+**原因**：`live_gemini_app_usage()` 把 `~/.cache/ai-limit/gemini-app-usage.json` 当成第一数据源，TTL 是 30 分钟。5 小时窗口在半小时里可以涨几十个百分点，所以缓存命中期间界面一直停留在半小时前的数字。Google 自己那一页大约每几分钟刷新一次。
+
+**解法**：
+- 新鲜期 TTL 降到 120 秒（`AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC`）
+- 旧快照只做离线兜底，最长 30 分钟（`AI_LIMIT_GEMINI_APP_CACHE_STALE_SEC`），并在 `source` 里标出 `(cached Ns)` / `(stale cache Ns)`
+- 兜底 RPC 路径也要写缓存，之前只有主 RPC 路径写
+
+---
+
+## 005 · py2app 打包后 LLM API 全部「余额失败」
+
+**现象**：App 连续运行两周后，LLM API 面板里 7 个 provider 全变成「余额失败」，重新用同一份代码在终端跑却全部正常。真实报错是 `Could not find a suitable TLS CA certificate bundle, invalid path: /var/folders/.../T/tmpXXXXcacert.pem`。
+
+**原因**：`certifi` 被 py2app 塞进了 `python311.zip`，`certifi.where()` 只能把 `cacert.pem` 解压到 `/var/folders/.../T/` 的临时文件，并且只在进程存活期间保留。macOS 会清理几天没被访问的临时文件，长驻的菜单栏 App 于是丢掉了 CA 包，所有 `requests` 调用全部失败。`providers.py` 走 urllib + 系统 SSL，所以 Claude/Codex/Gemini 额度不受影响——只有 `llm_balance.py` 挂掉，这一点很容易误判成 API Key 失效。
+
+**解法**：
+- `menubar/setup.py` 的 `packages` 加上 `certifi`（和 `charset_normalizer`），让它落在磁盘上而不是 zip 里
+- `llm_balance._ensure_ca_bundle()` 再兜一层：临时路径失效时把 `cacert.pem` 复制到 `~/.cache/ai-limit/cacert.pem`，同时改写 `certifi.where`、`requests.utils/adapters.DEFAULT_CA_BUNDLE_PATH` 和 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`
+- 只设环境变量不够：阿里云 SDK（`Tea.core`）直接调 `certifi.where()`，requests 也在 import 时把 `DEFAULT_CA_BUNDLE_PATH` 冻住了

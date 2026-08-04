@@ -24,7 +24,12 @@ GOOGLE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQ
 GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
 GEMINI_APP_BATCHEXECUTE_URL = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
 GEMINI_APP_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "gemini-app-usage.json"
-GEMINI_APP_USAGE_CACHE_TTL_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC", 30 * 60))
+# gemini.google.com/usage refreshes its own numbers every few minutes, and the
+# 5-hour bucket can move tens of percent inside one window. A long fresh-cache
+# TTL therefore shows numbers that visibly disagree with the vendor page, so the
+# fresh window stays short and the older copy is only kept as an offline fallback.
+GEMINI_APP_USAGE_CACHE_TTL_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC", 120))
+GEMINI_APP_USAGE_CACHE_STALE_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_STALE_SEC", 30 * 60))
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
@@ -1897,15 +1902,30 @@ def _live_gemini_app_usage_from_rpc(timeout: int) -> dict:
     return data
 
 
-def _load_gemini_app_usage_cache():
+def _load_gemini_app_usage_cache(max_age_sec: int = GEMINI_APP_USAGE_CACHE_TTL_SEC):
+    """Return ``(data, age_seconds)`` for the cached usage snapshot, if young enough."""
     try:
         data = json.loads(GEMINI_APP_USAGE_CACHE.read_text(encoding="utf-8"))
         cached_at = float(data.get("cached_at", 0))
-        if time.time() - cached_at <= GEMINI_APP_USAGE_CACHE_TTL_SEC:
-            return data.get("data")
+        age = time.time() - cached_at
+        payload = data.get("data")
+        if payload is not None and 0 <= age <= max_age_sec:
+            return payload, int(age)
     except Exception:
         pass
-    return None
+    return None, None
+
+
+def _mark_gemini_app_usage_cached(data: dict, age_seconds: int | None, *, stale: bool) -> dict:
+    data = dict(data)
+    age_seconds = int(age_seconds or 0)
+    base_source = str(data.get("source") or "gemini.google.com/usage").split(" (cached")[0]
+    suffix = "stale cache" if stale else "cached"
+    data["source"] = f"{base_source} ({suffix} {age_seconds}s)"
+    data["cached"] = True
+    data["cache_age_seconds"] = age_seconds
+    data["cache_stale"] = stale
+    return data
 
 
 def _save_gemini_app_usage_cache(data: dict):
@@ -1921,14 +1941,31 @@ def _save_gemini_app_usage_cache(data: dict):
 
 
 def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
-    cached = _load_gemini_app_usage_cache()
-    if cached:
-        cached["source"] = f"{cached.get('source', 'gemini.google.com/usage')} (cached)"
-        return datetime.datetime.now(datetime.timezone.utc), cached
+    cached, age = _load_gemini_app_usage_cache()
+    if cached is not None:
+        return (
+            datetime.datetime.now(datetime.timezone.utc),
+            _mark_gemini_app_usage_cached(cached, age, stale=False),
+        )
 
+    try:
+        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage(timeout)
+    except Exception:
+        # Serving an older snapshot beats showing nothing, but it must be
+        # labelled so the caller can tell it apart from a fresh reading.
+        stale, stale_age = _load_gemini_app_usage_cache(GEMINI_APP_USAGE_CACHE_STALE_SEC)
+        if stale is None:
+            raise
+        return (
+            datetime.datetime.now(datetime.timezone.utc),
+            _mark_gemini_app_usage_cached(stale, stale_age, stale=True),
+        )
+
+
+def _live_gemini_app_usage(timeout: int) -> dict:
     rpc_error = None
     try:
-        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage_from_rpc(timeout=timeout)
+        return _live_gemini_app_usage_from_rpc(timeout=timeout)
     except GeminiAppUsageError as exc:
         rpc_error = exc
 
@@ -1994,7 +2031,9 @@ def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     }
     if rpc_errors and not payloads:
         data["rpc_errors"] = rpc_errors
-    return datetime.datetime.now(datetime.timezone.utc), data
+    if buckets:
+        _save_gemini_app_usage_cache(data)
+    return data
 
 
 def load_deepseek_api_key() -> str:

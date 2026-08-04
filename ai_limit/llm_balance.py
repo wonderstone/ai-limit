@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import importlib
+import os
+import pathlib
 from typing import Any
 from urllib.parse import quote
 
@@ -14,6 +16,50 @@ import requests
 
 
 _UNSET = object()
+
+_CA_BUNDLE_PATH = pathlib.Path.home() / ".cache" / "ai-limit" / "cacert.pem"
+
+
+def _ensure_ca_bundle() -> None:
+    """Keep a CA bundle on a path that survives, and point requests/ssl at it.
+
+    Inside the py2app bundle ``certifi`` lives in a zip, so ``certifi.where()``
+    extracts ``cacert.pem`` into ``/var/folders/.../T`` and keeps it only for the
+    life of the process. The menu bar app runs for weeks, and macOS deletes temp
+    files it has not seen for a few days — after that every balance call fails
+    with "Could not find a suitable TLS CA certificate bundle". Copying the
+    bundle somewhere durable removes that failure mode.
+    """
+    try:
+        import certifi
+
+        where = certifi.where()
+        if os.path.exists(where) and not str(where).startswith(_temp_prefixes()):
+            return
+        if not _CA_BUNDLE_PATH.exists():
+            from importlib.resources import files
+
+            pem = files("certifi").joinpath("cacert.pem").read_bytes()
+            _CA_BUNDLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _CA_BUNDLE_PATH.write_bytes(pem)
+        # certifi.where() is read directly by the Alibaba Cloud SDK, and requests
+        # froze its own copy into DEFAULT_CA_BUNDLE_PATH at import time — that
+        # copy wins over REQUESTS_CA_BUNDLE on sessions with trust_env disabled.
+        certifi.where = lambda: str(_CA_BUNDLE_PATH)  # type: ignore[assignment]
+        for module_name in ("requests.utils", "requests.adapters"):
+            module = importlib.import_module(module_name)
+            if hasattr(module, "DEFAULT_CA_BUNDLE_PATH"):
+                module.DEFAULT_CA_BUNDLE_PATH = str(_CA_BUNDLE_PATH)  # type: ignore[attr-defined]
+    except Exception:
+        return
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", str(_CA_BUNDLE_PATH))
+    os.environ.setdefault("SSL_CERT_FILE", str(_CA_BUNDLE_PATH))
+
+
+def _temp_prefixes() -> tuple[str, ...]:
+    import tempfile
+
+    return (tempfile.gettempdir(), "/var/folders", "/tmp", "/private/var/folders")
 
 
 def _utc_now_iso() -> str:
@@ -643,6 +689,7 @@ class BalanceAdapterRegistry:
         env_values: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         adapter = self.resolve(provider)
+        _ensure_ca_bundle()
         try:
             return adapter.fetch(BalanceAdapterContext(provider=provider, secret=secret, env_values=env_values))
         except requests.HTTPError as exc:
