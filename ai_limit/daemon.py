@@ -36,6 +36,8 @@ from ai_limit.providers import (
     GoogleQuotaAuthError,
     GoogleQuotaError,
     codex_5h_remaining_percent,
+    codex_window_remaining_percent,
+    codex_window_reset_time,
     current_codex_rate_limits,
     has_deepseek_api_key,
     has_google_oauth_creds,
@@ -174,15 +176,15 @@ def _fetch_codex():
             return {"error": fallback_reason or "Codex live data unavailable"}
         primary = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
-        # 缺 5h 窗口数据时不能伪造剩余 100%（详见 codex_5h_remaining_percent）。
         five_h_left = codex_5h_remaining_percent(rl)
-        if five_h_left is None:
+        weekly_left = codex_window_remaining_percent(rl, "weekly")
+        if five_h_left is None and weekly_left is None:
             return {"error": fallback_reason or "incomplete Codex data"}
         return {
-            "5h_left": int(round(five_h_left)),
-            "7d_left": int(round(100 - secondary.get("used_percent", 0))),
-            "5h_reset": primary.get("resets_at"),
-            "7d_reset": secondary.get("resets_at"),
+            "5h_left": None if five_h_left is None else int(round(five_h_left)),
+            "7d_left": int(round(weekly_left if weekly_left is not None else 100 - secondary.get("used_percent", 0))),
+            "5h_reset": codex_window_reset_time(rl, "5h"),
+            "7d_reset": codex_window_reset_time(rl, "weekly") or secondary.get("resets_at"),
             "plan": rl.get("plan_type") or "?",
         }
     except CodexAuthError:
@@ -280,21 +282,22 @@ def _check_and_notify():
 
     # Codex
     if codex and "error" not in codex:
-        pct = codex["5h_left"]
-        state["codex_5h"] = pct
-        prev_pct = prev.get("codex_5h", 100)
-        if pct <= CRIT_THRESHOLD and prev_pct > CRIT_THRESHOLD:
-            _notify(
-                "⚠️ CodeX 额度严重不足",
-                f"5 小时内仅剩 {pct}%，请留意用量",
-            )
-            _log(f"CRITICAL: CodeX 5h remaining = {pct}%")
-        elif pct <= WARN_THRESHOLD and prev_pct > WARN_THRESHOLD:
-            _notify(
-                "CodeX 额度偏低",
-                f"5 小时内剩余 {pct}%",
-            )
-            _log(f"WARN: CodeX 5h remaining = {pct}%")
+        pct = codex.get("5h_left")
+        if pct is not None:
+            state["codex_5h"] = pct
+            prev_pct = prev.get("codex_5h", 100)
+            if pct <= CRIT_THRESHOLD and prev_pct > CRIT_THRESHOLD:
+                _notify(
+                    "⚠️ CodeX 额度严重不足",
+                    f"5 小时内仅剩 {pct}%，请留意用量",
+                )
+                _log(f"CRITICAL: CodeX 5h remaining = {pct}%")
+            elif pct <= WARN_THRESHOLD and prev_pct > WARN_THRESHOLD:
+                _notify(
+                    "CodeX 额度偏低",
+                    f"5 小时内剩余 {pct}%",
+                )
+                _log(f"WARN: CodeX 5h remaining = {pct}%")
 
     # DeepSeek
     if deepseek and "error" not in deepseek:

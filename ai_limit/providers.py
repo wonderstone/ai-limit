@@ -530,17 +530,27 @@ def _normalize_web_rate_limits(data: dict) -> dict:
     def group_from_rate_limit(name: str, raw_rate_limit: dict, *, default_group: bool = False) -> dict:
         primary = window((raw_rate_limit or {}).get("primary_window"))
         secondary = window((raw_rate_limit or {}).get("secondary_window"))
+
+        def label_for(bucket: dict | None, fallback: str) -> str:
+            if not bucket:
+                return fallback
+            if bucket.get("window") == "5h":
+                return "5 hour usage limit"
+            if bucket.get("window") == "weekly":
+                return "Weekly usage limit"
+            return fallback
+
         buckets = []
-        for label, bucket in (
-            ("5 hour usage limit", primary),
-            ("Weekly usage limit", secondary),
+        for fallback_label, bucket in (
+            ("Primary usage limit", primary),
+            ("Secondary usage limit", secondary),
         ):
             if not bucket:
                 continue
             buckets.append(
                 {
                     **bucket,
-                    "display_name": label,
+                    "display_name": label_for(bucket, fallback_label),
                     "group_display_name": name,
                     "default_group": default_group,
                 }
@@ -563,8 +573,10 @@ def _normalize_web_rate_limits(data: dict) -> dict:
             )
         )
     buckets = [bucket for group in groups for bucket in group.get("buckets") or []]
-    five_hour = [bucket for bucket in buckets if bucket.get("window") == "5h"]
-    weekly = [bucket for bucket in buckets if bucket.get("window") == "weekly"]
+    default_buckets = [bucket for bucket in buckets if bucket.get("default_group")]
+    summary_buckets = default_buckets or buckets
+    five_hour = [bucket for bucket in summary_buckets if bucket.get("window") == "5h"]
+    weekly = [bucket for bucket in summary_buckets if bucket.get("window") == "weekly"]
 
     normalized = {
         "limit_id": None,
@@ -651,27 +663,71 @@ def prompt_app_server_confirm() -> bool:
     return ans in ("y", "yes")
 
 
-def codex_5h_remaining_percent(rate_limits: dict):
-    """返回 Codex 5 小时窗口的剩余百分比，数据缺失时返回 None。
+def _codex_default_group_bucket(rate_limits: dict, window: str):
+    for group in rate_limits.get("groups") or []:
+        group_name = str(group.get("display_name") or "").strip().lower()
+        if not (group.get("default_group") or group_name == "balance"):
+            continue
+        for bucket in group.get("buckets") or []:
+            if bucket.get("window") == window:
+                return bucket
+    for bucket in rate_limits.get("buckets") or []:
+        group_name = str(bucket.get("group_display_name") or "").strip().lower()
+        if group_name == "balance" and bucket.get("window") == window:
+            return bucket
+    return None
 
-    优先用 web 归一化后的 ``summary["5h_remaining_percent"]``，其次回退到
-    ``primary.used_percent``（本地快照没有 summary，只有 primary）。
 
-    瞬时/不完整的 chatgpt.com usage 响应会缺失 primary_window，若把「缺数据」
-    当成 used_percent=0 就会错误闪现剩余 100%。真正重置的窗口仍会返回带
-    used_percent=0 的 primary_window，因此缺 used_percent 即代表无数据 → None，
-    调用方据此保留上一份状态、等待下一轮轮询纠正。
-    """
-    if not rate_limits:
+def _codex_remaining_from_bucket(bucket: dict | None):
+    if not bucket:
         return None
-    summary = rate_limits.get("summary") or {}
-    remaining = summary.get("5h_remaining_percent")
+    remaining = bucket.get("remaining_percent")
     if remaining is not None:
         return remaining
-    primary = rate_limits.get("primary") or {}
-    if "used_percent" in primary:
-        return 100 - primary["used_percent"]
+    if "used_percent" in bucket:
+        return 100 - bucket["used_percent"]
     return None
+
+
+def codex_window_remaining_percent(rate_limits: dict, window: str):
+    """Return remaining percent for the default/Balance Codex quota window."""
+    if not rate_limits:
+        return None
+    remaining = _codex_remaining_from_bucket(_codex_default_group_bucket(rate_limits, window))
+    if remaining is not None:
+        return remaining
+    summary_key = "5h_remaining_percent" if window == "5h" else "weekly_remaining_percent"
+    summary = rate_limits.get("summary") or {}
+    remaining = summary.get(summary_key)
+    if remaining is not None:
+        return remaining
+    if window == "5h":
+        return None
+    legacy = rate_limits.get("primary" if window == "5h" else "secondary") or {}
+    if "used_percent" in legacy:
+        return 100 - legacy["used_percent"]
+    return None
+
+
+def codex_window_reset_time(rate_limits: dict, window: str):
+    if not rate_limits:
+        return None
+    bucket = _codex_default_group_bucket(rate_limits, window)
+    if bucket:
+        return bucket.get("resets_at") or bucket.get("reset_time")
+    if window == "5h":
+        return None
+    legacy = rate_limits.get("primary" if window == "5h" else "secondary") or {}
+    return legacy.get("resets_at") or legacy.get("reset_time")
+
+
+def codex_5h_remaining_percent(rate_limits: dict):
+    """返回 Codex 默认 Balance 5 小时窗口的剩余百分比，数据缺失时返回 None。
+
+    优先用 web 归一化后的默认 ``Balance`` 额度组。Spark 等附加额度组可以
+    在详情里单独展示，但不能冒充 CodeX 总额度。
+    """
+    return codex_window_remaining_percent(rate_limits, "5h")
 
 
 def current_codex_rate_limits(latest_codex_rate_limits_func, *, allow_app_server_fallback=True):

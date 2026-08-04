@@ -17,6 +17,21 @@ import atexit
 os.environ.setdefault("LANG", "en_US.UTF-8")
 os.environ.setdefault("LC_ALL", "en_US.UTF-8")
 os.environ.setdefault("PYTHONUTF8", "1")
+_CLI_PATHS = (
+    str(pathlib.Path.home() / ".local" / "bin"),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
+_existing_path = os.environ.get("PATH") or ""
+os.environ["PATH"] = os.pathsep.join(
+    [path for path in _CLI_PATHS if path]
+    + [path for path in _existing_path.split(os.pathsep) if path and path not in _CLI_PATHS]
+)
 
 import rumps
 import AppKit
@@ -40,6 +55,8 @@ from ai_limit.providers import (
     CodexAuthError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     codex_5h_remaining_percent,
+    codex_window_remaining_percent,
+    codex_window_reset_time,
     clear_provider_caches,
     DeepSeekAuthError,
     DeepSeekError,
@@ -353,10 +370,13 @@ def _load_cache():
         raw = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
         age = datetime.datetime.now().timestamp() - float(raw.get("cached_at", 0))
         claude = raw.get("claude")
+        codex = raw.get("codex")
+        if isinstance(codex, dict) and codex.get("source") != "web":
+            codex = None
         ttl = _ERROR_CACHE_TTL if isinstance(claude, dict) and claude.get("error") else _CACHE_TTL
         if age <= ttl:
             cached = {
-                "codex": raw.get("codex"),
+                "codex": codex,
                 "deepseek": raw.get("deepseek"),
                 "google": raw.get("google"),
                 "gemini": raw.get("gemini"),
@@ -365,7 +385,7 @@ def _load_cache():
             # Older builds stored only claude/codex. Keep accepting that shape
             # so users do not need to delete their cache after upgrading.
             if all(value is None for value in cached.values()):
-                return claude, raw.get("codex")
+                return claude, codex
             return claude, cached
     except Exception:
         pass
@@ -398,6 +418,57 @@ def _save_cache(claude, cached):
         )
     except Exception:
         pass
+
+def _codex_transient_error(codex):
+    if not isinstance(codex, dict) or not codex.get("error"):
+        return False
+    text = str(codex.get("error") or "")
+    return any(
+        needle in text
+        for needle in (
+            "实时数据暂不可用",
+            "live data temporarily unavailable",
+            "额度数据暂不完整",
+            "usage data temporarily incomplete",
+            "网络超时",
+            "Network timeout",
+            "网络不可用",
+            "Network unavailable",
+        )
+    )
+
+def _codex_window_jump(previous, candidate, value_key, reset_key):
+    if not isinstance(previous, dict) or not isinstance(candidate, dict):
+        return False
+    prev_value = previous.get(value_key)
+    next_value = candidate.get(value_key)
+    if prev_value is None or next_value is None:
+        return False
+    prev_reset = previous.get(reset_key)
+    next_reset = candidate.get(reset_key)
+    if not (prev_reset and next_reset):
+        return False
+    if prev_reset != next_reset:
+        return False
+    try:
+        return float(next_value) - float(prev_value) > 25
+    except (TypeError, ValueError):
+        return False
+
+def _codex_unstable_sample(previous, candidate):
+    if not (
+        isinstance(previous, dict)
+        and isinstance(candidate, dict)
+        and previous.get("source") == "web"
+        and candidate.get("source") == "web"
+        and not previous.get("error")
+        and not candidate.get("error")
+    ):
+        return False
+    return (
+        _codex_window_jump(previous, candidate, "5h_left", "5h_reset")
+        or _codex_window_jump(previous, candidate, "7d_left", "7d_reset")
+    )
 
 
 def _clear_all_caches():
@@ -471,30 +542,20 @@ def _fetch_codex(lang):
         # 还会 spawn codex app-server 并触发 5h 冷却副作用。web 瞬时失败时拒绝
         # 这些回退源，保留上一份缓存好值，等待下一轮 web 自动纠正。
         if source != "web":
-            return {"error": _tr(
-                lang,
-                "Codex 实时数据暂不可用，请稍后重试",
-                "Codex live data temporarily unavailable, please retry",
-            )}
+            return None
         primary   = rl.get("primary") or {}
         secondary = rl.get("secondary") or {}
         summary = rl.get("summary") or {}
         buckets = rl.get("buckets") or []
         five_hour_left = codex_5h_remaining_percent(rl)
-        weekly_left = summary.get("weekly_remaining_percent")
-        # 缺 5h 窗口数据时不能伪造剩余 100%（详见 codex_5h_remaining_percent），
-        # 按错误处理以保留上一份缓存，等待下一轮轮询自动纠正。
-        if five_hour_left is None:
-            return {"error": _tr(
-                lang,
-                "Codex 额度数据暂不完整，请稍后重试",
-                "Codex usage data temporarily incomplete, please retry",
-            )}
+        weekly_left = codex_window_remaining_percent(rl, "weekly")
+        if five_hour_left is None and weekly_left is None:
+            return None
         return {
-            "5h_left":  int(round(five_hour_left)),
+            "5h_left":  None if five_hour_left is None else int(round(five_hour_left)),
             "7d_left":  int(round(weekly_left if weekly_left is not None else 100 - secondary.get("used_percent", 0))),
-            "5h_reset": primary.get("resets_at"),
-            "7d_reset": secondary.get("resets_at"),
+            "5h_reset": codex_window_reset_time(rl, "5h"),
+            "7d_reset": codex_window_reset_time(rl, "weekly") or secondary.get("resets_at"),
             "plan":     rl.get("plan_type") or "?",
             "source":   source,
             "groups":   rl.get("groups") or [],
@@ -509,12 +570,12 @@ def _fetch_codex(lang):
     except CodexWebError as e:
         msg = str(e)
         if "timed out" in msg or "urlopen" in msg:
-            msg = _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")
+            return None
         return {"error": msg}
     except (socket.timeout, TimeoutError):
-        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+        return None
     except urllib.error.URLError:
-        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+        return None
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -1117,7 +1178,12 @@ class AiLimitApp(rumps.App):
         if claude is not None:
             self._claude = claude
         if codex is not None:
-            self._codex = codex
+            if _codex_transient_error(codex) and isinstance(self._codex, dict) and not self._codex.get("error"):
+                codex = None
+            elif _codex_unstable_sample(self._codex, codex):
+                codex = None
+            else:
+                self._codex = codex
         if deepseek is not None:
             self._deepseek = deepseek
         if google is not None:
@@ -1254,9 +1320,13 @@ class AiLimitApp(rumps.App):
                     "live": _tr(lang, "codex app-server", "codex app-server"),
                 }.get(source, source)
                 self._codex_source.title = _tr(lang, f"  来源：{source_label}", f"  Source: {source_label}")
-                x5_reset = _fmt_reset_epoch(codex["5h_reset"], lang)
                 x7_reset = _fmt_reset_epoch(codex["7d_reset"], lang)
-                self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)
+                if codex.get("5h_left") is None:
+                    self._codex_5h._menuitem.setHidden_(True)
+                else:
+                    x5_reset = _fmt_reset_epoch(codex.get("5h_reset"), lang)
+                    self._codex_5h.title = _detail_text("5h", codex["5h_left"], x5_reset, lang)
+                    self._codex_5h._menuitem.setHidden_(False)
                 self._codex_7d.title = _detail_text("7d", codex["7d_left"], x7_reset, lang)
                 buckets = codex.get("buckets") or []
                 for index, item in enumerate(self._codex_bucket_items):
@@ -1573,9 +1643,19 @@ class AiLimitApp(rumps.App):
         )
 
     def _render_widget(self):
+        self._sync_codex_from_web_cache()
         if self._widget_content is not None:
             self._render_widget_dashboard()
         self._update_widget_item()
+
+    def _sync_codex_from_web_cache(self):
+        try:
+            _claude, cached = _load_cache()
+            codex = cached.get("codex") if isinstance(cached, dict) else cached
+            if isinstance(codex, dict) and codex.get("source") == "web":
+                self._codex = codex
+        except Exception:
+            pass
 
     def _clear_widget_content(self):
         for view in list(self._widget_content.subviews()):
@@ -1897,6 +1977,8 @@ class AiLimitApp(rumps.App):
             label = item[0]
             pct = item[1] if len(item) > 1 else None
             reset = item[2] if len(item) > 2 else None
+            if pct is None:
+                continue
             pct = _widget_pct_value(pct)
             metrics.append({
                 "label": label,
@@ -2216,7 +2298,8 @@ class AiLimitApp(rumps.App):
                     "reset": self._bucket_reset(bucket),
                 })
         elif data:
-            entries.append({"name": "Balance / 5h", "pct": _widget_pct_value(data.get("5h_left")), "reset": data.get("5h_reset")})
+            if data.get("5h_left") is not None:
+                entries.append({"name": "Balance / 5h", "pct": _widget_pct_value(data.get("5h_left")), "reset": data.get("5h_reset")})
             entries.append({"name": "Balance / weekly", "pct": _widget_pct_value(data.get("7d_left")), "reset": data.get("7d_reset")})
         return entries
 
@@ -2362,7 +2445,8 @@ class AiLimitApp(rumps.App):
                         remaining = max(0, min(100, int(round(100 - bucket.get("used_percent")))))
                     lines.append(self._widget_quota_row(name, remaining, bucket.get("used_percent"), bucket.get("resets_at") or bucket.get("reset_time")))
             else:
-                lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
+                if data.get("5h_left") is not None:
+                    lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
                 lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
         lines.append("")
         return lines
