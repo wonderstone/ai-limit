@@ -58,3 +58,26 @@
 - `menubar/setup.py` 的 `packages` 加上 `certifi`（和 `charset_normalizer`），让它落在磁盘上而不是 zip 里
 - `llm_balance._ensure_ca_bundle()` 再兜一层：临时路径失效时把 `cacert.pem` 复制到 `~/.cache/ai-limit/cacert.pem`，同时改写 `certifi.where`、`requests.utils/adapters.DEFAULT_CA_BUNDLE_PATH` 和 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`
 - 只设环境变量不够：阿里云 SDK（`Tea.core`）直接调 `certifi.where()`，requests 也在 import 时把 `DEFAULT_CA_BUNDLE_PATH` 冻住了
+
+---
+
+## 006 · 重建 .app 时踩的两个坑：构建环境丢失 + 依赖被 modulegraph 拖进来
+
+**现象一**：想重新 py2app 打包，发现机器上已经没有任何装了 `py2app` + `rumps` 的 Python 3.11 了（pyenv 3.11.9 有运行期依赖但没有这两个，homebrew 只剩 3.14）。原构建环境应该是个已被删掉的 venv。
+
+**现象二**：直接用 pyenv 3.11.9 装上 py2app 再打包，产物 **1.8 GB**（原版 71 MB），`lib/python3.11/` 里混进了 matplotlib、numpy、pydantic、sqlalchemy、shiboken6、psycopg2。那个 pyenv 环境装了 1389 个包，`modulegraph` 顺着 import 链全拖进来了，中途还会 `RecursionError: maximum recursion depth exceeded`。
+
+**解法**：用干净的 venv 打包，只装 setup.py `packages` 里真正需要的东西：
+
+```bash
+cd /Users/mac/Desktop/ai-limit
+python3.11 -m venv .venv     # .gitignore 里已经忽略 .venv/
+.venv/bin/python -m pip install py2app rumps browser-cookie3 pycryptodomex \
+    requests certifi charset-normalizer \
+    alibabacloud-bssopenapi20171214 alibabacloud-tea-openapi
+cd menubar && ../.venv/bin/python setup.py py2app
+```
+
+产物回到 74 MB，RecursionError 也一起消失了。
+
+**另一个坑**：不要用 `runpy.run_path('setup.py')` 之类的包装去调 setup.py。`setup.py` 靠 `pathlib.Path(__file__).parent.parent` 把项目根塞进 `sys.path`，包装之后 `__file__` 变成相对路径，算出来是 `menubar/` 而不是项目根，`ai_limit` 和 `usage` 就**静默地没被打进去**——构建照样 exit 0，只有 build log 里 "Modules not found" 一行 `* ai_limit` 能看出来，App 启动才会崩。打完包务必确认 `dist/ai-limit.app/Contents/Resources/lib/python3.11/ai_limit/` 存在。
