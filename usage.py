@@ -576,10 +576,19 @@ def render_google():
         print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(ts_to_local(reset_time))}{_RST}")
     if antigravity.get("limited"):
         model_label = antigravity.get("model_label") or "Antigravity CLI"
-        reset_in = antigravity.get("reset_in") or "?"
+        # Only pre-1.1.9 logs carry a countdown; newer builds report the reset
+        # moment from the quota service instead.
+        reset_in = antigravity.get("reset_in")
+        limit_reset = antigravity.get("reset_time")
+        if reset_in:
+            reset_text = f"{t('日志显示还需', 'log reset in')} {reset_in}"
+        elif limit_reset:
+            reset_text = f"{t('重置于', 'resets at')} {fmt_reset_dt(ts_to_local(limit_reset))}"
+        else:
+            reset_text = t("重置时间未知", "reset time unknown")
         print(
             f"  ⚠️  {t('Antigravity CLI 已触发额度限制', 'Antigravity CLI quota is exhausted')}: "
-            f"{_BOLD}{model_label}{_RST}  |  {t('日志显示还需', 'log reset in')} {reset_in}"
+            f"{_BOLD}{model_label}{_RST}  |  {reset_text}"
         )
 
     quota_groups = data.get("quota_groups") or []

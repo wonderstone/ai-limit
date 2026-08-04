@@ -81,3 +81,25 @@ cd menubar && ../.venv/bin/python setup.py py2app
 产物回到 74 MB，RecursionError 也一起消失了。
 
 **另一个坑**：不要用 `runpy.run_path('setup.py')` 之类的包装去调 setup.py。`setup.py` 靠 `pathlib.Path(__file__).parent.parent` 把项目根塞进 `sys.path`，包装之后 `__file__` 变成相对路径，算出来是 `menubar/` 而不是项目根，`ai_limit` 和 `usage` 就**静默地没被打进去**——构建照样 exit 0，只有 build log 里 "Modules not found" 一行 `* ai_limit` 能看出来，App 启动才会崩。打完包务必确认 `dist/ai-limit.app/Contents/Resources/lib/python3.11/ai_limit/` 存在。
+
+---
+
+## 007 · Antigravity CLI 1.1.9 改了日志格式，429 也不再区分"模型额度耗尽"
+
+**现象**：菜单栏和 CLI 的 Antigravity 数据来源一直是 `agy /usage fallback`，`antigravity` 字段恒为 `null`，「已触发额度限制」的告警横幅再也不出现。额度数字本身是对的，所以很久没被发现。
+
+**定位**：版本时间线卡得很死——最后一个能解析的日志 `cli-20260731_172713.log`（17:27），第一个新格式日志 `cli-20260731_172756.log`（17:28），中间 43 秒就是 language server 1.1.8 → 1.1.9 的升级点。
+
+**两处独立的破坏**：
+
+1. **时间戳不在行首了**。新版每行都加 `ERROR: logging before google.Init: ` 前缀，`ANTIGRAVITY_LOG_TIME_RE` 用 `^[A-Z](\d{2})(\d{2}) ` 配合 `.match()` 直接失配。改成不锚定行首 + `.search()` 即可，新旧两种格式都能解析。
+
+2. **限流消息丢了模型名和倒计时**。旧版是 `RESOURCE_EXHAUSTED (code 429): Individual quota reached. … Resets in 3h20m`，新版只剩 `RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).`。在最新 80 个日志里扫 `Resets in` / `Individual quota` / `quota reached` / `retryDelay` / `quotaId` **全部 0 命中**，`quota_manager.go` 也只打 `doRefreshQuota: starting reload`，不带任何额度数值。
+
+**关键陷阱**：不要图省事去匹配裸的 `RESOURCE_EXHAUSTED (code 429)`。实际日志里这条消息的来源是 `Cache(userInfo): Singleflight refresh failed` / `failed to fetch user status` / `Failed to refresh cache in background`——**是 userInfo 缓存刷新被限流，不是模型额度耗尽**，这时候额度可能还很充足。照着匹配会得到假的「额度耗尽」横幅，比没有横幅更糟。
+
+另外统计 `429` 子串会严重高估：`429.83525ms`、线程号 `429`、UUID `d08653c4-3dc2-429a` 都会命中，200 个日志里 14 个"含 429"实际只有 1 个真的含 `RESOURCE_EXHAUSTED`。
+
+**解法**：横幅改由额度数字驱动（`_antigravity_limit_from_quota`）——哪个 bucket 的 `remaining_percent == 0` 就是它，重置时间直接取该 bucket 的 `reset_time`，比日志里那个 429 当时打印的倒计时更权威。挂在 `_normalize_antigravity_quota_summary` 的出口上，app sidecar 和 `agy /usage` 两条路径一次覆盖。旧格式日志仍然优先（它还能给出具体模型名和触发时刻），解析不到才回退到额度数字。
+
+**副产品**：`agy /usage` 这条路径以前根本没有 `antigravity` 字段（只有 REST 兜底路径的 `_with_antigravity_view` 会加），所以就算日志能解析，走 `/usage` 时横幅也不会出现。

@@ -66,11 +66,23 @@ GOOGLE_MODEL_PRIORITY = (
     "gemini-2.5-flash-lite",
 )
 ANTIGRAVITY_MODEL_LABEL_RE = re.compile(r'Propagating selected model override to backend: label="([^"]+)"')
+# Only the pre-1.1.9 wording is matched on purpose. 1.1.9 replaced it with a
+# bare "RESOURCE_EXHAUSTED (code 429): Resource has been exhausted" that the
+# userInfo and user-status cache refreshes also emit while model quota is still
+# healthy, so matching the new line would raise a false "quota exhausted"
+# banner. Current builds get their limited state from the quota numbers
+# instead — see _antigravity_limit_from_quota.
 ANTIGRAVITY_QUOTA_RE = re.compile(
     r"RESOURCE_EXHAUSTED \(code 429\): Individual quota reached\..*?Resets in "
     r"(?P<duration>(?:(?:\d+)h)?(?:(?:\d+)m)?(?:(?:\d+)s)?)"
 )
-ANTIGRAVITY_LOG_TIME_RE = re.compile(r"^[A-Z](?P<month>\d{2})(?P<day>\d{2}) (?P<time>\d{2}:\d{2}:\d{2})\.(?P<micro>\d{1,6})")
+# Antigravity CLI 1.1.9 (2026-07-31) began prefixing every log line with
+# "ERROR: logging before google.Init: ", so the glog timestamp is no longer at
+# the start of the line. Anchor on the severity+MMDD+HH:MM:SS shape instead of
+# the line start; the trailing time makes a false positive very unlikely.
+ANTIGRAVITY_LOG_TIME_RE = re.compile(
+    r"(?:^|\s)[A-Z](?P<month>\d{2})(?P<day>\d{2}) (?P<time>\d{2}:\d{2}:\d{2})\.(?P<micro>\d{1,6})"
+)
 ANTIGRAVITY_LOG_FILE_RE = re.compile(r"cli-(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})_")
 ANTIGRAVITY_CSRF_RE = re.compile(r"--csrf_token\s+(\S+)")
 ANSI_RE = re.compile(
@@ -983,7 +995,7 @@ def _antigravity_log_year(path: pathlib.Path) -> int:
 
 
 def _parse_antigravity_log_time(line: str, path: pathlib.Path, tzinfo) -> datetime.datetime | None:
-    match = ANTIGRAVITY_LOG_TIME_RE.match(line)
+    match = ANTIGRAVITY_LOG_TIME_RE.search(line)
     if not match:
         return None
     try:
@@ -1184,6 +1196,45 @@ def _antigravity_quota_bucket(raw_bucket: dict) -> dict:
     }
 
 
+def _antigravity_limit_from_quota(normalized: dict) -> dict | None:
+    """Derive the "quota exhausted" state from quota numbers instead of logs.
+
+    The log line that used to name the exhausted model and its reset countdown
+    disappeared in Antigravity CLI 1.1.9 (see ANTIGRAVITY_QUOTA_RE), so the
+    banner is driven by the bucket that actually reports 0% remaining. That is
+    also the more authoritative reset moment: it comes from the quota service
+    rather than from a countdown printed when the 429 happened.
+
+    Returns ``None`` when nothing is exhausted, matching the log-based helper.
+    """
+    exhausted = [
+        bucket
+        for bucket in normalized.get("buckets") or []
+        if not bucket.get("disabled") and bucket.get("remaining_percent") == 0
+    ]
+    if not exhausted:
+        return None
+    # Prefer the window that frees up first, and keep buckets with a known
+    # reset time ahead of ones without.
+    bucket = min(
+        exhausted,
+        key=lambda item: (item.get("reset_time") is None, item.get("reset_time") or ""),
+    )
+    label = " / ".join(
+        part
+        for part in (bucket.get("group_display_name"), bucket.get("display_name"))
+        if part
+    )
+    return {
+        "limited": True,
+        "source": normalized.get("source") or "antigravity quota",
+        "model_label": label or None,
+        "reset_in": None,
+        "reset_time": bucket.get("reset_time"),
+        "bucket_id": bucket.get("bucket_id"),
+    }
+
+
 def _normalize_antigravity_quota_summary(data: dict, source: str = "Antigravity app RetrieveUserQuotaSummary") -> dict:
     response = data.get("response") or data
     groups = []
@@ -1211,7 +1262,7 @@ def _normalize_antigravity_quota_summary(data: dict, source: str = "Antigravity 
                 bucket.get("display_name") or "",
             ),
         )
-    return {
+    normalized = {
         "source": source,
         "quota_groups": groups,
         "primary": primary,
@@ -1225,6 +1276,10 @@ def _normalize_antigravity_quota_summary(data: dict, source: str = "Antigravity 
             "description": response.get("description"),
         },
     }
+    # Both the app sidecar and the `agy /usage` fallback funnel through here, so
+    # attaching the banner once covers every current Antigravity source.
+    normalized["antigravity"] = _antigravity_limit_from_quota(normalized)
+    return normalized
 
 
 def live_antigravity_quota_summary(timeout: int = 8) -> dict:
@@ -1597,7 +1652,9 @@ def _with_antigravity_view(normalized: dict, limit: dict | None, models: list[st
         "legacy_google_buckets": normalized.get("buckets") or [],
         "legacy_google_source": normalized.get("source"),
         "summary": summary,
-        "antigravity": limit,
+        # Pre-1.1.9 logs still give the richer signal (which model, countdown at
+        # 429 time), so keep them first and fall back to the quota numbers.
+        "antigravity": limit or _antigravity_limit_from_quota(normalized),
     }
 
 
