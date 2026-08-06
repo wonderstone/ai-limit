@@ -103,3 +103,49 @@ cd menubar && ../.venv/bin/python setup.py py2app
 **解法**：横幅改由额度数字驱动（`_antigravity_limit_from_quota`）——哪个 bucket 的 `remaining_percent == 0` 就是它，重置时间直接取该 bucket 的 `reset_time`，比日志里那个 429 当时打印的倒计时更权威。挂在 `_normalize_antigravity_quota_summary` 的出口上，app sidecar 和 `agy /usage` 两条路径一次覆盖。旧格式日志仍然优先（它还能给出具体模型名和触发时刻），解析不到才回退到额度数字。
 
 **副产品**：`agy /usage` 这条路径以前根本没有 `antigravity` 字段（只有 REST 兜底路径的 `_with_antigravity_view` 会加），所以就算日志能解析，走 `/usage` 时横幅也不会出现。
+
+---
+
+## 008 · 驱动 agy TUI 抓额度：超时静默、半屏数据当成功、降级冒充成功
+
+**现象**：菜单栏 Antigravity 卡片显示「未知」。CLI 和本地 API 却是正常数字——因为它们跟菜单栏共用 `~/.cache/ai-limit/antigravity-cli-usage.json`（TTL 5 分钟），只要在终端跑过一次，菜单栏就会"恢复"5 分钟，然后再变回未知。这个共享缓存把问题伪装成时好时坏。
+
+**失败链**（四层，每层都在吞信息）：
+
+1. `_run_antigravity_cli_usage_text` 超时**不抛异常**，只 `return` 手上那点残缺抄本
+2. `_parse_antigravity_cli_usage_text` 找不到 `MODELS & QUOTA` → `GoogleQuotaError`
+3. `live_google_quota` 的 `except GoogleQuotaError: pass` 静默吞掉，落到第三级
+4. 第三级 `_with_antigravity_view` 返回 `_antigravity_model_buckets` 拿模型名单硬凑的空壳，`remaining_percent` 全是 `None`——菜单栏 `_has_windowed_quota()` 因此为 False，渲染成「未知」
+
+**定位数据**（同一份代码，三种环境）：
+
+| 环境 | agy 驱动耗时 |
+|---|---|
+| 终端 | 3.9–5.3s |
+| GUI app 进程 | 12s |
+| 跑了 34 小时的旧 app 进程 | 稳定 18s 撞满超时，每次都失败 |
+
+GUI 进程里本来就慢 2.5–3 倍，而 `ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC` 只有 18s。**排除掉的假设**（都实测过）：PATH（app 启动时已前置 `~/.local/bin`，agy 确实被 spawn 了）、无控制终端（`os.setsid()` 后跑通）、环境变量（完全复刻 app 的 env 跑通）、并发争用（趁 app 那次跑着插进去也跑通）、App Sandbox（`codesign -d --entitlements` 为空）。
+
+**更严重的第二个坑**：超时**不等于**解析失败。加了 dump 之后第一次就抓到——翻页抢在渲染前面：`/usage` 标题一出现就连按两次 PageDown，Gemini 组还没渲染就被跳过，该组从此不在抄本里，退出判据永远等不到，跑满 30s；但抄本里有 `MODELS & QUOTA`，解析照样"成功"，于是**半屏数据被写进缓存**：
+
+```
+group_count = 1 | bucket_count = 2       （正常应为 2 组 4 个）
+  claude-and-gpt-models-weekly  99%
+  claude-and-gpt-models-5h     100%
+```
+
+Gemini 组整个丢了，`primary` 从只剩的 bucket 里挑，菜单栏有 5 分钟显示 **99%**，真值 80%。**显示错数字比显示「未知」更糟**，而且在加仪表盘之前完全隐形。
+
+**解法**（四处）：
+
+1. **超时 18s → 30s**，GUI 里观测值 12s 的 2.5 倍，仍在 app 60s 刷新周期内留足其他 provider 的时间
+2. **超时即拒绝**：完整屏幕必然满足退出条件并走 `/exit`，所以超时 ⟹ 抄本不完整，直接抛错不写缓存。宁可没数不要错数
+3. **翻页加门槛**：从「看到 `Models & Quota` 标题就翻」改成「还要看到 `Limit Remaining` 正文才翻」。这个改动是单调的——只推迟翻页、不跳过任何东西，不会破坏本来正常的路径
+4. **降级不再冒充成功**：空壳视图的 `quota_state` 从 `unknown` 改成 `unavailable` + `unavailable_reason`，`live_google_quota` 把前两级的失败原因往下传；菜单栏显示从「未知」改成「取数失败」+ 具体原因。「未知」暗示的是额度状态未知，实际是取数管道断了，这个区别正是排查绕远路的原因
+
+**真正的教训是可观测性**：这条路径原本超时不抛错、原始 pty 文本直接丢弃、降级静默，外面只看到「未知」，零线索。现在 `_run_antigravity_cli_usage_text` 接收 `trace`（走到哪一步 / 耗时 / 是否超时 / 抓了多少字节 / 子进程退出码），失败时 `_dump_antigravity_cli_debug` 把完整抄本 + trace + marker 计数 + `>` 提示符是否命中写到 `~/.cache/ai-limit/agy-usage-debug.txt`（滚动保留 3 次）。上面那个「半屏当成功」的坑就是这个 dump 抓出来的，否则根本不会被发现。
+
+**排查手法备忘**：菜单栏 app 的状态可以从 `~/.ai-limit-menubar-cache.json` 直接读，不用猜 UI 显示什么；确认 app 是否真的 spawn 了子进程用 `ps -eo pid,ppid,etime,comm` 采样，`etime` 恰好等于超时值就是撞满了；跨缓存过期的那一刻才是检验点（`agy_cache_age` 超过 TTL 后 app 能否自己刷新成功），缓存新鲜时一切都看起来正常。
+
+**遗留**：`claude-and-gpt-models-5h` 的百分比经常是 `None`——退出判据 `text.count("Refreshes in") >= 3` 在屏幕翻完前就触发，最后一个 bucket 被分页器截在 `(1–20 of 30 lines)`。改它要重新设计滚动逻辑，风险比收益大，且现在失败会留 dump。另外 GUI 进程里为什么比终端慢 2.5–3 倍，没查出来。
