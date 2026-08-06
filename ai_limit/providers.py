@@ -40,7 +40,21 @@ ANTIGRAVITY_LOG_DIR = pathlib.Path.home() / ".gemini" / "antigravity-cli" / "log
 ANTIGRAVITY_QUOTA_LOG_MAX_AGE_SEC = 36 * 60 * 60
 ANTIGRAVITY_CLI_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "antigravity-cli-usage.json"
 ANTIGRAVITY_CLI_USAGE_CACHE_TTL_SEC = 5 * 60
-ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC = 18
+# Driving the TUI takes ~4-5s from a terminal but ~12s inside the menubar app,
+# and at the old 18s the app timed out on every single attempt. Keep a wide
+# margin over the slow case; a stuck drive still has to fit inside the app's
+# 60s refresh tick alongside the other providers.
+ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC = 30
+# Driving the agy TUI is the only way to read the real quota windows, and when it
+# fails it fails invisibly: the read loop returns whatever it captured, the parse
+# raises, and live_google_quota degrades to a numberless view. Keep the last
+# failed transcript on disk so the failure can be diagnosed after the fact.
+ANTIGRAVITY_CLI_DEBUG_PATH = pathlib.Path.home() / ".cache" / "ai-limit" / "agy-usage-debug.txt"
+ANTIGRAVITY_CLI_DEBUG_KEEP = 3
+# The agy TUI is ready for a slash command once it renders a bare "> " prompt
+# line. Whether this matches decides if /usage is ever typed, so the debug dump
+# reports it too — hence a shared constant rather than an inline pattern.
+ANTIGRAVITY_TUI_PROMPT_RE = re.compile(r"(?:^|\n)>\s*(?:\n|$)")
 ANTIGRAVITY_DEFAULT_MODELS = (
     "Gemini 3.5 Flash (Medium)",
     "Gemini 3.5 Flash (High)",
@@ -1447,13 +1461,25 @@ def _parse_antigravity_cli_usage_text(text: str) -> dict:
     )
 
 
-def _run_antigravity_cli_usage_text(timeout: int) -> str:
+def _run_antigravity_cli_usage_text(timeout: int, trace: dict | None = None) -> str:
+    """Drive the agy TUI to its /usage screen and return the raw pty transcript.
+
+    ``trace`` is filled in with how far the drive got. A timeout is not an error
+    here — the loop just returns what it captured — so without the trace a stuck
+    TUI is indistinguishable from a healthy one that produced odd output.
+    """
     import fcntl
     import pty
     import termios
 
+    if trace is None:
+        trace = {}
+    trace.update({"stage": "start", "elapsed_sec": 0.0, "timed_out": False})
+    started = time.monotonic()
+
     agy_path = shutil.which("agy")
     if not agy_path:
+        trace["stage"] = "agy-not-found"
         raise GoogleQuotaError("agy command not found")
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
@@ -1475,6 +1501,7 @@ def _run_antigravity_cli_usage_text(timeout: int) -> str:
     page_down_count = 0
     last_page_down = 0.0
     sent_exit = False
+    trace["stage"] = "spawned"
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1485,28 +1512,42 @@ def _run_antigravity_cli_usage_text(timeout: int) -> str:
                 except BlockingIOError:
                     chunk = b""
                 except OSError:
+                    trace["stage"] = "pty-read-error"
                     break
                 if not chunk:
+                    trace["stage"] = "pty-eof"
                     break
                 chunks.append(chunk)
             text = _strip_terminal_control(b"".join(chunks).decode("utf-8", errors="replace"))
             if "Do you trust the contents of this project?" in text and not sent_trust:
                 os.write(master_fd, b"\r")
                 sent_trust = True
+                trace["stage"] = "sent-trust"
                 continue
             if (
                 "Antigravity CLI" in text
                 and "Do you trust the contents of this project?" not in text
                 and not sent_usage
-                and re.search(r"(?:^|\n)>\s*(?:\n|$)", text)
+                and ANTIGRAVITY_TUI_PROMPT_RE.search(text)
             ):
                 os.write(master_fd, b"/usage\r")
                 sent_usage = True
+                trace["stage"] = "sent-usage"
                 continue
-            if "Models & Quota" in text and page_down_count < 2 and time.monotonic() - last_page_down > 0.6:
+            # Wait for real body content, not just the header: paging the moment
+            # "Models & Quota" paints can scroll past the first group before it
+            # ever renders, and a group that never renders never enters the
+            # transcript, so the exit condition can no longer be met.
+            if (
+                "Models & Quota" in text
+                and "Limit Remaining" in text
+                and page_down_count < 2
+                and time.monotonic() - last_page_down > 0.6
+            ):
                 os.write(master_fd, b"\x1b[6~")
                 page_down_count += 1
                 last_page_down = time.monotonic()
+                trace["stage"] = f"paged-{page_down_count}"
                 continue
             if (
                 "GEMINI MODELS" in text
@@ -1517,10 +1558,25 @@ def _run_antigravity_cli_usage_text(timeout: int) -> str:
             ):
                 os.write(master_fd, b"\x1b/exit\r")
                 sent_exit = True
+                trace["stage"] = "sent-exit"
                 time.sleep(0.3)
                 break
+        else:
+            trace["timed_out"] = True
         return b"".join(chunks).decode("utf-8", errors="replace")
     finally:
+        trace.update(
+            {
+                "elapsed_sec": round(time.monotonic() - started, 2),
+                "sent_trust": sent_trust,
+                "sent_usage": sent_usage,
+                "page_down_count": page_down_count,
+                "sent_exit": sent_exit,
+                "captured_bytes": sum(len(chunk) for chunk in chunks),
+                "agy_path": agy_path,
+                "exit_code": proc.poll(),
+            }
+        )
         try:
             os.close(master_fd)
         except OSError:
@@ -1533,11 +1589,69 @@ def _run_antigravity_cli_usage_text(timeout: int) -> str:
                 proc.kill()
 
 
+def _dump_antigravity_cli_debug(text: str, trace: dict, reason: str) -> None:
+    """Persist the transcript of a failed agy drive. Never raises."""
+    try:
+        clean = _strip_terminal_control(text)
+        markers = {
+            marker: clean.count(marker)
+            for marker in (
+                "Do you trust the contents of this project?",
+                "Antigravity CLI",
+                "Models & Quota",
+                "GEMINI MODELS",
+                "CLAUDE AND GPT MODELS",
+                "Five Hour Limit",
+                "Refreshes in",
+            )
+        }
+        header = [
+            f"=== {datetime.datetime.now().astimezone().isoformat()} pid={os.getpid()}",
+            f"reason: {reason}",
+            f"trace: {json.dumps(trace, default=str, ensure_ascii=False)}",
+            f"markers: {json.dumps(markers, ensure_ascii=False)}",
+            f"prompt_regex_hit: {bool(ANTIGRAVITY_TUI_PROMPT_RE.search(clean))}",
+            "--- transcript (control sequences stripped) ---",
+        ]
+        entry = "\n".join(header) + "\n" + clean + "\n"
+
+        ANTIGRAVITY_CLI_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        previous = ""
+        if ANTIGRAVITY_CLI_DEBUG_PATH.exists():
+            previous = ANTIGRAVITY_CLI_DEBUG_PATH.read_text(encoding="utf-8", errors="replace")
+        entries = [block for block in previous.split("\n=== ") if block.strip()]
+        # split() eats the delimiter on every entry but the first; put it back.
+        entries = [entries[0]] + ["=== " + block for block in entries[1:]] if entries else []
+        entries.append(entry)
+        ANTIGRAVITY_CLI_DEBUG_PATH.write_text(
+            "\n".join(entries[-ANTIGRAVITY_CLI_DEBUG_KEEP:]), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never break a quota read
+        pass
+
+
 def live_antigravity_cli_usage(timeout: int = ANTIGRAVITY_CLI_USAGE_TIMEOUT_SEC) -> dict:
     cached = _load_antigravity_cli_usage_cache()
     if cached:
         return cached
-    data = _parse_antigravity_cli_usage_text(_run_antigravity_cli_usage_text(timeout))
+    trace: dict = {}
+    text = _run_antigravity_cli_usage_text(timeout, trace=trace)
+    try:
+        data = _parse_antigravity_cli_usage_text(text)
+    except GoogleQuotaError as exc:
+        _dump_antigravity_cli_debug(text, trace, str(exc))
+        raise GoogleQuotaError(f"{exc} (stage={trace.get('stage')}, timed_out={trace.get('timed_out')})") from exc
+    if trace.get("timed_out"):
+        # A complete screen would have satisfied the exit condition and left via
+        # /exit, so a timeout means the transcript is partial — and the parser
+        # only insists on the "Models & Quota" header, so it happily returns
+        # whichever groups did render. Caching that reports one group's numbers
+        # as if they were the whole account, which is worse than no data at all.
+        groups = [group.get("display_name") for group in data.get("quota_groups") or []]
+        _dump_antigravity_cli_debug(text, trace, f"timed out; partial parse gave groups={groups}")
+        raise GoogleQuotaError(
+            f"agy /usage timed out with a partial screen (stage={trace.get('stage')}, groups={groups})"
+        )
     _save_antigravity_cli_usage_cache(data)
     return data
 
@@ -1619,7 +1733,12 @@ def _antigravity_model_buckets(models: list[str], limit: dict | None) -> list[di
     return buckets
 
 
-def _with_antigravity_view(normalized: dict, limit: dict | None, models: list[str]) -> dict:
+def _with_antigravity_view(
+    normalized: dict,
+    limit: dict | None,
+    models: list[str],
+    degraded_reasons: list[str] | None = None,
+) -> dict:
     agy_buckets = _antigravity_model_buckets(models, limit)
     primary = next((bucket for bucket in agy_buckets if bucket.get("quota_state") == "limited"), None)
     if primary is None:
@@ -1636,17 +1755,21 @@ def _with_antigravity_view(normalized: dict, limit: dict | None, models: list[st
             }
         )
     else:
+        # Nothing here carries a number: the buckets are just the model list.
+        # Say the data is unavailable rather than implying the quota is unknown.
         summary.update(
             {
                 "remaining_percent": None,
                 "reset_time": None,
                 "bucket_count": len(agy_buckets),
-                "quota_state": "unknown",
+                "quota_state": "unavailable",
+                "unavailable_reason": "; ".join(degraded_reasons or []) or "no live quota source responded",
             }
         )
     return {
         **normalized,
         "source": "agy models + antigravity-cli-log",
+        "degraded_reasons": list(degraded_reasons or []),
         "primary": primary,
         "buckets": agy_buckets,
         "legacy_google_buckets": normalized.get("buckets") or [],
@@ -1662,14 +1785,18 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     import urllib.error
     import urllib.request
 
+    # Both real quota sources are best-effort. Remember why each one dropped out
+    # so the numberless last-resort view can say so instead of looking like a
+    # successful read with unknown numbers.
+    degraded_reasons: list[str] = []
     try:
         return datetime.datetime.now(datetime.timezone.utc), live_antigravity_quota_summary(timeout=min(timeout, 8))
-    except GoogleQuotaError:
-        pass
+    except GoogleQuotaError as exc:
+        degraded_reasons.append(f"antigravity app: {exc}")
     try:
         return datetime.datetime.now(datetime.timezone.utc), live_antigravity_cli_usage()
-    except GoogleQuotaError:
-        pass
+    except GoogleQuotaError as exc:
+        degraded_reasons.append(f"agy /usage: {exc}")
 
     def fetch(creds: dict) -> bytes:
         req = urllib.request.Request(
@@ -1721,6 +1848,7 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         normalized,
         latest_antigravity_quota_limit(),
         list_antigravity_models(),
+        degraded_reasons,
     )
     return datetime.datetime.now(datetime.timezone.utc), normalized
 

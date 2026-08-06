@@ -622,6 +622,8 @@ def _fetch_google(lang):
             "buckets": data.get("buckets") or [],
             "quota_groups": data.get("quota_groups") or [],
             "antigravity": data.get("antigravity"),
+            "quota_state": summary.get("quota_state"),
+            "unavailable_reason": summary.get("unavailable_reason"),
             "source": data.get("source") or "oauth live",
         }
     except GoogleQuotaAuthError as e:
@@ -1932,10 +1934,21 @@ class AiLimitApp(rumps.App):
                 antigravity = data.get("antigravity") or {}
                 limited = bool(antigravity.get("limited"))
                 pct = 0 if limited else 70
-                value = _tr(lang, "受限", "Limited") if limited else _tr(lang, "未知", "Unknown")
                 model = antigravity.get("model_label") or data.get("primary_model") or "Antigravity"
                 reset = self._format_detail_reset(antigravity.get("reset_time") or data.get("daily_reset"))
-                subtitle = _short_widget_name(f"{model} ↻ {reset}" if reset else model, 38)
+                if limited:
+                    value = _tr(lang, "受限", "Limited")
+                    subtitle = _short_widget_name(f"{model} ↻ {reset}" if reset else model, 38)
+                elif data.get("quota_state") == "unavailable":
+                    # No live source answered, so there are no numbers at all.
+                    # Naming the failure beats implying the quota is unknown.
+                    value = _tr(lang, "取数失败", "No data")
+                    subtitle = _short_widget_name(
+                        data.get("unavailable_reason") or _tr(lang, "无可用额度数据源", "no live quota source"), 38
+                    )
+                else:
+                    value = _tr(lang, "未知", "Unknown")
+                    subtitle = _short_widget_name(f"{model} ↻ {reset}" if reset else model, 38)
                 metrics = []
         elif service == "gemini" and data:
             current, current_reset, weekly, weekly_reset = self._gemini_card_windows(data)
