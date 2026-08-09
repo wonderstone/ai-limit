@@ -8,6 +8,7 @@ app-server fallback opt-in because that path can start a Codex usage window.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -55,6 +56,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17655
 CODEX_CACHE_TTL_SECONDS = int(os.environ.get("AI_LIMIT_API_CODEX_CACHE_TTL_SECONDS", "300") or "300")
 CODEX_DISK_STALE_SECONDS = int(os.environ.get("AI_LIMIT_API_CODEX_DISK_STALE_SECONDS", "3600") or "3600")
+AGGREGATE_DEADLINE_SECONDS = float(os.environ.get("AI_LIMIT_API_AGGREGATE_DEADLINE_SECONDS", "8") or "8")
 _CODEX_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _CODEX_DISK_CACHE_PATH = pathlib.Path.home() / ".cache" / "ai-limit" / "codex-quota-api-cache.json"
 
@@ -166,8 +168,10 @@ def _codex_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
             cache_status="miss",
         )
         _CODEX_CACHE[cache_key] = (now_ts, payload)
-        if not allow_app_server:
-            _write_codex_disk_cache(now_ts, payload)
+        # A user-authorized App Server refresh is also valid safe-read cache
+        # evidence. Persist it so later ordinary `/v1/quota` observations do
+        # not fall back to an older snapshot and misclassify Codex as stale.
+        _write_codex_disk_cache(now_ts, payload)
         return payload
     except CodexAuthError as exc:
         return {"provider": "codex", "available": False, "source": "web", "error": str(exc), "observed_at": _utc_now()}
@@ -253,11 +257,11 @@ def _codex_rate_limits_payload(
 
 def _claude_payload() -> dict[str, Any]:
     try:
-        data = live_claude_usage()
+        data = live_claude_usage(timeout=5)
         five_h = data.get("five_hour") or {}
         seven_d = data.get("seven_day") or {}
         try:
-            plan = live_claude_plan()
+            plan = live_claude_plan(timeout=2)
         except Exception:  # noqa: BLE001
             plan = None
         return {
@@ -362,18 +366,42 @@ def _llm_api_payload() -> dict[str, Any] | None:
 
 
 def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
-    providers: dict[str, Any] = {
-        "claude": _claude_payload(),
-        "codex": _codex_payload(allow_app_server=allow_app_server),
+    # Provider probes are independent remote operations. Running them serially
+    # made one slow source hold the entire aggregate endpoint for up to a
+    # minute, which in turn made healthy Claude/Codex observations look
+    # unavailable. Isolate them behind one bounded aggregate deadline.
+    probes = {
+        "claude": _claude_payload,
+        "codex": lambda: _codex_payload(allow_app_server=allow_app_server),
+        "deepseek": _deepseek_payload,
+        "google": _google_payload,
+        "gemini": _gemini_payload,
+        "llm_api": _llm_api_payload,
     }
-    for name, payload in (
-        ("deepseek", _deepseek_payload()),
-        ("google", _google_payload()),
-        ("gemini", _gemini_payload()),
-        ("llm_api", _llm_api_payload()),
-    ):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="ai-limit-provider")
+    futures = {executor.submit(probe): name for name, probe in probes.items()}
+    done, pending = concurrent.futures.wait(futures, timeout=AGGREGATE_DEADLINE_SECONDS)
+    providers: dict[str, Any] = {}
+    for future in done:
+        name = futures[future]
+        try:
+            payload = future.result()
+        except Exception as exc:  # noqa: BLE001
+            payload = {"provider": name, "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
         if payload is not None:
             providers[name] = payload
+    for future in pending:
+        name = futures[future]
+        future.cancel()
+        providers[name] = {
+            "provider": name,
+            "available": False,
+            "observed_at": _utc_now(),
+            "error": f"aggregate probe exceeded {AGGREGATE_DEADLINE_SECONDS:g}s deadline",
+        }
+    # Do not wait for a provider's own bounded network timeout after the
+    # aggregate response is already complete.
+    executor.shutdown(wait=False, cancel_futures=True)
     return {
         "module": "ai-limit-local-api",
         "observed_at": _utc_now(),
@@ -397,6 +425,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/quota/codex", "/v1/quota/codex"}:
             self._write_json(_codex_payload(allow_app_server=allow_app_server))
+            return
+        if parsed.path in {"/quota/claude", "/v1/quota/claude"}:
+            self._write_json(_claude_payload())
             return
         self._write_json({"error": "not_found", "path": parsed.path}, status=404)
 
