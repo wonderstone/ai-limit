@@ -1461,6 +1461,29 @@ def _parse_antigravity_cli_usage_text(text: str) -> dict:
     )
 
 
+def _antigravity_cli_usage_complete(text: str) -> bool:
+    """Return whether the TUI transcript contains every expected quota window.
+
+    A fully available (100%) window is rendered as ``Quota available`` without
+    a ``Refreshes in`` line.  Counting refresh labels therefore rejects valid,
+    complete screens and makes the driver wait until it times out.  Reuse the
+    parser as the completion check so the driver and the accepted payload stay
+    in agreement as the TUI wording changes.
+    """
+    try:
+        data = _parse_antigravity_cli_usage_text(text)
+    except GoogleQuotaError:
+        return False
+    groups = data.get("quota_groups") or []
+    if len(groups) != 2:
+        return False
+    return all(
+        {bucket.get("window") for bucket in group.get("buckets") or []} == {"weekly", "5h"}
+        and all(bucket.get("remaining_percent") is not None for bucket in group.get("buckets") or [])
+        for group in groups
+    )
+
+
 def _run_antigravity_cli_usage_text(timeout: int, trace: dict | None = None) -> str:
     """Drive the agy TUI to its /usage screen and return the raw pty transcript.
 
@@ -1549,13 +1572,7 @@ def _run_antigravity_cli_usage_text(timeout: int, trace: dict | None = None) -> 
                 last_page_down = time.monotonic()
                 trace["stage"] = f"paged-{page_down_count}"
                 continue
-            if (
-                "GEMINI MODELS" in text
-                and "CLAUDE AND GPT MODELS" in text
-                and text.count("Five Hour Limit") >= 2
-                and text.count("Refreshes in") >= 3
-                and not sent_exit
-            ):
+            if not sent_exit and _antigravity_cli_usage_complete(text):
                 os.write(master_fd, b"\x1b/exit\r")
                 sent_exit = True
                 trace["stage"] = "sent-exit"
