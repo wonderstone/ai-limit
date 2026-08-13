@@ -43,6 +43,47 @@ class AggregateIsolationTests(unittest.TestCase):
         self.assertTrue(payload["available"])
         write_cache.assert_called_once()
 
+    def test_safe_request_refreshes_web_after_disk_cache_ttl(self):
+        stale_disk = {
+            "provider": "codex",
+            "available": True,
+            "source": "snapshot",
+            "cache": {"status": "stale-disk-hit", "age_seconds": 301},
+        }
+        rate_limits = {"primary": {"used_percent": 2, "window_minutes": 300, "resets_at": 123}}
+        with (
+            mock.patch.object(api_server, "_read_codex_disk_cache", return_value=stale_disk),
+            mock.patch.object(
+                api_server,
+                "current_codex_rate_limits",
+                return_value=(None, rate_limits, "web", None),
+            ) as current,
+            mock.patch.object(api_server, "_write_codex_disk_cache"),
+            mock.patch.object(api_server, "_CODEX_CACHE", {}),
+        ):
+            payload = api_server._codex_payload()
+
+        self.assertEqual(payload["source"], "web")
+        self.assertEqual(payload["five_hour"]["remaining_percent"], 98)
+        current.assert_called_once_with(api_server.latest_codex_rate_limits, allow_app_server_fallback=False)
+
+    def test_safe_request_reuses_fresh_disk_cache(self):
+        fresh_disk = {
+            "provider": "codex",
+            "available": True,
+            "source": "web",
+            "cache": {"status": "disk-hit", "age_seconds": 30},
+        }
+        with (
+            mock.patch.object(api_server, "_read_codex_disk_cache", return_value=fresh_disk),
+            mock.patch.object(api_server, "current_codex_rate_limits") as current,
+            mock.patch.object(api_server, "_CODEX_CACHE", {}),
+        ):
+            payload = api_server._codex_payload()
+
+        self.assertEqual(payload, fresh_disk)
+        current.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -123,26 +123,11 @@ def _codex_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
         return payload
     if not allow_app_server:
         disk_cached = _read_codex_disk_cache(now_ts)
-        if disk_cached is not None:
+        if disk_cached is not None and disk_cached.get("cache", {}).get("status") == "disk-hit":
             _CODEX_CACHE[cache_key] = (now_ts, disk_cached)
             return disk_cached
 
     try:
-        if not allow_app_server:
-            observed_at, rate_limits = latest_codex_rate_limits()
-            if rate_limits:
-                payload = _codex_rate_limits_payload(
-                    observed_at=observed_at,
-                    rate_limits=rate_limits,
-                    source="snapshot",
-                    allow_app_server=allow_app_server,
-                    fallback_reason="safe_api_snapshot_first",
-                    cache_status="miss",
-                )
-                _CODEX_CACHE[cache_key] = (now_ts, payload)
-                _write_codex_disk_cache(now_ts, payload)
-                return payload
-
         observed_at, rate_limits, source, fallback_reason = current_codex_rate_limits(
             latest_codex_rate_limits,
             allow_app_server_fallback=allow_app_server,
