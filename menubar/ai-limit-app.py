@@ -1400,7 +1400,11 @@ class AiLimitApp(rumps.App):
                 )
                 self._google_header.title = "Google ⚠️" if any_empty else "Google"
                 source = google.get("source") or ""
-                source_label = "agy usage fallback" if "agy /usage" in source else ("antigravity app live" if quota_groups else "antigravity fallback")
+                source_label = (
+                    "antigravity unavailable"
+                    if google.get("quota_state") == "unavailable"
+                    else ("agy usage fallback" if "agy /usage" in source else "antigravity app live")
+                )
                 self._google_source.title = _tr(lang, f"  来源：{source_label}", f"  Source: {source_label}")
                 if quota_groups:
                     group_count = google.get("group_count") or len(quota_groups)

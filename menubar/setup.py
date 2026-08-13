@@ -16,6 +16,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from setuptools import setup
+from ai_limit.version import __build_version__, __version__
 
 APP = ["ai-limit-app.py"]
 OPTIONS = {
@@ -40,8 +41,8 @@ OPTIONS = {
         "CFBundleName": "ai-limit",
         "CFBundleDisplayName": "ai-limit",
         "CFBundleIdentifier": "com.zhuchenxi.ai-limit",
-        "CFBundleVersion": "0.3.5",
-        "CFBundleShortVersionString": "0.3.5",
+        "CFBundleVersion": __build_version__,
+        "CFBundleShortVersionString": __version__,
         "NSHumanReadableCopyright": "© 2026 zhuchenxi",
         "LSEnvironment": {
             "LANG": "en_US.UTF-8",

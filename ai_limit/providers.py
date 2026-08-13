@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 
 from ai_limit.i18n import t
+from ai_limit.version import __version__
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
@@ -55,16 +56,6 @@ ANTIGRAVITY_CLI_DEBUG_KEEP = 3
 # line. Whether this matches decides if /usage is ever typed, so the debug dump
 # reports it too — hence a shared constant rather than an inline pattern.
 ANTIGRAVITY_TUI_PROMPT_RE = re.compile(r"(?:^|\n)>\s*(?:\n|$)")
-ANTIGRAVITY_DEFAULT_MODELS = (
-    "Gemini 3.5 Flash (Medium)",
-    "Gemini 3.5 Flash (High)",
-    "Gemini 3.5 Flash (Low)",
-    "Gemini 3.1 Pro (Low)",
-    "Gemini 3.1 Pro (High)",
-    "Claude Sonnet 4.6 (Thinking)",
-    "Claude Opus 4.6 (Thinking)",
-    "GPT-OSS 120B (Medium)",
-)
 DEEPSEEK_KEY_PATHS = (
     pathlib.Path.home() / ".deepseek_api_key",
     pathlib.Path.home() / ".config" / "ai-limit" / "deepseek_api_key",
@@ -1082,32 +1073,6 @@ def latest_antigravity_quota_limit() -> dict | None:
     return latest
 
 
-def list_antigravity_models(timeout: int = 8) -> list[str]:
-    agy_path = shutil.which("agy")
-    if not agy_path:
-        return list(ANTIGRAVITY_DEFAULT_MODELS)
-    try:
-        result = subprocess.run(
-            [agy_path, "models"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return list(ANTIGRAVITY_DEFAULT_MODELS)
-    if result.returncode != 0:
-        return list(ANTIGRAVITY_DEFAULT_MODELS)
-    models = []
-    for line in result.stdout.splitlines():
-        model = line.strip()
-        if model and model not in models:
-            models.append(model)
-    return models or list(ANTIGRAVITY_DEFAULT_MODELS)
-
-
 def _antigravity_devtools_port() -> int | None:
     try:
         raw = (pathlib.Path.home() / "Library" / "Application Support" / "Antigravity" / "DevToolsActivePort").read_text(
@@ -1314,7 +1279,7 @@ def live_antigravity_quota_summary(timeout: int = 8) -> dict:
             "x-codeium-csrf-token": csrf_token,
             "x-user-agent": "CONNECT_ES_USER_AGENT",
             "Referer": f"{origin}/sidecars?settingsOpen=true&settingsScreen=Models",
-            "User-Agent": "ai-limit/0.3.5 Antigravity",
+            "User-Agent": f"ai-limit/{__version__} Antigravity",
         },
         method="POST",
     )
@@ -1718,48 +1683,39 @@ def _normalize_google_quota(data: dict) -> dict:
     }
 
 
-def _antigravity_model_buckets(models: list[str], limit: dict | None) -> list[dict]:
-    limited_model = (limit or {}).get("model_label")
-    buckets = []
-    for model in models:
-        limited = bool(limit and limited_model == model)
-        buckets.append(
-            {
-                "model_id": model,
-                "remaining_amount": 0 if limited else None,
-                "remaining_fraction": 0.0 if limited else None,
-                "remaining_percent": 0 if limited else None,
-                "reset_time": (limit or {}).get("reset_time") if limited else None,
-                "quota_state": "limited" if limited else "unknown",
-                "quota_source": (limit or {}).get("source") if limited else "agy models",
+def _unavailable_antigravity_quota_groups() -> tuple[list[dict], list[dict]]:
+    groups = []
+    flat_buckets = []
+    for display_name, description in (
+        ("Gemini Models", "Models within this group: Gemini Flash, Gemini Pro"),
+        ("Claude and GPT models", "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS"),
+    ):
+        buckets = []
+        for bucket_name, window in (("Weekly Limit", "weekly"), ("Five Hour Limit", "5h")):
+            bucket = {
+                "bucket_id": f"{display_name.lower().replace(' ', '-').replace('&', 'and')}-{window}",
+                "display_name": bucket_name,
+                "description": "Quota data unavailable",
+                "window": window,
+                "remaining_fraction": None,
+                "remaining_percent": None,
+                "reset_time": None,
+                "disabled": False,
+                "quota_state": "unavailable",
             }
-        )
-    if limit and limited_model and all(bucket.get("model_id") != limited_model for bucket in buckets):
-        buckets.insert(
-            0,
-            {
-                "model_id": limited_model,
-                "remaining_amount": 0,
-                "remaining_fraction": 0.0,
-                "remaining_percent": 0,
-                "reset_time": limit.get("reset_time"),
-                "quota_state": "limited",
-                "quota_source": limit.get("source"),
-            },
-        )
-    return buckets
+            buckets.append(bucket)
+            flat_buckets.append({**bucket, "group_display_name": display_name})
+        groups.append({"display_name": display_name, "description": description, "buckets": buckets})
+    return groups, flat_buckets
 
 
 def _with_antigravity_view(
     normalized: dict,
     limit: dict | None,
-    models: list[str],
     degraded_reasons: list[str] | None = None,
 ) -> dict:
-    agy_buckets = _antigravity_model_buckets(models, limit)
-    primary = next((bucket for bucket in agy_buckets if bucket.get("quota_state") == "limited"), None)
-    if primary is None:
-        primary = agy_buckets[0] if agy_buckets else normalized.get("primary")
+    quota_groups, buckets = _unavailable_antigravity_quota_groups()
+    primary = buckets[0]
 
     summary = dict(normalized.get("summary") or {})
     if limit:
@@ -1767,7 +1723,8 @@ def _with_antigravity_view(
             {
                 "remaining_percent": 0,
                 "reset_time": limit.get("reset_time") or summary.get("reset_time"),
-                "bucket_count": len(agy_buckets),
+                "bucket_count": len(buckets),
+                "group_count": len(quota_groups),
                 "quota_state": "limited",
             }
         )
@@ -1778,17 +1735,19 @@ def _with_antigravity_view(
             {
                 "remaining_percent": None,
                 "reset_time": None,
-                "bucket_count": len(agy_buckets),
+                "bucket_count": len(buckets),
+                "group_count": len(quota_groups),
                 "quota_state": "unavailable",
                 "unavailable_reason": "; ".join(degraded_reasons or []) or "no live quota source responded",
             }
         )
     return {
         **normalized,
-        "source": "agy models + antigravity-cli-log",
+        "source": "antigravity quota groups unavailable",
         "degraded_reasons": list(degraded_reasons or []),
         "primary": primary,
-        "buckets": agy_buckets,
+        "buckets": buckets,
+        "quota_groups": quota_groups,
         "legacy_google_buckets": normalized.get("buckets") or [],
         "legacy_google_source": normalized.get("source"),
         "summary": summary,
@@ -1823,7 +1782,7 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                 "Authorization": f"Bearer {creds['access_token']}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "ai-limit/0.3.5",
+                "User-Agent": f"ai-limit/{__version__}",
             },
             method="POST",
         )
@@ -1864,7 +1823,6 @@ def live_google_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     normalized = _with_antigravity_view(
         normalized,
         latest_antigravity_quota_limit(),
-        list_antigravity_models(),
         degraded_reasons,
     )
     return datetime.datetime.now(datetime.timezone.utc), normalized
@@ -2333,7 +2291,7 @@ def live_deepseek_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
-            "User-Agent": "ai-limit/0.3.5",
+            "User-Agent": f"ai-limit/{__version__}",
         },
     )
     try:
