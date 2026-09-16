@@ -18,6 +18,7 @@ It should not automate browser windows in the background. A browser may be opene
 | Google Code Assist / Gemini CLI | `~/.gemini/oauth_creds.json` | `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | JSON | No |
 | Antigravity | Running Antigravity local sidecar plus local CSRF token | `https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` | gRPC-web JSON | No |
 | Antigravity fallback | `agy` CLI and local logs | `agy /usage`, `~/.gemini/antigravity-cli/log` | CLI text / log text | No |
+| GitHub Copilot | GitHub OAuth/PAT token from env, `copilot-cli` Keychain entry, or `gh auth token` | `https://api.github.com/copilot_internal/user` | JSON (`quota_snapshots`) | No |
 
 ## Shared Browser-Session Pattern
 
@@ -44,6 +45,7 @@ ai-limit should use the smallest existing local credential material needed to re
 | Gemini page tokens: `cfb2h`, `FdrFJe`, `SNlM0e` | Gemini App | HTML returned by `https://gemini.google.com/usage`, requested with Google cookies | Used as batchexecute query/body parameters | No |
 | Google OAuth refresh/access token | Google Code Assist / Gemini CLI | `~/.gemini/oauth_creds.json` | Refreshes and calls `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | No new copy; reads existing file |
 | Antigravity CSRF token | Antigravity sidecar | Antigravity language-server process arguments | Sent as `x-codeium-csrf-token` to the local sidecar | No |
+| GitHub token (`gho_` / `ghu_` / `github_pat_`) | GitHub Copilot | `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, then the `copilot-cli` Keychain item, then `gh auth token` | Sent as `Authorization: token …` to `copilot_internal/user` | No |
 
 Important distinctions:
 
@@ -181,6 +183,24 @@ Remote-server observation:
 
 - Antigravity sidecar itself connects to Google endpoints such as `daily-cloudcode-pa.googleapis.com`.
 - ai-limit should not depend on reverse engineering that remote sidecar-to-Google protocol. The local sidecar quota summary is the intended boundary for this tool.
+
+## GitHub Copilot
+
+Copilot quota uses the GitHub sign-in that Copilot CLI (or GitHub CLI) already holds on the machine. There is no public REST endpoint for a user's remaining quota; the public Billing / usage-metrics APIs report consumption after the fact and need org/enterprise permissions. ai-limit therefore reads the same internal endpoint the Copilot CLI footer uses.
+
+Flow:
+
+1. Resolve a token in Copilot CLI's documented order: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`; then the `copilot-cli` macOS Keychain item written by `copilot login`; then `gh auth token`.
+2. `GET https://api.github.com/copilot_internal/user` with `Authorization: token …`.
+3. Read `quota_snapshots`. `premium_interactions` is the metered monthly bucket (AI credits, or premium requests on the legacy billing platform); `chat` and `completions` are `unlimited` on paid plans.
+4. Normalize `percent_remaining`, `remaining`, `entitlement`, `credits_used`, and `quota_reset_date_utc` into the shared quota model. `copilot_plan` (for example `individual_max`) supplies the plan label; `token_based_billing` picks the wording.
+
+Risk profile:
+
+- Internal endpoint, not in the GitHub REST reference; field names may change.
+- `401`/`403` mean the token expired or lacks Copilot access; `404` means the account has no Copilot subscription. Both are surfaced as sign-in guidance, not as a quota number.
+- The reset is a fixed monthly boundary (first day of the month, 00:00 UTC), not a rolling window like Claude/Codex.
+- Do not fall back to scraping github.com settings pages or to the Copilot SDK server mode from the menu bar app; the single narrow read above is the intended boundary.
 
 ## Maintenance Rules
 
