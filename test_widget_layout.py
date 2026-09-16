@@ -8,7 +8,9 @@ missing quota data rather than a layout bug. These tests pin that down.
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
+import locale
 import pathlib
 import sys
 import types
@@ -58,6 +60,7 @@ def _load_menubar_module():
 
 
 menubar = _load_menubar_module()
+import usage  # noqa: E402  (imported after the GUI stubs are installed)
 
 
 class _Size:
@@ -222,6 +225,71 @@ class DashboardLayoutTests(unittest.TestCase):
             app._widget_detail_row_advance(with_reset),
             app._widget_detail_row_advance(without_reset),
         )
+
+
+class CJKUnderPosixLocaleTests(unittest.TestCase):
+    """The packaged app runs with LC_CTYPE=C.
+
+    Under that locale strftime returns an empty string for any format holding
+    non-ASCII characters, so ``f"{dt:%m月%d日}"`` renders as nothing inside the
+    app while looking correct in a UTF-8 terminal. These tests pin the date
+    formatters to that locale so the failure cannot come back unnoticed.
+    """
+
+    def setUp(self):
+        self._saved = locale.setlocale(locale.LC_CTYPE)
+        locale.setlocale(locale.LC_CTYPE, "C")
+
+    def tearDown(self):
+        locale.setlocale(locale.LC_CTYPE, self._saved)
+
+    def test_strftime_with_cjk_is_indeed_broken_here(self):
+        # Guards the premise of the tests below; if a future macOS/Python makes
+        # this work, these tests would otherwise pass for the wrong reason.
+        moment = datetime.datetime(2026, 10, 1, 12, 0)
+        self.assertEqual(f"{moment:%H:%M}", "12:00")
+        self.assertEqual(f"{moment:%m月%d日}", "")
+
+    def test_copilot_reset_keeps_the_date(self):
+        text = menubar._fmt_copilot_reset("2026-10-01T00:00:00.000Z", "zh")
+
+        self.assertIn("10月01日", text)
+        self.assertIn("12:00", text)
+
+    def test_copilot_reset_english_keeps_the_date(self):
+        text = menubar._fmt_copilot_reset("2026-10-01T00:00:00.000Z", "en")
+
+        self.assertIn("Oct 1", text)
+        self.assertIn("12:00", text)
+
+    def test_distant_reset_label_keeps_the_date(self):
+        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=menubar.TZ_LOCAL)
+
+        class _Now(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 16, 14, 0)
+                return value.replace(tzinfo=tz) if tz else value
+
+        with mock.patch.object(menubar.datetime, "datetime", _Now):
+            text = menubar._fmt_reset_dt(moment, "zh")
+
+        self.assertIn("10月01日", text)
+
+    def test_cli_distant_reset_label_keeps_the_date(self):
+        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=usage.TZ_LOCAL)
+
+        class _Now(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 16, 14, 0)
+                return value.replace(tzinfo=tz) if tz else value
+
+        with mock.patch.object(usage.datetime, "datetime", _Now), \
+                mock.patch.object(usage, "LANG", "zh"):
+            text = usage.fmt_reset_dt(moment)
+
+        self.assertIn("10月01日", text)
 
 
 if __name__ == "__main__":

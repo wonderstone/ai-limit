@@ -297,6 +297,18 @@ def _pick_primary_balance(balances):
     )
     return ranked[0]
 
+def _zh_date(dt, with_year=False):
+    """Render a Chinese date without putting CJK inside a strftime format.
+
+    The bundled app runs with ``LC_CTYPE=C``, and under that locale strftime
+    silently returns an empty string for a format containing non-ASCII
+    characters. ``f"{dt:%m月%d日}"`` therefore renders as nothing inside the
+    app while working fine in a UTF-8 terminal, so build the text directly.
+    """
+    text = f"{dt.month:02d}月{dt.day:02d}日"
+    return f"{dt.year}年{text}" if with_year else text
+
+
 def _fmt_reset_dt(dt, lang):
     today = datetime.datetime.now(TZ_LOCAL).date()
     target = dt.date()
@@ -316,7 +328,7 @@ def _fmt_reset_dt(dt, lang):
     elif days == 1:  wd = "明天"
     elif days == 2:  wd = "后天"
     elif next_week:  wd = f"下周{_ZH_WEEKDAYS[dt.weekday()]}"
-    elif target_monday > today_monday: wd = f"{dt:%m月%d日}"
+    elif target_monday > today_monday: wd = _zh_date(dt)
     else:            wd = f"周{_ZH_WEEKDAYS[dt.weekday()]}"
     if len(wd) < 3:
         wd += "　" * (3 - len(wd))
@@ -347,14 +359,13 @@ def _fmt_copilot_reset(value, lang="zh"):
                 str(value).replace("Z", "+00:00")
             ).astimezone(TZ_LOCAL)
         current_year = datetime.datetime.now(TZ_LOCAL).year
+        show_year = reset.year != current_year
         if lang == "en":
             date_text = f"{reset:%b} {reset.day}"
-            if reset.year != current_year:
-                date_text += f", {reset:%Y}"
+            if show_year:
+                date_text += f", {reset.year}"
         else:
-            date_text = f"{reset:%m月%d日}"
-            if reset.year != current_year:
-                date_text = f"{reset:%Y年}{date_text}"
+            date_text = _zh_date(reset, with_year=show_year)
         return f"{date_text} {reset:%H:%M}"
     except Exception:
         return str(value)

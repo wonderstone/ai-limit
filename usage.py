@@ -135,7 +135,10 @@ def fmt_reset_dt(dt: datetime.datetime) -> str:
         elif next_week:
             wd = f"下周{_bare_zh[dt.weekday()]}"
         elif explicit_date:
-            wd = f"{dt:%m月%d日}"
+            # Building the Chinese date directly instead of via strftime: a
+            # strftime format containing CJK silently returns an empty string
+            # under LC_CTYPE=C, which is what the packaged app runs with.
+            wd = f"{dt.month:02d}月{dt.day:02d}日"
         else:
             wd = f"周{_bare_zh[dt.weekday()]}  "
     else:
