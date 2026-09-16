@@ -121,7 +121,10 @@ def fmt_reset_dt(dt: datetime.datetime) -> str:
     today = datetime.datetime.now(TZ_LOCAL).date()
     target = dt.date()
     days = (target - today).days
-    next_week = target.isocalendar()[:2] > today.isocalendar()[:2]
+    today_monday = today - datetime.timedelta(days=today.weekday())
+    target_monday = target - datetime.timedelta(days=target.weekday())
+    next_week = target_monday - today_monday == datetime.timedelta(days=7)
+    explicit_date = target_monday > today_monday and not next_week
     if LANG == "zh":
         if days == 0:
             wd = "今天  "
@@ -131,6 +134,8 @@ def fmt_reset_dt(dt: datetime.datetime) -> str:
             wd = "后天  "
         elif next_week:
             wd = f"下周{_bare_zh[dt.weekday()]}"
+        elif explicit_date:
+            wd = f"{dt:%m月%d日}"
         else:
             wd = f"周{_bare_zh[dt.weekday()]}  "
     else:
@@ -142,8 +147,12 @@ def fmt_reset_dt(dt: datetime.datetime) -> str:
             wd = "2 days  "
         elif next_week:
             wd = f"next {_bare_en[dt.weekday()]}"
+        elif explicit_date:
+            wd = f"{dt:%b} {dt.day}"
         else:
             wd = f"{_bare_en[dt.weekday()]:<8}"
+    if explicit_date:
+        return f"{wd} {dt.strftime('%H:%M')} {TZ_ABBR}"
     return f"{wd} {dt.strftime('%m-%d %H:%M')} {TZ_ABBR}"
 
 

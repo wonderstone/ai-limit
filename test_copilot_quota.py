@@ -1,3 +1,4 @@
+import datetime
 import os
 import unittest
 from unittest import mock
@@ -9,6 +10,7 @@ from ai_limit.providers import (
     _normalize_copilot_quota,
     load_copilot_github_token,
 )
+import usage
 
 
 def _snapshot(**overrides):
@@ -109,6 +111,26 @@ class TokenResolutionTests(unittest.TestCase):
                 os.environ.pop(name, None)
             with self.assertRaises(CopilotAuthError):
                 load_copilot_github_token()
+
+
+class ResetLabelTests(unittest.TestCase):
+    def test_reset_beyond_next_week_uses_calendar_date(self):
+        reset = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=usage.TZ_LOCAL)
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 16, 14, 0)
+                return value.replace(tzinfo=tz) if tz else value
+
+        with (
+            mock.patch.object(usage.datetime, "datetime", FixedDateTime),
+            mock.patch.object(usage, "LANG", "zh"),
+        ):
+            label = usage.fmt_reset_dt(reset)
+
+        self.assertIn("10月01日 12:00", label)
+        self.assertNotIn("下周", label)
 
 
 if __name__ == "__main__":

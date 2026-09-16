@@ -301,18 +301,22 @@ def _fmt_reset_dt(dt, lang):
     today = datetime.datetime.now(TZ_LOCAL).date()
     target = dt.date()
     days = (target - today).days
-    next_week = target.isocalendar()[:2] > today.isocalendar()[:2]
+    today_monday = today - datetime.timedelta(days=today.weekday())
+    target_monday = target - datetime.timedelta(days=target.weekday())
+    next_week = target_monday - today_monday == datetime.timedelta(days=7)
     if lang == "en":
         if days == 0:    wd = "today"
         elif days == 1:  wd = "tomorrow"
         elif days == 2:  wd = "2 days"
         elif next_week:  wd = f"next {_EN_WEEKDAYS[dt.weekday()]}"
+        elif target_monday > today_monday: wd = f"{dt:%b} {dt.day}"
         else:            wd = _EN_WEEKDAYS[dt.weekday()]
         return f"{dt:%H:%M}  {wd}"
     if days == 0:    wd = "今天"
     elif days == 1:  wd = "明天"
     elif days == 2:  wd = "后天"
     elif next_week:  wd = f"下周{_ZH_WEEKDAYS[dt.weekday()]}"
+    elif target_monday > today_monday: wd = f"{dt:%m月%d日}"
     else:            wd = f"周{_ZH_WEEKDAYS[dt.weekday()]}"
     if len(wd) < 3:
         wd += "　" * (3 - len(wd))
