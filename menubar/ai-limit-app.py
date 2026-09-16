@@ -58,22 +58,22 @@ from ai_limit.providers import (
     codex_window_remaining_percent,
     codex_window_reset_time,
     clear_provider_caches,
+    COPILOT_USAGE_URL,
+    CopilotAuthError,
+    CopilotQuotaError,
     DeepSeekAuthError,
     DeepSeekError,
     GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
+    has_copilot_credentials,
     has_deepseek_api_key,
     has_gemini_app_cookies,
     has_google_oauth_creds,
+    live_copilot_quota,
     live_deepseek_balance,
     live_gemini_app_usage,
     live_google_quota,
-)
-from ai_limit.llm_api import (
-    clear_llm_api_balance_cache,
-    has_llm_api_provider_config,
-    live_llm_api_balances,
 )
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ _ERROR_CACHE_TTL = 5
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
-_SERVICES      = ("claude", "codex", "deepseek", "google", "gemini", "llm_api")
+_SERVICES      = ("claude", "codex", "deepseek", "google", "gemini", "copilot")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -115,8 +115,8 @@ def _default_services():
         services.append("google")
     if has_gemini_app_cookies():
         services.append("gemini")
-    if has_llm_api_provider_config():
-        services.append("llm_api")
+    if has_copilot_credentials():
+        services.append("copilot")
     return services
 
 
@@ -274,7 +274,7 @@ def _status_service_label(service):
         "deepseek": "D",
         "google": "G",
         "gemini": "M",
-        "llm_api": "LLM",
+        "copilot": "CP",
     }.get(service, service[:1].upper())
 
 
@@ -297,22 +297,38 @@ def _pick_primary_balance(balances):
     )
     return ranked[0]
 
+def _zh_date(dt, with_year=False):
+    """Render a Chinese date without putting CJK inside a strftime format.
+
+    The bundled app runs with ``LC_CTYPE=C``, and under that locale strftime
+    silently returns an empty string for a format containing non-ASCII
+    characters. ``f"{dt:%m月%d日}"`` therefore renders as nothing inside the
+    app while working fine in a UTF-8 terminal, so build the text directly.
+    """
+    text = f"{dt.month:02d}月{dt.day:02d}日"
+    return f"{dt.year}年{text}" if with_year else text
+
+
 def _fmt_reset_dt(dt, lang):
     today = datetime.datetime.now(TZ_LOCAL).date()
     target = dt.date()
     days = (target - today).days
-    next_week = target.isocalendar()[:2] > today.isocalendar()[:2]
+    today_monday = today - datetime.timedelta(days=today.weekday())
+    target_monday = target - datetime.timedelta(days=target.weekday())
+    next_week = target_monday - today_monday == datetime.timedelta(days=7)
     if lang == "en":
         if days == 0:    wd = "today"
         elif days == 1:  wd = "tomorrow"
         elif days == 2:  wd = "2 days"
         elif next_week:  wd = f"next {_EN_WEEKDAYS[dt.weekday()]}"
+        elif target_monday > today_monday: wd = f"{dt:%b} {dt.day}"
         else:            wd = _EN_WEEKDAYS[dt.weekday()]
         return f"{dt:%H:%M}  {wd}"
     if days == 0:    wd = "今天"
     elif days == 1:  wd = "明天"
     elif days == 2:  wd = "后天"
     elif next_week:  wd = f"下周{_ZH_WEEKDAYS[dt.weekday()]}"
+    elif target_monday > today_monday: wd = _zh_date(dt)
     else:            wd = f"周{_ZH_WEEKDAYS[dt.weekday()]}"
     if len(wd) < 3:
         wd += "　" * (3 - len(wd))
@@ -330,6 +346,46 @@ def _fmt_reset_iso(iso, lang="zh"):
     except Exception:
         return "?"
 
+
+def _fmt_copilot_reset(value, lang="zh"):
+    """Format Copilot's monthly reset as an absolute date plus a countdown.
+
+    Copilot's allowance always rolls over on the first of the next month, so
+    the reset date belongs to a different month than the window it ends. Saying
+    only "本月" next to an October date reads like a contradiction, so the
+    countdown spells out why the date is where it is.
+    """
+    if not value:
+        return "?"
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            reset = epoch_to_local(int(value))
+        else:
+            reset = datetime.datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            ).astimezone(TZ_LOCAL)
+        now = datetime.datetime.now(TZ_LOCAL)
+        show_year = reset.year != now.year
+        if lang == "en":
+            date_text = f"{reset:%b} {reset.day}"
+            if show_year:
+                date_text += f", {reset.year}"
+        else:
+            date_text = _zh_date(reset, with_year=show_year)
+        date_text = f"{date_text} {reset:%H:%M}"
+
+        days = (reset.date() - now.date()).days
+        if days <= 0:
+            countdown = _tr(lang, "今天", "today")
+        elif days == 1:
+            countdown = _tr(lang, "明天", "tomorrow")
+        else:
+            countdown = _tr(lang, f"{days} 天后", f"in {days} days")
+        return f"{date_text} · {countdown}"
+    except Exception:
+        return str(value)
+
+
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
@@ -344,12 +400,14 @@ def _load_state():
             if isinstance(raw.get("widget"), bool):
                 state["widget"] = raw["widget"]
             if isinstance(raw.get("services"), list):
-                svc = ["llm_api" if s == "infoweave" else s for s in raw["services"]]
-                svc = [s for s in svc if s in _SERVICES]
+                # "infoweave" / "llm_api" were the balance card this build
+                # replaces with Copilot; drop them instead of carrying a
+                # service id the UI no longer knows how to draw.
+                svc = [s for s in raw["services"] if s in _SERVICES]
                 if "gemini" not in svc and has_gemini_app_cookies():
                     svc.append("gemini")
-                if "llm_api" not in svc and has_llm_api_provider_config():
-                    svc.append("llm_api")
+                if "copilot" not in svc and has_copilot_credentials():
+                    svc.append("copilot")
                 if svc:
                     state["services"] = svc
     except Exception:
@@ -380,7 +438,7 @@ def _load_cache():
                 "deepseek": raw.get("deepseek"),
                 "google": raw.get("google"),
                 "gemini": raw.get("gemini"),
-                "llm_api": raw.get("llm_api"),
+                "copilot": raw.get("copilot"),
             }
             # Older builds stored only claude/codex. Keep accepting that shape
             # so users do not need to delete their cache after upgrading.
@@ -394,16 +452,16 @@ def _load_cache():
 def _save_cache(claude, cached):
     try:
         if isinstance(cached, dict) and (
-            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "llm_api" in cached
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "copilot" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             google = cached.get("google")
             gemini = cached.get("gemini")
-            llm_api = cached.get("llm_api")
+            copilot = cached.get("copilot")
         else:
             codex = cached
-            deepseek = google = gemini = llm_api = None
+            deepseek = google = gemini = copilot = None
         _CACHE_PATH.write_text(
             json.dumps({
                 "cached_at": datetime.datetime.now().timestamp(),
@@ -412,7 +470,7 @@ def _save_cache(claude, cached):
                 "deepseek": deepseek,
                 "google": google,
                 "gemini": gemini,
-                "llm_api": llm_api,
+                "copilot": copilot,
             }, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -481,10 +539,6 @@ def _clear_all_caches():
             pass
     try:
         clear_provider_caches()
-    except Exception:
-        pass
-    try:
-        clear_llm_api_balance_cache()
     except Exception:
         pass
 
@@ -667,9 +721,35 @@ def _fetch_gemini_app(lang):
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def _fetch_llm_api(lang):
+def _fetch_copilot(lang):
+    import socket, urllib.error
     try:
-        return live_llm_api_balances(cache_ttl_seconds=300)
+        _ts, data = live_copilot_quota()
+        summary = data.get("summary") or {}
+        return {
+            "left": summary.get("remaining_percent"),
+            "remaining": summary.get("remaining"),
+            "used": summary.get("used"),
+            "entitlement": summary.get("entitlement"),
+            "overage_permitted": summary.get("overage_permitted"),
+            "overage_count": summary.get("overage_count"),
+            "reset": summary.get("reset_time"),
+            "plan": data.get("plan_label") or data.get("plan"),
+            "login": data.get("login"),
+            "unit": data.get("unit"),
+            "token_based_billing": data.get("token_based_billing"),
+            "buckets": data.get("buckets") or [],
+            "source": data.get("source") or "api.github.com copilot_internal/user",
+            "token_source": data.get("token_source"),
+        }
+    except CopilotAuthError as e:
+        return {"error": str(e)}
+    except CopilotQuotaError as e:
+        return {"error": str(e)}
+    except (socket.timeout, TimeoutError):
+        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+    except urllib.error.URLError:
+        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -948,7 +1028,7 @@ class AiLimitApp(rumps.App):
         self._deepseek = None
         self._google = None
         self._gemini = None
-        self._llm_api = None
+        self._copilot = None
         self._widget_panel = None
         self._widget_content = None
         self._widget_last_layout_size = None
@@ -1025,7 +1105,7 @@ class AiLimitApp(rumps.App):
         self._svc_deepseek = rumps.MenuItem("DeepSeek",  callback=self._toggle_deepseek)
         self._svc_google = rumps.MenuItem("Google", callback=self._toggle_google)
         self._svc_gemini = rumps.MenuItem("Gemini App", callback=self._toggle_gemini)
-        self._svc_llm_api = rumps.MenuItem("LLM API", callback=self._toggle_llm_api)
+        self._svc_copilot = rumps.MenuItem("Copilot", callback=self._toggle_copilot)
         svc_label = "监控服务" if lang == "zh" else "Services"
         self._svc_menu = rumps.MenuItem(svc_label)
         self._svc_menu.add(self._svc_claude)
@@ -1033,7 +1113,7 @@ class AiLimitApp(rumps.App):
         self._svc_menu.add(self._svc_deepseek)
         self._svc_menu.add(self._svc_google)
         self._svc_menu.add(self._svc_gemini)
-        self._svc_menu.add(self._svc_llm_api)
+        self._svc_menu.add(self._svc_copilot)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -1071,6 +1151,10 @@ class AiLimitApp(rumps.App):
             "打开 Gemini App 用量页" if lang == "zh" else "Open Gemini App usage",
             callback=lambda _: webbrowser.open(_GEMINI_APP_USAGE_URL),
         )
+        self._copilot_dash = rumps.MenuItem(
+            "打开 Copilot 用量页" if lang == "zh" else "Open Copilot usage",
+            callback=lambda _: webbrowser.open(COPILOT_USAGE_URL),
+        )
 
         # 项目信息子菜单
         about_label = f"项目信息（ai-limit {__version__}）" if lang == "zh" else f"Project (ai-limit {__version__})"
@@ -1083,13 +1167,13 @@ class AiLimitApp(rumps.App):
             f"版本：ai-limit {__version__}" if lang == "zh" else f"Version: ai-limit {__version__}"
         ))
         self._about_scope  = _disable(rumps.MenuItem(
-            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / LLM API" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / LLM API"
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot"
         ))
         self._about_surfaces = _disable(rumps.MenuItem(
             "界面：菜单栏 / CLI / daemon" if lang == "zh" else "Surfaces: menu bar / CLI / daemon"
         ))
         self._about_status = _disable(rumps.MenuItem(
-            "状态：当前版本已接入 Google、Gemini App 与 LLM API 配额" if lang == "zh" else "Status: current build includes Google, Gemini App, and LLM API quota"
+            "状态：当前版本已接入 Google、Gemini App 与 GitHub Copilot 配额" if lang == "zh" else "Status: current build includes Google, Gemini App, and GitHub Copilot quota"
         ))
         self._about_menu.add(self._about_repo)
         self._about_menu.add(self._about_ver)
@@ -1117,6 +1201,7 @@ class AiLimitApp(rumps.App):
             self._deepseek_dash,
             self._google_dash,
             self._gemini_dash,
+            self._copilot_dash,
             None,
             self._about_menu,
             None,
@@ -1176,7 +1261,7 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is None:
             return
-        claude, codex, deepseek, google, gemini, llm_api = pending
+        claude, codex, deepseek, google, gemini, copilot = pending
         if claude is not None:
             self._claude = claude
         if codex is not None:
@@ -1192,8 +1277,8 @@ class AiLimitApp(rumps.App):
             self._google = google
         if gemini is not None:
             self._gemini = gemini
-        if llm_api is not None:
-            self._llm_api = llm_api
+        if copilot is not None:
+            self._copilot = copilot
         _save_cache(
             self._claude,
             {
@@ -1201,7 +1286,7 @@ class AiLimitApp(rumps.App):
                 "deepseek": self._deepseek,
                 "google": self._google,
                 "gemini": self._gemini,
-                "llm_api": self._llm_api,
+                "copilot": self._copilot,
             },
         )
         self._render()
@@ -1213,15 +1298,15 @@ class AiLimitApp(rumps.App):
         deepseek = None
         google = None
         gemini = None
-        llm_api = None
+        copilot = None
         if isinstance(cached, dict) and (
-            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "llm_api" in cached
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "copilot" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             google = cached.get("google")
             gemini = cached.get("gemini")
-            llm_api = cached.get("llm_api")
+            copilot = cached.get("copilot")
         else:
             codex = cached
         # 不按 services 过滤——内存里保留两份数据，UI 显示由 _render 控
@@ -1235,8 +1320,8 @@ class AiLimitApp(rumps.App):
             self._google = google
         if gemini is not None:
             self._gemini = gemini
-        if llm_api is not None:
-            self._llm_api = llm_api
+        if copilot is not None:
+            self._copilot = copilot
         self._render()
 
     def _kick_background_fetch(self):
@@ -1253,9 +1338,9 @@ class AiLimitApp(rumps.App):
         deepseek = _fetch_deepseek(lang) if "deepseek" in services else None
         google = _fetch_google(lang) if "google" in services else None
         gemini = _fetch_gemini_app(lang) if "gemini" in services else None
-        llm_api = _fetch_llm_api(lang) if "llm_api" in services else None
+        copilot = _fetch_copilot(lang) if "copilot" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google, gemini, llm_api)
+            self._pending = (claude, codex, deepseek, google, gemini, copilot)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -1266,13 +1351,11 @@ class AiLimitApp(rumps.App):
         show_deepseek = "deepseek" in services
         show_google = "google" in services
         show_gemini = "gemini" in services
-        show_llm_api = "llm_api" in services
         claude = self._claude or {}
         codex  = self._codex  or {}
         deepseek = self._deepseek or {}
         google = self._google or {}
         gemini = self._gemini or {}
-        llm_api = self._llm_api or {}
 
         # 系统栏只显示入口图标；额度细节交给独立浮窗。
         _set_bar_icon(self)
@@ -1621,6 +1704,9 @@ class AiLimitApp(rumps.App):
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
         scroll.setAutoresizingMask_(getattr(AppKit, "NSViewWidthSizable", 2) | getattr(AppKit, "NSViewHeightSizable", 16))
         scroll.setHasVerticalScroller_(True)
+        # The dashboard is laid out to the clip width, so a horizontal scroller
+        # would only ever appear because of a layout bug. Keep it off.
+        scroll.setHasHorizontalScroller_(False)
         scroll.setBorderType_(getattr(AppKit, "NSNoBorder", 0))
         scroll.setDrawsBackground_(False)
 
@@ -1750,6 +1836,44 @@ class AiLimitApp(rumps.App):
         self._widget_content.addSubview_(view)
         return view
 
+    # The dashboard is drawn into a fixed-height document view, so the height
+    # must be known before drawing. These advances are the single source of
+    # truth for both passes: if the estimate is smaller than what the draw loop
+    # consumes, the last quota rows land below the document view and are simply
+    # invisible, which looks like missing data rather than a layout bug.
+    _WIDGET_TOP_MARGIN = 18
+    _WIDGET_BOTTOM_MARGIN = 18
+    _WIDGET_HEADER_ADVANCE = 46
+    _WIDGET_CARD_BLOCK_EXTRA = 6
+    _WIDGET_ALERT_HEADING_ADVANCE = 30
+    _WIDGET_ALERT_ROW_ADVANCE = 34
+    _WIDGET_ALERT_BLOCK_EXTRA = 10
+    _WIDGET_MAX_ALERTS = 5
+    _WIDGET_DETAIL_HEADING_ADVANCE = 32
+    _WIDGET_SECTION_ADVANCE = 26
+
+    @staticmethod
+    def _widget_detail_row_height(row):
+        return 42 if row.get("reset") else 28
+
+    def _widget_detail_row_advance(self, row):
+        if row.get("type") == "section":
+            return self._WIDGET_SECTION_ADVANCE
+        return self._widget_detail_row_height(row) + 6
+
+    def _widget_layout_height(self, card_rows, card_h, alerts, details):
+        height = self._WIDGET_TOP_MARGIN + self._WIDGET_HEADER_ADVANCE
+        height += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
+        if alerts:
+            height += (
+                self._WIDGET_ALERT_HEADING_ADVANCE
+                + min(len(alerts), self._WIDGET_MAX_ALERTS) * self._WIDGET_ALERT_ROW_ADVANCE
+                + self._WIDGET_ALERT_BLOCK_EXTRA
+            )
+        height += self._WIDGET_DETAIL_HEADING_ADVANCE
+        height += sum(self._widget_detail_row_advance(row) for row in details)
+        return height + self._WIDGET_BOTTOM_MARGIN
+
     def _render_widget_dashboard(self):
         lang = self._state["lang"]
         cards = self._widget_summary_cards()
@@ -1764,16 +1888,14 @@ class AiLimitApp(rumps.App):
         card_w = int((content_w - margin * 2 - gap * (cols - 1)) / cols)
         card_h = 100
         card_rows = max(1, (len(cards) + cols - 1) // cols)
-        alerts_h = 0 if not alerts else 36 + min(len(alerts), 5) * 34
-        details_h = 42 + sum(26 if row.get("type") == "section" else (42 if row.get("reset") else 34) for row in details)
-        total_h = max(560, 70 + card_rows * (card_h + 12) + alerts_h + details_h + 34)
+        total_h = max(560, self._widget_layout_height(card_rows, card_h, alerts, details))
         self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, total_h))
         self._clear_widget_content()
 
         def y(top, h):
             return total_h - top - h
 
-        top = 18
+        top = self._WIDGET_TOP_MARGIN
         self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
         self._widget_add_label(
             _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
@@ -1785,7 +1907,7 @@ class AiLimitApp(rumps.App):
             color="#a1a1aa",
             align="right",
         )
-        top += 46
+        top += self._WIDGET_HEADER_ADVANCE
 
         for index, card in enumerate(cards):
             col = index % cols
@@ -1793,23 +1915,23 @@ class AiLimitApp(rumps.App):
             x = margin + col * (card_w + gap)
             cy = y(top + row * (card_h + 12), card_h)
             self._draw_widget_card(card, x, cy, card_w, card_h)
-        top += card_rows * (card_h + 12) + 6
+        top += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
 
         if alerts:
             self._widget_add_label(_tr(lang, "需要注意", "Needs attention"), margin, y(top, 22), 180, 22, size=15, weight="bold")
-            top += 30
-            for alert in alerts[:5]:
+            top += self._WIDGET_ALERT_HEADING_ADVANCE
+            for alert in alerts[: self._WIDGET_MAX_ALERTS]:
                 cy = y(top, 28)
                 row_w = content_w - margin * 2
                 self._widget_add_box(margin, cy, row_w, 28, alert["bg"], radius=8, border=alert["border"])
                 self._widget_add_symbol(alert["symbol"], margin + 10, cy + 5, size=14, color=alert["fg"])
                 self._widget_add_label(alert["text"], margin + 34, cy + 5, max(120, row_w - 120), 18, size=12, weight="medium", color=alert["fg"])
                 self._widget_add_label(alert["value"], margin + row_w - 86, cy + 5, 72, 18, size=12, weight="bold", color=alert["fg"], align="right")
-                top += 34
-            top += 10
+                top += self._WIDGET_ALERT_ROW_ADVANCE
+            top += self._WIDGET_ALERT_BLOCK_EXTRA
 
         self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
-        top += 32
+        top += self._WIDGET_DETAIL_HEADING_ADVANCE
         value_w = 72
         progress_w = max(76, min(180, int((content_w - margin * 2) * 0.28)))
         name_x = margin + 4
@@ -1821,16 +1943,16 @@ class AiLimitApp(rumps.App):
                 cy = y(top, 20)
                 self._widget_add_label(row["name"], name_x, cy + 2, 200, 16, size=12, weight="bold", color=row["color"])
                 self._widget_add_box(progress_x, cy + 8, max(40, content_w - progress_x - margin), 1, "#323238", radius=0)
-                top += 26
+                top += self._WIDGET_SECTION_ADVANCE
                 continue
-            row_h = 42 if row.get("reset") else 28
+            row_h = self._widget_detail_row_height(row)
             cy = y(top, row_h)
             self._widget_add_label(row["name"], name_x, cy + 8, name_w, 16, size=11, color="#d4d4d8")
             if row.get("reset"):
                 self._widget_add_label(f"↻ {row['reset']}", name_x, cy - 5, name_w, 14, size=9, color="#8b8b93")
             self._widget_add_progress(progress_x, cy + 10, progress_w, 8, row["pct"])
             self._widget_add_label(row["value"], value_x, cy + 5, value_w, 18, size=12, weight="bold", color=row["color"], align="right")
-            top += row_h + 6
+            top += self._widget_detail_row_advance(row)
 
     def _draw_widget_card(self, card, x, y, w, h):
         self._widget_add_box(x, y, w, h, card["bg"], radius=12, border=card["border"])
@@ -1840,9 +1962,7 @@ class AiLimitApp(rumps.App):
 
         metrics = card.get("metrics") or []
         if metrics:
-            reset_text = self._card_reset_text(metrics)
-            if reset_text:
-                self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
+            reset_text = card.get("reset_text") or self._card_reset_text(metrics)
             row_x = x + 16
             row_w = max(120, w - 30)
             value_w = 44
@@ -1850,6 +1970,14 @@ class AiLimitApp(rumps.App):
             bar_x = row_x + label_w + 6
             bar_w = max(46, row_w - label_w - value_w - 14)
             first_y = y + 37
+            if reset_text:
+                if len(metrics) == 1:
+                    # A single-window card leaves the lower half of the card
+                    # empty. Put the reset line there at a readable size instead
+                    # of squeezing it into the narrow strip beside the icon.
+                    self._widget_add_label(reset_text, row_x, y + 15, row_w, 15, size=10, color="#a1a1aa")
+                else:
+                    self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
             for index, metric in enumerate(metrics[:2]):
                 row_y = first_y - index * 21
                 self._widget_add_label(metric["label"], row_x, row_y, label_w, 13, size=10, weight="medium", color="#a1a1aa")
@@ -1867,7 +1995,7 @@ class AiLimitApp(rumps.App):
             ("codex", "CodeX", "terminal.fill", "#2563eb", self._codex or {}),
             ("google", "Antigravity", "globe", "#dc2626", self._google or {}),
             ("gemini", "Gemini", "sparkles", "#9333ea", self._gemini or {}),
-            ("llm_api", "LLM API", "rectangle.stack.badge.person.crop", "#0f766e", self._llm_api or {}),
+            ("copilot", "Copilot", "chevron.left.forwardslash.chevron.right", "#0f766e", self._copilot or {}),
             ("deepseek", "DeepSeek", "dollarsign.circle.fill", "#0891b2", self._deepseek or {}),
         ]
         for service, title, symbol, accent, data in specs:
@@ -1891,7 +2019,7 @@ class AiLimitApp(rumps.App):
                 "bg": "#2a171a",
                 "border": "#7f1d1d",
             }
-        pct, subtitle, value, metrics = None, _tr(lang, "等待数据", "Waiting"), "…", []
+        pct, subtitle, value, metrics, reset_text = None, _tr(lang, "等待数据", "Waiting"), "…", [], None
         if service == "claude" and data:
             metrics = self._quota_card_metrics([
                 ("5h", data.get("5h_left"), data.get("5h_reset")),
@@ -1961,14 +2089,30 @@ class AiLimitApp(rumps.App):
                 (_tr(lang, "1周", "1w"), weekly, weekly_reset),
             ])
             pct = self._metric_floor(metrics)
-        elif service == "llm_api" and data:
-            providers = data.get("providers") or []
-            ready = int(data.get("ready_provider_count") or sum(1 for provider in providers if provider.get("configured")))
-            total = int(data.get("provider_count") or len(providers))
-            warnings = sum(1 for provider in providers if str(provider.get("warning_level")) in {"critical", "warning"})
-            pct = 100 if warnings == 0 and ready == total and total > 0 else (35 if warnings else 70)
-            value = f"{ready}/{total}" if total else "?"
-            subtitle = _tr(lang, f"{warnings} 个余额告警", f"{warnings} balance warnings") if warnings else _tr(lang, "provider 余额", "provider balances")
+        elif service == "copilot" and data:
+            # One monthly bucket of AI credits (or legacy premium requests);
+            # chat/completions are unlimited on paid plans and stay off the card.
+            copilot_reset = _fmt_copilot_reset(data.get("reset"), lang)
+            metrics = self._quota_card_metrics([
+                (
+                    _tr(lang, "本月", "Mo"),
+                    data.get("left"),
+                    None,
+                ),
+            ])
+            if copilot_reset != "?":
+                # "本月" labels the allowance window; the date is when the next
+                # one starts. Prefixing it with the window name again would read
+                # as "this month, on October 1".
+                reset_text = _tr(
+                    lang,
+                    f"重置 {copilot_reset}",
+                    f"Resets {copilot_reset}",
+                )
+            pct = self._metric_floor(metrics)
+            if not metrics:
+                value = _tr(lang, "未知", "Unknown")
+                subtitle = _short_widget_name(data.get("unit") or "Copilot", 38)
 
         pct = _widget_pct_value(pct)
         value_color = _widget_risk_color(pct)
@@ -1984,6 +2128,7 @@ class AiLimitApp(rumps.App):
             "value_color": value_color,
             "subtitle": subtitle,
             "metrics": metrics,
+            "reset_text": reset_text,
             "bg": bg,
             "border": border,
         }
@@ -2114,47 +2259,14 @@ class AiLimitApp(rumps.App):
             formatted = str(reset)
         return formatted
 
-    def _llm_api_provider_name(self, provider):
-        aliases = {
-            "openrouter": "OpenRoute",
-            "openai": "OpenAI",
-            "xai": "xAI",
-            "moonshot": "Kimi",
-            "dashscope": "Qwen",
-            "ark": "Doubao",
-            "deepseek": "DeepSeek",
-        }
-        profile_id = str(provider.get("provider_profile_id") or "")
-        return aliases.get(profile_id) or provider.get("display_name") or profile_id or "LLM"
-
-    def _llm_api_provider_metric(self, provider):
-        balance = provider.get("balance") if isinstance(provider.get("balance"), dict) else {}
-        amount = balance.get("amount")
-        currency = balance.get("currency")
-        if str(balance.get("status")) == "ok" and isinstance(amount, (int, float)):
-            return f"{amount:.2f} {currency}" if currency else f"{amount:.2f}"
-        if not provider.get("configured"):
-            return _tr(self._state["lang"], "未配置", "missing")
-        status = str(balance.get("status") or "")
-        if status == "missing_credentials":
-            return _tr(self._state["lang"], "缺账务密钥", "no billing key")
-        if status == "error":
-            return _tr(self._state["lang"], "余额失败", "balance error")
-        if status == "unsupported":
-            return _tr(self._state["lang"], "无接口", "unsupported")
-        return _tr(self._state["lang"], "待同步", "syncing")
-
-    def _llm_api_provider_health_pct(self, provider):
-        if not provider.get("configured"):
-            return 0
-        level = str(provider.get("warning_level") or "normal")
-        if level == "critical":
-            return 10
-        if level == "warning":
-            return 35
-        if level == "info":
-            return 70
-        return 100
+    def _copilot_credits_text(self, data):
+        remaining = data.get("remaining")
+        entitlement = data.get("entitlement")
+        if isinstance(remaining, (int, float)) and isinstance(entitlement, (int, float)) and entitlement > 0:
+            return f"{int(remaining):,} / {int(entitlement):,}"
+        if isinstance(remaining, (int, float)):
+            return f"{int(remaining):,}"
+        return None
 
     def _widget_alert_rows(self):
         rows = []
@@ -2185,7 +2297,7 @@ class AiLimitApp(rumps.App):
             ("deepseek", self._deepseek or {}),
             ("google", self._google or {}),
             ("gemini", self._gemini or {}),
-            ("llm_api", self._llm_api or {}),
+            ("copilot", self._copilot or {}),
         ):
             if service in (self._state.get("services") or list(_SERVICES)) and data.get("error"):
                 error_services.append(service)
@@ -2214,16 +2326,8 @@ class AiLimitApp(rumps.App):
             return "AG"
         if "current" in text or "usage" in text or "每周" in text or "当前" in text:
             return "M"
-        if "kimi" in text or "moonshot" in text:
-            return "KM"
-        if "doubao" in text or "ark" in text:
-            return "DB"
-        if "qwen" in text or "dashscope" in text:
-            return "QW"
-        if "openroute" in text or "openrouter" in text:
-            return "OR"
-        if "xai" in text:
-            return "xAI"
+        if "copilot" in text or "ai credits" in text or "premium request" in text:
+            return "CP"
         if "deepseek" in text:
             return "D"
         return "AI"
@@ -2283,12 +2387,12 @@ class AiLimitApp(rumps.App):
                 section("Gemini", "#d8b4fe")
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
-        if "llm_api" in services:
-            entries = self._widget_llm_api_entries()
+        if "copilot" in services:
+            entries = self._widget_copilot_entries()
             if entries:
-                section("LLM API", "#5eead4")
+                section("Copilot", "#5eead4")
                 for item in entries:
-                    append(item["name"], item["pct"], item.get("disabled", False), item.get("value"))
+                    append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
         return rows[:34]
 
     def _widget_codex_entries(self):
@@ -2365,17 +2469,40 @@ class AiLimitApp(rumps.App):
             entries.append({"name": "Usage", "pct": _widget_pct_value(data.get("left")), "reset": data.get("reset") or data.get("reset_text")})
         return entries
 
-    def _widget_llm_api_entries(self):
-        data = self._llm_api or {}
+    def _widget_copilot_entries(self):
+        data = self._copilot or {}
         if data.get("error"):
             return []
         entries = []
-        for provider in data.get("providers") or []:
+        metered = [
+            bucket for bucket in data.get("buckets") or []
+            if isinstance(bucket, dict) and not bucket.get("unlimited") and bucket.get("has_quota", True)
+        ]
+        for bucket in metered:
+            pct = bucket.get("remaining_percent")
+            remaining = bucket.get("remaining")
+            entitlement = bucket.get("entitlement")
+            name = f"Copilot / {bucket.get('display_name') or bucket.get('bucket_id') or 'quota'}"
+            # The value column is narrow (percent only); the absolute count
+            # rides along in the wide name column instead.
+            if isinstance(remaining, (int, float)) and isinstance(entitlement, (int, float)) and entitlement > 0:
+                name += f"  {int(remaining):,} / {int(entitlement):,}"
             entries.append({
-                "name": self._llm_api_provider_name(provider),
-                "pct": self._llm_api_provider_health_pct(provider),
-                "value": self._llm_api_provider_metric(provider),
-                "disabled": not bool(provider.get("configured")),
+                "name": name,
+                "pct": _widget_pct_value(pct),
+                "reset": _fmt_copilot_reset(bucket.get("reset_time"), self._state["lang"]),
+                "unknown": pct is None,
+            })
+        if not entries and data:
+            name = f"Copilot / {data.get('unit') or 'quota'}"
+            credits = self._copilot_credits_text(data)
+            if credits:
+                name += f"  {credits}"
+            entries.append({
+                "name": name,
+                "pct": _widget_pct_value(data.get("left")),
+                "reset": _fmt_copilot_reset(data.get("reset"), self._state["lang"]),
+                "unknown": data.get("left") is None,
             })
         return entries
 
@@ -2401,8 +2528,8 @@ class AiLimitApp(rumps.App):
             lines.extend(self._widget_google_lines())
         if "gemini" in services:
             lines.extend(self._widget_gemini_lines())
-        if "llm_api" in services:
-            lines.extend(self._widget_llm_api_lines())
+        if "copilot" in services:
+            lines.extend(self._widget_copilot_lines())
         return "\n".join(lines).rstrip() + "\n"
 
     def _widget_section(self, title, data, source=None):
@@ -2523,15 +2650,28 @@ class AiLimitApp(rumps.App):
         lines.append("")
         return lines
 
-    def _widget_llm_api_lines(self):
-        data = self._llm_api or {}
-        lines = self._widget_section("LLM API", data, data.get("source") or "ai-limit native llm balance adapters")
+    def _widget_copilot_lines(self):
+        lang = self._state["lang"]
+        data = self._copilot or {}
+        lines = self._widget_section("GitHub Copilot", data, data.get("source") or "api.github.com copilot_internal/user")
         if data and not data.get("error"):
-            ready = data.get("ready_provider_count")
-            total = data.get("provider_count")
-            lines.append(_tr(self._state["lang"], f"  Provider: {ready}/{total}", f"  Providers: {ready}/{total}"))
-            for provider in data.get("providers") or []:
-                lines.append(f"  {self._llm_api_provider_name(provider)}    {self._llm_api_provider_metric(provider)}")
+            plan = data.get("plan")
+            if plan:
+                lines.append(f"  Plan: {plan}")
+            credits = self._copilot_credits_text(data)
+            if credits:
+                lines.append(_tr(lang, f"  剩余 {credits} {data.get('unit') or ''}".rstrip(), f"  Remaining {credits} {data.get('unit') or ''}".rstrip()))
+            for bucket in data.get("buckets") or []:
+                if bucket.get("unlimited"):
+                    lines.append(_tr(lang, f"  {bucket.get('display_name')}    不限量", f"  {bucket.get('display_name')}    unlimited"))
+                    continue
+                lines.append(
+                    self._widget_quota_row(
+                        bucket.get("display_name") or "quota",
+                        bucket.get("remaining_percent"),
+                        reset=_fmt_copilot_reset(bucket.get("reset_time"), lang),
+                    )
+                )
         lines.append("")
         return lines
 
@@ -2587,6 +2727,7 @@ class AiLimitApp(rumps.App):
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")
+        self._copilot_dash.title = _tr(lang, "打开 Copilot 用量页", "Open Copilot usage")
         self._about_repo.title = _tr(lang, "打开项目仓库", "Open project repository")
         self._about_menu.title  = _tr(lang,
             f"项目信息（ai-limit {__version__}）",
@@ -2597,16 +2738,16 @@ class AiLimitApp(rumps.App):
             f"Version: ai-limit {__version__}",
         )
         self._about_scope.title = _tr(lang,
-            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / LLM API",
-            "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / LLM API",
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot",
+            "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot",
         )
         self._about_surfaces.title = _tr(lang,
             "界面：菜单栏 / CLI / daemon",
             "Surfaces: menu bar / CLI / daemon",
         )
         self._about_status.title = _tr(lang,
-            "状态：当前版本已接入 Google、Gemini App 与 LLM API 配额",
-            "Status: current build includes Google, Gemini App, and LLM API quota",
+            "状态：当前版本已接入 Google、Gemini App 与 GitHub Copilot 配额",
+            "Status: current build includes Google, Gemini App, and GitHub Copilot quota",
         )
         self._update_login_item_check()
         self._update_widget_item()
@@ -2638,8 +2779,8 @@ class AiLimitApp(rumps.App):
     def _toggle_gemini(self, _):
         self._toggle_service("gemini")
 
-    def _toggle_llm_api(self, _):
-        self._toggle_service("llm_api")
+    def _toggle_copilot(self, _):
+        self._toggle_service("copilot")
 
     def _toggle_service(self, service):
         svc = list(self._state.get("services") or list(_SERVICES))
@@ -2677,7 +2818,7 @@ class AiLimitApp(rumps.App):
         self._svc_deepseek.title = ("✓ " if "deepseek" in svc else "  ") + "DeepSeek"
         self._svc_google.title = ("✓ " if "google" in svc else "  ") + "Google"
         self._svc_gemini.title = ("✓ " if "gemini" in svc else "  ") + "Gemini App"
-        self._svc_llm_api.title = ("✓ " if "llm_api" in svc else "  ") + "LLM API"
+        self._svc_copilot.title = ("✓ " if "copilot" in svc else "  ") + "Copilot"
         enabled = []
         if "claude" in svc:
             enabled.append("Claude Code")
@@ -2689,8 +2830,8 @@ class AiLimitApp(rumps.App):
             enabled.append("Google")
         if "gemini" in svc:
             enabled.append("Gemini App")
-        if "llm_api" in svc:
-            enabled.append("LLM API")
+        if "copilot" in svc:
+            enabled.append("Copilot")
         summary = _tr(lang, "全部", "All") if len(svc) == len(_SERVICES) else ", ".join(enabled)
         self._svc_menu.title = _tr(lang, f"监控服务（{summary}）", f"Services ({summary})")
 

@@ -33,7 +33,7 @@ First launch: right-click the app → Open → Open Anyway (bypasses Gatekeeper;
 
 - Chinese / English UI toggle
 - 5-hour / 7-day quota window toggle
-- Claude, Codex, and Google shown simultaneously, each independently configurable
+- Claude, Codex, Google, and GitHub Copilot shown simultaneously, each independently configurable
 - Manual refresh
 - Click to expand details (plan, usage, reset time)
 
@@ -66,6 +66,7 @@ Output language is detected automatically from your system locale.
 - Chrome or Firefox signed in to [claude.ai](https://claude.ai) (for Claude quota)
 - Chrome or Firefox signed in to [chatgpt.com](https://chatgpt.com) (recommended path for Codex quota)
 - Signed in to Gemini CLI / Antigravity on this Mac (for Google quota)
+- Signed in to Copilot CLI (`copilot login`) or GitHub CLI (`gh auth login`) on this Mac (for GitHub Copilot quota in the menu bar app)
 - Optional: [Codex CLI](https://developers.openai.com/codex/cli) installed and signed in (fallback when browser cookies are unavailable)
 
 ### Usage Prerequisites
@@ -75,6 +76,7 @@ ai-limit only reads your existing local Claude / ChatGPT browser session and loc
 - If Claude Code is available and signed in, Claude Code quota is shown.
 - If ChatGPT / Codex is available and signed in, Codex quota is shown.
 - If Gemini CLI / Antigravity is signed in, Google quota is shown.
+- If Copilot CLI or GitHub CLI is signed in, GitHub Copilot monthly AI credits are shown in the menu bar app.
 - Services that are unavailable or not signed in show a ⚠️ warning. You can hide each service from the menu bar app under `Services`.
 - If both services are unavailable, the menu bar shows `ai-limit ⚠️` or the corresponding error state.
 
@@ -161,6 +163,14 @@ The browser path (1) reuses the same analytics endpoint that powers the chatgpt.
 | Antigravity fallback | `agy /usage` and `~/.gemini/antigravity-cli/log` |
 
 ai-limit reuses local sign-in state already present on your Mac. Gemini App follows the same browser-session request pattern as Claude and ChatGPT. Antigravity is different: it prefers the running local app sidecar and falls back to CLI/log data when that sidecar is unavailable.
+
+### GitHub Copilot
+
+| Data | Source |
+|------|--------|
+| Monthly AI credits (or legacy premium requests) | GitHub token → `api.github.com/copilot_internal/user` → `quota_snapshots.premium_interactions` |
+
+The token is resolved in the same order Copilot CLI uses: `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, then the `copilot-cli` Keychain entry written by `copilot login`, then `gh auth token`. This is the same internal endpoint the Copilot CLI footer reads; it is not part of the public REST API and may change. Copilot is currently a menu bar app card only.
 
 ## Notes
 

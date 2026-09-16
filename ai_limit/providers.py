@@ -32,6 +32,15 @@ GEMINI_APP_USAGE_CACHE = pathlib.Path.home() / ".cache" / "ai-limit" / "gemini-a
 GEMINI_APP_USAGE_CACHE_TTL_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_TTL_SEC", 120))
 GEMINI_APP_USAGE_CACHE_STALE_SEC = int(os.environ.get("AI_LIMIT_GEMINI_APP_CACHE_STALE_SEC", 30 * 60))
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+# Same endpoint the Copilot CLI / IDE clients call for their quota footer. It is
+# an internal GitHub API (not in the public REST reference), so treat it like
+# the Claude / ChatGPT usage endpoints: reuse existing local sign-in, one narrow
+# read-only request, and normalize defensively.
+COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
+COPILOT_USAGE_URL = "https://github.com/settings/billing"
+COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+COPILOT_KEYCHAIN_SERVICE = "copilot-cli"
+COPILOT_TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
@@ -129,6 +138,14 @@ class GoogleQuotaAuthError(GoogleQuotaError):
 
 class GeminiAppUsageError(Exception):
     pass
+
+
+class CopilotQuotaError(Exception):
+    pass
+
+
+class CopilotAuthError(CopilotQuotaError):
+    """No usable GitHub token, or the token has no Copilot access."""
 
 
 def clear_provider_caches() -> None:
@@ -2315,3 +2332,250 @@ def live_deepseek_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         raise DeepSeekError("non-JSON response") from exc
 
     return datetime.datetime.now(datetime.timezone.utc), data
+
+
+# ── GitHub Copilot ────────────────────────────────────────────────────────────
+
+def _copilot_token_like(value) -> str | None:
+    text = str(value or "").strip()
+    return text if text.startswith(COPILOT_TOKEN_PREFIXES) else None
+
+
+def _copilot_token_from_keychain() -> str | None:
+    """OAuth token stored by `copilot login` in the macOS Keychain.
+
+    The CLI documents the service name (`copilot-cli`) but not the payload
+    shape, so accept both a bare token and a JSON blob that carries one.
+    """
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", COPILOT_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    direct = _copilot_token_like(raw)
+    if direct:
+        return direct
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    for value in _walk_json(parsed):
+        token = _copilot_token_like(value)
+        if token:
+            return token
+    return None
+
+
+def _copilot_token_from_gh() -> str | None:
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return None
+    try:
+        result = subprocess.run(
+            [gh_path, "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _copilot_token_like(result.stdout)
+
+
+def load_copilot_github_token() -> tuple[str, str]:
+    """Return ``(token, source)`` following the Copilot CLI credential order.
+
+    Env vars first, then the Keychain entry written by `copilot login`, then
+    the GitHub CLI token as the documented lowest-priority fallback.
+    """
+    for name in COPILOT_TOKEN_ENV_VARS:
+        token = _copilot_token_like(os.environ.get(name))
+        if token:
+            return token, name
+    token = _copilot_token_from_keychain()
+    if token:
+        return token, "copilot-cli keychain"
+    token = _copilot_token_from_gh()
+    if token:
+        return token, "gh auth token"
+    raise CopilotAuthError(
+        t(
+            "未找到 GitHub Copilot 登录态，请先运行 copilot login 或 gh auth login",
+            "GitHub Copilot sign-in not found. Run copilot login or gh auth login first",
+        )
+    )
+
+
+def has_copilot_credentials() -> bool:
+    try:
+        load_copilot_github_token()
+    except CopilotAuthError:
+        return False
+    return True
+
+
+_COPILOT_PLAN_LABELS = {
+    "individual": "Pro",
+    "individual_pro": "Pro",
+    "individual_pro_plus": "Pro+",
+    "individual_max": "Max",
+    "free": "Free",
+    "free_limited_copilot": "Free",
+    "student": "Student",
+    "business": "Business",
+    "enterprise": "Enterprise",
+}
+
+
+def _copilot_plan_label(plan) -> str | None:
+    if not plan:
+        return None
+    key = str(plan).strip().lower()
+    if key in _COPILOT_PLAN_LABELS:
+        return _COPILOT_PLAN_LABELS[key]
+    return key.replace("individual_", "").replace("_", " ").title()
+
+
+def _copilot_bucket_display_name(quota_id: str, token_based_billing: bool) -> str:
+    if quota_id == "premium_interactions":
+        return "AI Credits" if token_based_billing else "Premium requests"
+    return {"chat": "Chat", "completions": "Completions"}.get(quota_id, quota_id.replace("_", " ").title())
+
+
+def _copilot_int(value) -> int | None:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_copilot_quota(data: dict) -> dict:
+    token_based_billing = bool(data.get("token_based_billing"))
+    reset_time = data.get("quota_reset_date_utc") or data.get("quota_reset_date")
+    snapshots = data.get("quota_snapshots") or {}
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+
+    buckets = []
+    for quota_id, raw in snapshots.items():
+        if not isinstance(raw, dict):
+            continue
+        unlimited = bool(raw.get("unlimited"))
+        percent = None if unlimited else raw.get("percent_remaining")
+        try:
+            percent = None if percent is None else max(0, min(100, int(round(float(percent)))))
+        except (TypeError, ValueError):
+            percent = None
+        entitlement = _copilot_int(raw.get("entitlement"))
+        remaining = _copilot_int(raw.get("remaining"))
+        if remaining is None:
+            remaining = _copilot_int(raw.get("quota_remaining"))
+        used = _copilot_int(raw.get("credits_used"))
+        if used is None and entitlement is not None and remaining is not None:
+            used = max(0, entitlement - remaining)
+        buckets.append(
+            {
+                "bucket_id": quota_id,
+                "display_name": _copilot_bucket_display_name(str(quota_id), token_based_billing),
+                "window": "monthly",
+                "unlimited": unlimited,
+                "has_quota": bool(raw.get("has_quota", True)),
+                "remaining_percent": 100 if unlimited else percent,
+                "entitlement": entitlement,
+                "remaining": remaining,
+                "used": used,
+                "overage_permitted": bool(raw.get("overage_permitted")),
+                "overage_count": _copilot_int(raw.get("overage_count")) or 0,
+                "reset_time": reset_time,
+                "observed_at": raw.get("timestamp_utc"),
+            }
+        )
+
+    # premium_interactions is the only metered bucket on every plan; chat and
+    # completions report `unlimited` for paid plans and would drown it out.
+    primary = next((bucket for bucket in buckets if bucket["bucket_id"] == "premium_interactions"), None)
+    if primary is None:
+        metered = [bucket for bucket in buckets if not bucket["unlimited"] and bucket["remaining_percent"] is not None]
+        primary = min(metered, key=lambda bucket: bucket["remaining_percent"]) if metered else (buckets[0] if buckets else None)
+    if primary is None:
+        raise CopilotQuotaError("Copilot response did not include quota snapshots")
+
+    return {
+        "source": "api.github.com copilot_internal/user",
+        "login": data.get("login"),
+        "plan": data.get("copilot_plan"),
+        "plan_label": _copilot_plan_label(data.get("copilot_plan")),
+        "token_based_billing": token_based_billing,
+        "unit": "AI credits" if token_based_billing else "premium requests",
+        "reset_time": reset_time,
+        "primary": primary,
+        "buckets": buckets,
+        "summary": {
+            "remaining_percent": primary.get("remaining_percent"),
+            "remaining": primary.get("remaining"),
+            "used": primary.get("used"),
+            "entitlement": primary.get("entitlement"),
+            "overage_permitted": primary.get("overage_permitted"),
+            "overage_count": primary.get("overage_count"),
+            "reset_time": reset_time,
+            "bucket_count": len(buckets),
+        },
+    }
+
+
+def live_copilot_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    import urllib.error
+    import urllib.request
+
+    token, token_source = load_copilot_github_token()
+    req = urllib.request.Request(
+        COPILOT_USER_URL,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/json",
+            "User-Agent": f"ai-limit/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise CopilotAuthError(
+                t(
+                    f"HTTP {exc.code}：GitHub 登录已失效或该 token 无 Copilot 权限（来源 {token_source}）",
+                    f"HTTP {exc.code}: GitHub sign-in expired or token lacks Copilot access (source {token_source})",
+                )
+            ) from exc
+        if exc.code == 404:
+            raise CopilotAuthError(
+                t(
+                    "HTTP 404：该 GitHub 账号没有 Copilot 订阅",
+                    "HTTP 404: this GitHub account has no Copilot subscription",
+                )
+            ) from exc
+        raise CopilotQuotaError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise CopilotQuotaError(str(exc)) from exc
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise CopilotQuotaError("non-JSON response") from exc
+    if not isinstance(data, dict):
+        raise CopilotQuotaError("unexpected Copilot response shape")
+
+    normalized = _normalize_copilot_quota(data)
+    normalized["token_source"] = token_source
+    return datetime.datetime.now(datetime.timezone.utc), normalized
