@@ -348,7 +348,13 @@ def _fmt_reset_iso(iso, lang="zh"):
 
 
 def _fmt_copilot_reset(value, lang="zh"):
-    """Format Copilot's fixed monthly reset as an absolute local date."""
+    """Format Copilot's monthly reset as an absolute date plus a countdown.
+
+    Copilot's allowance always rolls over on the first of the next month, so
+    the reset date belongs to a different month than the window it ends. Saying
+    only "本月" next to an October date reads like a contradiction, so the
+    countdown spells out why the date is where it is.
+    """
     if not value:
         return "?"
     try:
@@ -358,15 +364,24 @@ def _fmt_copilot_reset(value, lang="zh"):
             reset = datetime.datetime.fromisoformat(
                 str(value).replace("Z", "+00:00")
             ).astimezone(TZ_LOCAL)
-        current_year = datetime.datetime.now(TZ_LOCAL).year
-        show_year = reset.year != current_year
+        now = datetime.datetime.now(TZ_LOCAL)
+        show_year = reset.year != now.year
         if lang == "en":
             date_text = f"{reset:%b} {reset.day}"
             if show_year:
                 date_text += f", {reset.year}"
         else:
             date_text = _zh_date(reset, with_year=show_year)
-        return f"{date_text} {reset:%H:%M}"
+        date_text = f"{date_text} {reset:%H:%M}"
+
+        days = (reset.date() - now.date()).days
+        if days <= 0:
+            countdown = _tr(lang, "今天", "today")
+        elif days == 1:
+            countdown = _tr(lang, "明天", "tomorrow")
+        else:
+            countdown = _tr(lang, f"{days} 天后", f"in {days} days")
+        return f"{date_text} · {countdown}"
     except Exception:
         return str(value)
 
@@ -2086,10 +2101,13 @@ class AiLimitApp(rumps.App):
                 ),
             ])
             if copilot_reset != "?":
+                # "本月" labels the allowance window; the date is when the next
+                # one starts. Prefixing it with the window name again would read
+                # as "this month, on October 1".
                 reset_text = _tr(
                     lang,
-                    f"本月 ↻ {copilot_reset}",
-                    f"Mo ↻ {copilot_reset}",
+                    f"重置 {copilot_reset}",
+                    f"Resets {copilot_reset}",
                 )
             pct = self._metric_floor(metrics)
             if not metrics:

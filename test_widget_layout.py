@@ -262,6 +262,24 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
         self.assertIn("Oct 1", text)
         self.assertIn("12:00", text)
 
+    def test_copilot_reset_explains_why_the_date_is_next_month(self):
+        # "本月" labels the allowance window while the date starts the next one,
+        # so the countdown has to be there to make the pairing readable.
+        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=menubar.TZ_LOCAL)
+
+        class _Now(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = cls(2026, 9, 16, 14, 0)
+                return value.replace(tzinfo=tz) if tz else value
+
+        with mock.patch.object(menubar.datetime, "datetime", _Now):
+            zh = menubar._fmt_copilot_reset(moment.isoformat(), "zh")
+            en = menubar._fmt_copilot_reset(moment.isoformat(), "en")
+
+        self.assertEqual(zh, "10月01日 12:00 · 15 天后")
+        self.assertEqual(en, "Oct 1 12:00 · in 15 days")
+
     def test_distant_reset_label_keeps_the_date(self):
         moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=menubar.TZ_LOCAL)
 
