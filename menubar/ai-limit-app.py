@@ -1678,6 +1678,9 @@ class AiLimitApp(rumps.App):
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
         scroll.setAutoresizingMask_(getattr(AppKit, "NSViewWidthSizable", 2) | getattr(AppKit, "NSViewHeightSizable", 16))
         scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        if hasattr(scroll, "setAutohidesScrollers_"):
+            scroll.setAutohidesScrollers_(False)
         scroll.setBorderType_(getattr(AppKit, "NSNoBorder", 0))
         scroll.setDrawsBackground_(False)
 
@@ -1813,7 +1816,11 @@ class AiLimitApp(rumps.App):
         alerts = self._widget_alert_rows()
         details = self._widget_detail_rows()
         bounds = self._widget_panel.contentView().bounds() if self._widget_panel is not None else AppKit.NSMakeRect(0, 0, 480, 560)
-        content_w = max(360, int(bounds.size.width))
+        # During startup the scroll view can briefly report its minimum clip
+        # width before the panel has laid out. Use the window frame as a stable
+        # floor so a normal 760pt panel does not render a one-column dashboard.
+        frame_w = int(self._widget_panel.frame().size.width) if self._widget_panel is not None else 0
+        content_w = max(360, int(bounds.size.width), frame_w - 20)
         self._widget_last_layout_size = (int(bounds.size.width), int(bounds.size.height))
         margin = 18
         gap = 14
@@ -1897,7 +1904,7 @@ class AiLimitApp(rumps.App):
 
         metrics = card.get("metrics") or []
         if metrics:
-            reset_text = self._card_reset_text(metrics)
+            reset_text = card.get("reset_text") or self._card_reset_text(metrics)
             if reset_text:
                 self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
             row_x = x + 16
@@ -1948,7 +1955,7 @@ class AiLimitApp(rumps.App):
                 "bg": "#2a171a",
                 "border": "#7f1d1d",
             }
-        pct, subtitle, value, metrics = None, _tr(lang, "等待数据", "Waiting"), "…", []
+        pct, subtitle, value, metrics, reset_text = None, _tr(lang, "等待数据", "Waiting"), "…", [], None
         if service == "claude" and data:
             metrics = self._quota_card_metrics([
                 ("5h", data.get("5h_left"), data.get("5h_reset")),
@@ -2021,13 +2028,20 @@ class AiLimitApp(rumps.App):
         elif service == "copilot" and data:
             # One monthly bucket of AI credits (or legacy premium requests);
             # chat/completions are unlimited on paid plans and stay off the card.
+            copilot_reset = _fmt_copilot_reset(data.get("reset"), lang)
             metrics = self._quota_card_metrics([
                 (
                     _tr(lang, "本月", "Mo"),
                     data.get("left"),
-                    _fmt_copilot_reset(data.get("reset"), lang),
+                    None,
                 ),
             ])
+            if copilot_reset != "?":
+                reset_text = _tr(
+                    lang,
+                    f"本月 ↻ {copilot_reset}",
+                    f"Mo ↻ {copilot_reset}",
+                )
             pct = self._metric_floor(metrics)
             if not metrics:
                 value = _tr(lang, "未知", "Unknown")
@@ -2047,6 +2061,7 @@ class AiLimitApp(rumps.App):
             "value_color": value_color,
             "subtitle": subtitle,
             "metrics": metrics,
+            "reset_text": reset_text,
             "bg": bg,
             "border": border,
         }
