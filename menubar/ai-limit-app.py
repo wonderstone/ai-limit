@@ -1678,9 +1678,9 @@ class AiLimitApp(rumps.App):
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
         scroll.setAutoresizingMask_(getattr(AppKit, "NSViewWidthSizable", 2) | getattr(AppKit, "NSViewHeightSizable", 16))
         scroll.setHasVerticalScroller_(True)
+        # The dashboard is laid out to the clip width, so a horizontal scroller
+        # would only ever appear because of a layout bug. Keep it off.
         scroll.setHasHorizontalScroller_(False)
-        if hasattr(scroll, "setAutohidesScrollers_"):
-            scroll.setAutohidesScrollers_(False)
         scroll.setBorderType_(getattr(AppKit, "NSNoBorder", 0))
         scroll.setDrawsBackground_(False)
 
@@ -1810,17 +1810,51 @@ class AiLimitApp(rumps.App):
         self._widget_content.addSubview_(view)
         return view
 
+    # The dashboard is drawn into a fixed-height document view, so the height
+    # must be known before drawing. These advances are the single source of
+    # truth for both passes: if the estimate is smaller than what the draw loop
+    # consumes, the last quota rows land below the document view and are simply
+    # invisible, which looks like missing data rather than a layout bug.
+    _WIDGET_TOP_MARGIN = 18
+    _WIDGET_BOTTOM_MARGIN = 18
+    _WIDGET_HEADER_ADVANCE = 46
+    _WIDGET_CARD_BLOCK_EXTRA = 6
+    _WIDGET_ALERT_HEADING_ADVANCE = 30
+    _WIDGET_ALERT_ROW_ADVANCE = 34
+    _WIDGET_ALERT_BLOCK_EXTRA = 10
+    _WIDGET_MAX_ALERTS = 5
+    _WIDGET_DETAIL_HEADING_ADVANCE = 32
+    _WIDGET_SECTION_ADVANCE = 26
+
+    @staticmethod
+    def _widget_detail_row_height(row):
+        return 42 if row.get("reset") else 28
+
+    def _widget_detail_row_advance(self, row):
+        if row.get("type") == "section":
+            return self._WIDGET_SECTION_ADVANCE
+        return self._widget_detail_row_height(row) + 6
+
+    def _widget_layout_height(self, card_rows, card_h, alerts, details):
+        height = self._WIDGET_TOP_MARGIN + self._WIDGET_HEADER_ADVANCE
+        height += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
+        if alerts:
+            height += (
+                self._WIDGET_ALERT_HEADING_ADVANCE
+                + min(len(alerts), self._WIDGET_MAX_ALERTS) * self._WIDGET_ALERT_ROW_ADVANCE
+                + self._WIDGET_ALERT_BLOCK_EXTRA
+            )
+        height += self._WIDGET_DETAIL_HEADING_ADVANCE
+        height += sum(self._widget_detail_row_advance(row) for row in details)
+        return height + self._WIDGET_BOTTOM_MARGIN
+
     def _render_widget_dashboard(self):
         lang = self._state["lang"]
         cards = self._widget_summary_cards()
         alerts = self._widget_alert_rows()
         details = self._widget_detail_rows()
         bounds = self._widget_panel.contentView().bounds() if self._widget_panel is not None else AppKit.NSMakeRect(0, 0, 480, 560)
-        # During startup the scroll view can briefly report its minimum clip
-        # width before the panel has laid out. Use the window frame as a stable
-        # floor so a normal 760pt panel does not render a one-column dashboard.
-        frame_w = int(self._widget_panel.frame().size.width) if self._widget_panel is not None else 0
-        content_w = max(360, int(bounds.size.width), frame_w - 20)
+        content_w = max(360, int(bounds.size.width))
         self._widget_last_layout_size = (int(bounds.size.width), int(bounds.size.height))
         margin = 18
         gap = 14
@@ -1828,16 +1862,14 @@ class AiLimitApp(rumps.App):
         card_w = int((content_w - margin * 2 - gap * (cols - 1)) / cols)
         card_h = 100
         card_rows = max(1, (len(cards) + cols - 1) // cols)
-        alerts_h = 0 if not alerts else 36 + min(len(alerts), 5) * 34
-        details_h = 42 + sum(26 if row.get("type") == "section" else (42 if row.get("reset") else 34) for row in details)
-        total_h = max(560, 70 + card_rows * (card_h + 12) + alerts_h + details_h + 34)
+        total_h = max(560, self._widget_layout_height(card_rows, card_h, alerts, details))
         self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, total_h))
         self._clear_widget_content()
 
         def y(top, h):
             return total_h - top - h
 
-        top = 18
+        top = self._WIDGET_TOP_MARGIN
         self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
         self._widget_add_label(
             _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
@@ -1849,7 +1881,7 @@ class AiLimitApp(rumps.App):
             color="#a1a1aa",
             align="right",
         )
-        top += 46
+        top += self._WIDGET_HEADER_ADVANCE
 
         for index, card in enumerate(cards):
             col = index % cols
@@ -1857,23 +1889,23 @@ class AiLimitApp(rumps.App):
             x = margin + col * (card_w + gap)
             cy = y(top + row * (card_h + 12), card_h)
             self._draw_widget_card(card, x, cy, card_w, card_h)
-        top += card_rows * (card_h + 12) + 6
+        top += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
 
         if alerts:
             self._widget_add_label(_tr(lang, "需要注意", "Needs attention"), margin, y(top, 22), 180, 22, size=15, weight="bold")
-            top += 30
-            for alert in alerts[:5]:
+            top += self._WIDGET_ALERT_HEADING_ADVANCE
+            for alert in alerts[: self._WIDGET_MAX_ALERTS]:
                 cy = y(top, 28)
                 row_w = content_w - margin * 2
                 self._widget_add_box(margin, cy, row_w, 28, alert["bg"], radius=8, border=alert["border"])
                 self._widget_add_symbol(alert["symbol"], margin + 10, cy + 5, size=14, color=alert["fg"])
                 self._widget_add_label(alert["text"], margin + 34, cy + 5, max(120, row_w - 120), 18, size=12, weight="medium", color=alert["fg"])
                 self._widget_add_label(alert["value"], margin + row_w - 86, cy + 5, 72, 18, size=12, weight="bold", color=alert["fg"], align="right")
-                top += 34
-            top += 10
+                top += self._WIDGET_ALERT_ROW_ADVANCE
+            top += self._WIDGET_ALERT_BLOCK_EXTRA
 
         self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
-        top += 32
+        top += self._WIDGET_DETAIL_HEADING_ADVANCE
         value_w = 72
         progress_w = max(76, min(180, int((content_w - margin * 2) * 0.28)))
         name_x = margin + 4
@@ -1885,16 +1917,16 @@ class AiLimitApp(rumps.App):
                 cy = y(top, 20)
                 self._widget_add_label(row["name"], name_x, cy + 2, 200, 16, size=12, weight="bold", color=row["color"])
                 self._widget_add_box(progress_x, cy + 8, max(40, content_w - progress_x - margin), 1, "#323238", radius=0)
-                top += 26
+                top += self._WIDGET_SECTION_ADVANCE
                 continue
-            row_h = 42 if row.get("reset") else 28
+            row_h = self._widget_detail_row_height(row)
             cy = y(top, row_h)
             self._widget_add_label(row["name"], name_x, cy + 8, name_w, 16, size=11, color="#d4d4d8")
             if row.get("reset"):
                 self._widget_add_label(f"↻ {row['reset']}", name_x, cy - 5, name_w, 14, size=9, color="#8b8b93")
             self._widget_add_progress(progress_x, cy + 10, progress_w, 8, row["pct"])
             self._widget_add_label(row["value"], value_x, cy + 5, value_w, 18, size=12, weight="bold", color=row["color"], align="right")
-            top += row_h + 6
+            top += self._widget_detail_row_advance(row)
 
     def _draw_widget_card(self, card, x, y, w, h):
         self._widget_add_box(x, y, w, h, card["bg"], radius=12, border=card["border"])
@@ -1905,8 +1937,6 @@ class AiLimitApp(rumps.App):
         metrics = card.get("metrics") or []
         if metrics:
             reset_text = card.get("reset_text") or self._card_reset_text(metrics)
-            if reset_text:
-                self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
             row_x = x + 16
             row_w = max(120, w - 30)
             value_w = 44
@@ -1914,6 +1944,14 @@ class AiLimitApp(rumps.App):
             bar_x = row_x + label_w + 6
             bar_w = max(46, row_w - label_w - value_w - 14)
             first_y = y + 37
+            if reset_text:
+                if len(metrics) == 1:
+                    # A single-window card leaves the lower half of the card
+                    # empty. Put the reset line there at a readable size instead
+                    # of squeezing it into the narrow strip beside the icon.
+                    self._widget_add_label(reset_text, row_x, y + 15, row_w, 15, size=10, color="#a1a1aa")
+                else:
+                    self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
             for index, metric in enumerate(metrics[:2]):
                 row_y = first_y - index * 21
                 self._widget_add_label(metric["label"], row_x, row_y, label_w, 13, size=10, weight="medium", color="#a1a1aa")
