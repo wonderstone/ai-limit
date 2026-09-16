@@ -334,6 +334,32 @@ def _fmt_reset_iso(iso, lang="zh"):
     except Exception:
         return "?"
 
+
+def _fmt_copilot_reset(value, lang="zh"):
+    """Format Copilot's fixed monthly reset as an absolute local date."""
+    if not value:
+        return "?"
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            reset = epoch_to_local(int(value))
+        else:
+            reset = datetime.datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            ).astimezone(TZ_LOCAL)
+        current_year = datetime.datetime.now(TZ_LOCAL).year
+        if lang == "en":
+            date_text = f"{reset:%b} {reset.day}"
+            if reset.year != current_year:
+                date_text += f", {reset:%Y}"
+        else:
+            date_text = f"{reset:%m月%d日}"
+            if reset.year != current_year:
+                date_text = f"{reset:%Y年}{date_text}"
+        return f"{date_text} {reset:%H:%M}"
+    except Exception:
+        return str(value)
+
+
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
@@ -1996,7 +2022,11 @@ class AiLimitApp(rumps.App):
             # One monthly bucket of AI credits (or legacy premium requests);
             # chat/completions are unlimited on paid plans and stay off the card.
             metrics = self._quota_card_metrics([
-                (_tr(lang, "本月", "Mo"), data.get("left"), data.get("reset")),
+                (
+                    _tr(lang, "本月", "Mo"),
+                    data.get("left"),
+                    _fmt_copilot_reset(data.get("reset"), lang),
+                ),
             ])
             pct = self._metric_floor(metrics)
             if not metrics:
@@ -2378,7 +2408,7 @@ class AiLimitApp(rumps.App):
             entries.append({
                 "name": name,
                 "pct": _widget_pct_value(pct),
-                "reset": bucket.get("reset_time"),
+                "reset": _fmt_copilot_reset(bucket.get("reset_time"), self._state["lang"]),
                 "unknown": pct is None,
             })
         if not entries and data:
@@ -2389,7 +2419,7 @@ class AiLimitApp(rumps.App):
             entries.append({
                 "name": name,
                 "pct": _widget_pct_value(data.get("left")),
-                "reset": data.get("reset"),
+                "reset": _fmt_copilot_reset(data.get("reset"), self._state["lang"]),
                 "unknown": data.get("left") is None,
             })
         return entries
@@ -2553,7 +2583,13 @@ class AiLimitApp(rumps.App):
                 if bucket.get("unlimited"):
                     lines.append(_tr(lang, f"  {bucket.get('display_name')}    不限量", f"  {bucket.get('display_name')}    unlimited"))
                     continue
-                lines.append(self._widget_quota_row(bucket.get("display_name") or "quota", bucket.get("remaining_percent"), reset=bucket.get("reset_time")))
+                lines.append(
+                    self._widget_quota_row(
+                        bucket.get("display_name") or "quota",
+                        bucket.get("remaining_percent"),
+                        reset=_fmt_copilot_reset(bucket.get("reset_time"), lang),
+                    )
+                )
         lines.append("")
         return lines
 
