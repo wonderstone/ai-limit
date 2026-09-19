@@ -612,6 +612,8 @@ def _fetch_codex(lang):
             "7d_reset": codex_window_reset_time(rl, "weekly") or secondary.get("resets_at"),
             "plan":     rl.get("plan_type") or "?",
             "source":   source,
+            "credits":  rl.get("credits"),
+            "rate_limit_reset_credits": rl.get("rate_limit_reset_credits"),
             "groups":   rl.get("groups") or [],
             "buckets":  buckets,
             "group_count": summary.get("group_count") or len(rl.get("groups") or []),
@@ -1016,6 +1018,69 @@ def _widget_risk_tone(pct):
 def _short_widget_name(value, limit=38):
     text = str(value or "?")
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _credit_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def _format_codex_credit_balance(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def _codex_credit_summary(data, lang="zh"):
+    credits = data.get("credits") if isinstance(data, dict) else None
+    if not isinstance(credits, dict):
+        return None
+    has_credits = credits.get("has_credits", credits.get("hasCredits"))
+    unlimited = credits.get("unlimited")
+    if _credit_bool(unlimited):
+        return _tr(lang, "Codex 积分不限量", "Codex credits unlimited")
+    if not _credit_bool(has_credits):
+        return None
+    balance = _format_codex_credit_balance(credits.get("balance"))
+    if balance is None:
+        balance = _tr(lang, "可用", "available")
+    return _tr(lang, f"Codex 积分 {balance}", f"Codex credits {balance}")
+
+
+def _compact_widget_quota_name(value):
+    """Shorten provider-owned quota labels without losing their window."""
+    text = str(value or "limit").strip()
+    lower = text.lower()
+    window = "5h" if any(token in lower for token in ("five hour", "5 hour", "5h")) else None
+    if any(token in lower for token in ("weekly", "week", "1周", "每周")):
+        window = "Weekly"
+    if "claude and gpt" in lower or "claude + gpt" in lower:
+        return f"Claude + GPT · {window}" if window else "Claude + GPT"
+    if "gemini models" in lower:
+        return f"Gemini · {window}" if window else "Gemini"
+    if lower.startswith("balance /"):
+        return window or text.split("/", 1)[-1].strip()
+    if "weekly usage limit" in lower:
+        return "Weekly"
+    if "five hour" in lower or "5 hour" in lower:
+        return "5h"
+    if "copilot / ai credits" in lower:
+        return text.replace("Copilot / ", "", 1)
+    return _short_widget_name(text, 30)
 
 # ── 主 App ────────────────────────────────────────────────────────────────────
 
@@ -1680,7 +1745,7 @@ class AiLimitApp(rumps.App):
         if self._widget_panel is not None:
             return
 
-        width, height = 760, 680
+        width, height = self._WIDGET_DEFAULT_WIDTH, self._WIDGET_MIN_HEIGHT
         screen = AppKit.NSScreen.mainScreen()
         visible = screen.visibleFrame() if screen is not None else AppKit.NSMakeRect(80, 80, width, height)
         origin_x = visible.origin.x + max(24, visible.size.width - width - 28)
@@ -1697,13 +1762,13 @@ class AiLimitApp(rumps.App):
         panel.setReleasedWhenClosed_(False)
         panel.setHidesOnDeactivate_(False)
         panel.setLevel_(getattr(AppKit, "NSFloatingWindowLevel", 3))
-        panel.setMinSize_(AppKit.NSMakeSize(520, 520))
+        panel.setMinSize_(AppKit.NSMakeSize(self._WIDGET_MIN_WIDTH, self._WIDGET_MIN_HEIGHT))
         panel.setBackgroundColor_(_appkit_color("#171717", 0.96))
         panel.setOpaque_(False)
 
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, width, height))
         scroll.setAutoresizingMask_(getattr(AppKit, "NSViewWidthSizable", 2) | getattr(AppKit, "NSViewHeightSizable", 16))
-        scroll.setHasVerticalScroller_(True)
+        scroll.setHasVerticalScroller_(False)
         # The dashboard is laid out to the clip width, so a horizontal scroller
         # would only ever appear because of a layout bug. Keep it off.
         scroll.setHasHorizontalScroller_(False)
@@ -1836,156 +1901,372 @@ class AiLimitApp(rumps.App):
         self._widget_content.addSubview_(view)
         return view
 
-    # The dashboard is drawn into a fixed-height document view, so the height
-    # must be known before drawing. These advances are the single source of
-    # truth for both passes: if the estimate is smaller than what the draw loop
-    # consumes, the last quota rows land below the document view and are simply
-    # invisible, which looks like missing data rather than a layout bug.
+    # The dashboard is drawn into a document view whose natural height is
+    # computed before drawing. These advances are the single source of truth
+    # for both passes, so the last quota row cannot be clipped by an estimate
+    # that is shorter than the content.
+    _WIDGET_DEFAULT_WIDTH = 640
+    _WIDGET_MIN_WIDTH = 420
+    _WIDGET_MIN_HEIGHT = 360
+    _WIDGET_MAX_HEIGHT = 760
     _WIDGET_TOP_MARGIN = 18
     _WIDGET_BOTTOM_MARGIN = 18
     _WIDGET_HEADER_ADVANCE = 46
     _WIDGET_CARD_BLOCK_EXTRA = 6
+    _WIDGET_CARD_HEIGHT = 62
+    _WIDGET_CARD_GAP = 10
     _WIDGET_ALERT_HEADING_ADVANCE = 30
     _WIDGET_ALERT_ROW_ADVANCE = 34
     _WIDGET_ALERT_BLOCK_EXTRA = 10
     _WIDGET_MAX_ALERTS = 5
     _WIDGET_DETAIL_HEADING_ADVANCE = 32
-    _WIDGET_SECTION_ADVANCE = 26
+    _WIDGET_SECTION_ADVANCE = 22
+    _WIDGET_QUOTA_ROW_ADVANCE = 26
+    _WIDGET_BLOCK_GAP = 14
+
+    def _widget_header_height(self, content_w, credit_summary):
+        if content_w < 470:
+            return 66 if credit_summary else 48
+        return 58 if credit_summary else self._WIDGET_HEADER_ADVANCE
 
     @staticmethod
     def _widget_detail_row_height(row):
-        return 42 if row.get("reset") else 28
+        # Reset information is rendered inline with the quota name, so every
+        # quota row can use the same compact height.
+        return 26
 
     def _widget_detail_row_advance(self, row):
         if row.get("type") == "section":
             return self._WIDGET_SECTION_ADVANCE
-        return self._widget_detail_row_height(row) + 6
+        return self._WIDGET_QUOTA_ROW_ADVANCE
 
-    def _widget_layout_height(self, card_rows, card_h, alerts, details):
-        height = self._WIDGET_TOP_MARGIN + self._WIDGET_HEADER_ADVANCE
-        height += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
+    @staticmethod
+    def _widget_detail_blocks(details):
+        blocks = []
+        current = None
+        for row in details:
+            if row.get("type") == "section":
+                current = [row]
+                blocks.append(current)
+            elif current is None:
+                current = []
+                blocks.append(current)
+                current.append(row)
+            else:
+                current.append(row)
+        return blocks
+
+    def _widget_detail_block_height(self, block):
+        return sum(self._widget_detail_row_advance(row) for row in block)
+
+    def _widget_detail_columns(self, details, columns):
+        blocks = self._widget_detail_blocks(details)
+        columns = max(1, min(columns, len(blocks) or 1))
+        grouped = [[] for _ in range(columns)]
+        heights = [0] * columns
+        for block in blocks:
+            index = min(range(columns), key=heights.__getitem__)
+            if grouped[index]:
+                heights[index] += self._WIDGET_BLOCK_GAP
+            grouped[index].append(block)
+            heights[index] += self._widget_detail_block_height(block)
+        return grouped, heights
+
+    def _widget_grid_height(self, items, columns, item_height):
+        if not items:
+            return 0
+        rows = (len(items) + columns - 1) // columns
+        return rows * item_height + (rows - 1) * self._WIDGET_BLOCK_GAP
+
+    def _widget_layout_height(
+        self,
+        card_rows,
+        card_h,
+        alerts,
+        details,
+        *,
+        alert_columns=1,
+        detail_columns=1,
+        header_height=None,
+    ):
+        height = self._WIDGET_TOP_MARGIN + (
+            self._WIDGET_HEADER_ADVANCE if header_height is None else header_height
+        )
+        if card_rows:
+            height += card_rows * (card_h + self._WIDGET_CARD_GAP) + self._WIDGET_CARD_BLOCK_EXTRA
         if alerts:
+            alert_rows = (min(len(alerts), self._WIDGET_MAX_ALERTS) + alert_columns - 1) // alert_columns
             height += (
                 self._WIDGET_ALERT_HEADING_ADVANCE
-                + min(len(alerts), self._WIDGET_MAX_ALERTS) * self._WIDGET_ALERT_ROW_ADVANCE
+                + alert_rows * self._WIDGET_ALERT_ROW_ADVANCE
+                + max(0, alert_rows - 1) * self._WIDGET_BLOCK_GAP
                 + self._WIDGET_ALERT_BLOCK_EXTRA
             )
         height += self._WIDGET_DETAIL_HEADING_ADVANCE
-        height += sum(self._widget_detail_row_advance(row) for row in details)
+        _, column_heights = self._widget_detail_columns(details, detail_columns)
+        height += max(column_heights, default=0)
         return height + self._WIDGET_BOTTOM_MARGIN
+
+    def _widget_resize_panel(self, desired_height):
+        panel = self._widget_panel
+        if panel is None or not hasattr(panel, "frame"):
+            return
+        frame = panel.frame()
+        current_width = int(frame.size.width)
+        current_height = int(frame.size.height)
+        height = max(self._WIDGET_MIN_HEIGHT, min(self._widget_height_limit(), int(desired_height)))
+        if current_height == height:
+            return
+
+        right = frame.origin.x + frame.size.width
+        top = frame.origin.y + frame.size.height
+        origin_x = right - current_width
+        origin_y = top - height
+        screen = AppKit.NSScreen.mainScreen()
+        visible = screen.visibleFrame() if screen is not None else None
+        if visible is not None:
+            inset = 16
+            left = visible.origin.x + inset
+            right_edge = visible.origin.x + visible.size.width - inset
+            bottom = visible.origin.y + inset
+            top_edge = visible.origin.y + visible.size.height - inset
+            origin_x = min(max(origin_x, left), max(left, right_edge - current_width))
+            origin_y = min(max(origin_y, bottom), max(bottom, top_edge - height))
+
+        new_frame = AppKit.NSMakeRect(origin_x, origin_y, current_width, height)
+        if hasattr(panel, "setFrame_display_animate_"):
+            panel.setFrame_display_animate_(new_frame, True, True)
+        else:
+            panel.setFrame_display_(new_frame, True)
+
+    def _widget_height_limit(self):
+        limit = self._WIDGET_MAX_HEIGHT
+        screen = AppKit.NSScreen.mainScreen()
+        visible = screen.visibleFrame() if screen is not None else None
+        if visible is not None:
+            limit = min(limit, max(self._WIDGET_MIN_HEIGHT, int(visible.size.height) - 32))
+        return limit
 
     def _render_widget_dashboard(self):
         lang = self._state["lang"]
-        cards = self._widget_summary_cards()
         alerts = self._widget_alert_rows()
         details = self._widget_detail_rows()
-        bounds = self._widget_panel.contentView().bounds() if self._widget_panel is not None else AppKit.NSMakeRect(0, 0, 480, 560)
-        content_w = max(360, int(bounds.size.width))
-        self._widget_last_layout_size = (int(bounds.size.width), int(bounds.size.height))
+        bounds = (
+            self._widget_panel.contentView().bounds()
+            if self._widget_panel is not None
+            else AppKit.NSMakeRect(0, 0, 480, 560)
+        )
+        content_w = max(1, int(bounds.size.width))
         margin = 18
-        gap = 14
-        cols = 3 if content_w >= 960 else (2 if content_w >= 560 else 1)
-        card_w = int((content_w - margin * 2 - gap * (cols - 1)) / cols)
-        card_h = 100
-        card_rows = max(1, (len(cards) + cols - 1) // cols)
-        total_h = max(560, self._widget_layout_height(card_rows, card_h, alerts, details))
-        self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, total_h))
+        credit_summary = None
+        columns = 2 if content_w >= 470 else 1
+        card_h = self._WIDGET_CARD_HEIGHT
+        card_rows = 0
+        header_height = self._widget_header_height(content_w, credit_summary)
+        natural_height = self._widget_layout_height(
+            card_rows,
+            card_h,
+            alerts,
+            details,
+            alert_columns=columns,
+            detail_columns=columns,
+            header_height=header_height,
+        )
+        self._widget_resize_panel(natural_height)
+        scroll = self._widget_panel.contentView() if self._widget_panel is not None else None
+        if scroll is not None and hasattr(scroll, "setHasVerticalScroller_"):
+            scroll.setHasVerticalScroller_(natural_height > self._widget_height_limit())
+        self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, natural_height))
+        viewport = self._widget_panel.contentView().bounds() if self._widget_panel is not None else bounds
+        self._widget_last_layout_size = (int(viewport.size.width), int(viewport.size.height))
         self._clear_widget_content()
 
         def y(top, h):
-            return total_h - top - h
+            return natural_height - top - h
 
         top = self._WIDGET_TOP_MARGIN
-        self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
-        self._widget_add_label(
-            _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
-            max(margin + 170, content_w - 188),
-            y(top + 3, 20),
-            170,
-            20,
-            size=12,
-            color="#a1a1aa",
-            align="right",
-        )
-        top += self._WIDGET_HEADER_ADVANCE
-
-        for index, card in enumerate(cards):
-            col = index % cols
-            row = index // cols
-            x = margin + col * (card_w + gap)
-            cy = y(top + row * (card_h + 12), card_h)
-            self._draw_widget_card(card, x, cy, card_w, card_h)
-        top += card_rows * (card_h + 12) + self._WIDGET_CARD_BLOCK_EXTRA
-
-        if alerts:
-            self._widget_add_label(_tr(lang, "需要注意", "Needs attention"), margin, y(top, 22), 180, 22, size=15, weight="bold")
-            top += self._WIDGET_ALERT_HEADING_ADVANCE
-            for alert in alerts[: self._WIDGET_MAX_ALERTS]:
-                cy = y(top, 28)
-                row_w = content_w - margin * 2
-                self._widget_add_box(margin, cy, row_w, 28, alert["bg"], radius=8, border=alert["border"])
-                self._widget_add_symbol(alert["symbol"], margin + 10, cy + 5, size=14, color=alert["fg"])
-                self._widget_add_label(alert["text"], margin + 34, cy + 5, max(120, row_w - 120), 18, size=12, weight="medium", color=alert["fg"])
-                self._widget_add_label(alert["value"], margin + row_w - 86, cy + 5, 72, 18, size=12, weight="bold", color=alert["fg"], align="right")
-                top += self._WIDGET_ALERT_ROW_ADVANCE
-            top += self._WIDGET_ALERT_BLOCK_EXTRA
+        inner_w = max(1, content_w - margin * 2)
+        if content_w < 470:
+            self._widget_add_label("AI Limit", margin, y(top, 24), inner_w, 24, size=21, weight="bold")
+            self._widget_add_label(
+                _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
+                margin,
+                y(top + 27, 18),
+                inner_w,
+                18,
+                size=11,
+                color="#a1a1aa",
+            )
+            if credit_summary:
+                self._widget_add_label(
+                    credit_summary,
+                    margin,
+                    y(top + 46, 18),
+                    inner_w,
+                    18,
+                    size=11,
+                    weight="medium",
+                    color="#c4c4ca",
+                )
+        else:
+            self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
+            right_x = max(margin + 180, content_w - margin - 220)
+            right_w = max(120, content_w - margin - right_x)
+            self._widget_add_label(
+                _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
+                right_x,
+                y(top + 1, 18),
+                right_w,
+                18,
+                size=11,
+                color="#a1a1aa",
+                align="right",
+            )
+            if credit_summary:
+                self._widget_add_label(
+                    credit_summary,
+                    right_x,
+                    y(top + 22, 18),
+                    right_w,
+                    18,
+                    size=11,
+                    weight="medium",
+                    color="#c4c4ca",
+                    align="right",
+                )
+        top += header_height
 
         self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
         top += self._WIDGET_DETAIL_HEADING_ADVANCE
-        value_w = 72
-        progress_w = max(76, min(180, int((content_w - margin * 2) * 0.28)))
-        name_x = margin + 4
-        value_x = content_w - margin - value_w
-        progress_x = value_x - progress_w - 10
-        name_w = max(110, progress_x - name_x - 12)
-        for row in details:
-            if row.get("type") == "section":
-                cy = y(top, 20)
-                self._widget_add_label(row["name"], name_x, cy + 2, 200, 16, size=12, weight="bold", color=row["color"])
-                self._widget_add_box(progress_x, cy + 8, max(40, content_w - progress_x - margin), 1, "#323238", radius=0)
-                top += self._WIDGET_SECTION_ADVANCE
-                continue
-            row_h = self._widget_detail_row_height(row)
-            cy = y(top, row_h)
-            self._widget_add_label(row["name"], name_x, cy + 8, name_w, 16, size=11, color="#d4d4d8")
-            if row.get("reset"):
-                self._widget_add_label(f"↻ {row['reset']}", name_x, cy - 5, name_w, 14, size=9, color="#8b8b93")
-            self._widget_add_progress(progress_x, cy + 10, progress_w, 8, row["pct"])
-            self._widget_add_label(row["value"], value_x, cy + 5, value_w, 18, size=12, weight="bold", color=row["color"], align="right")
-            top += self._widget_detail_row_advance(row)
+        detail_gap = self._WIDGET_BLOCK_GAP
+        detail_w = max(1, int((content_w - margin * 2 - detail_gap * (columns - 1)) / columns))
+        detail_groups, detail_heights = self._widget_detail_columns(details, columns)
+        for col, blocks in enumerate(detail_groups):
+            bx = margin + col * (detail_w + detail_gap)
+            block_top = top
+            for block in blocks:
+                value_w = 58
+                ring_size = 16
+                name_x = bx + 4
+                value_x = bx + detail_w - value_w
+                ring_x = max(name_x + 24, value_x - ring_size - 10)
+                name_w = max(40, ring_x - name_x - 12)
+                for item in block:
+                    if item.get("type") == "section":
+                        cy = y(block_top, 20)
+                        self._widget_add_label(item["name"], name_x, cy + 2, 150, 16, size=12, weight="bold", color=item["color"])
+                        self._widget_add_box(ring_x, cy + 8, max(30, bx + detail_w - ring_x), 1, "#323238", radius=0)
+                    else:
+                        row_h = self._widget_detail_row_height(item)
+                        cy = y(block_top, row_h)
+                        name = item["name"]
+                        if item.get("reset"):
+                            name = f"{name}  ↻ {item['reset']}"
+                        self._widget_add_label(name, name_x, cy + 5, name_w, 16, size=10, color="#d4d4d8")
+                        if item.get("kind") == "percent":
+                            self._widget_add_ring(ring_x, cy + 5, ring_size, item["pct"])
+                        self._widget_add_label(item["value"], value_x, cy + 4, value_w, 18, size=11, weight="bold", color=item["color"], align="right")
+                    block_top += self._widget_detail_row_advance(item)
+                block_top += detail_gap
+        top += max(detail_heights, default=0)
+
+        if alerts:
+            alert_columns = columns
+            self._widget_add_label(_tr(lang, "需要注意", "Needs attention"), margin, y(top, 22), 180, 22, size=15, weight="bold")
+            top += self._WIDGET_ALERT_HEADING_ADVANCE
+            alert_items = alerts[: self._WIDGET_MAX_ALERTS]
+            alert_gap = self._WIDGET_BLOCK_GAP
+            alert_w = int((content_w - margin * 2 - alert_gap * (alert_columns - 1)) / alert_columns)
+            alert_rows = (len(alert_items) + alert_columns - 1) // alert_columns
+            for index, alert in enumerate(alert_items):
+                col = index % alert_columns
+                row = index // alert_columns
+                ax = margin + col * (alert_w + alert_gap)
+                cy = y(top + row * (self._WIDGET_ALERT_ROW_ADVANCE + alert_gap), 28)
+                self._widget_add_box(ax, cy, alert_w, 28, alert["bg"], radius=8, border=alert["border"])
+                self._widget_add_symbol(alert["symbol"], ax + 10, cy + 5, size=14, color=alert["fg"])
+                self._widget_add_label(alert["text"], ax + 34, cy + 5, max(80, alert_w - 120), 18, size=11, weight="medium", color=alert["fg"])
+                self._widget_add_label(alert["value"], ax + alert_w - 86, cy + 5, 72, 18, size=12, weight="bold", color=alert["fg"], align="right")
 
     def _draw_widget_card(self, card, x, y, w, h):
         self._widget_add_box(x, y, w, h, card["bg"], radius=12, border=card["border"])
-        self._widget_add_box(x + 12, y + h - 43, 32, 32, card["accent"], radius=16)
-        self._widget_add_symbol(card["symbol"], x + 18, y + h - 37, size=18, color="#ffffff")
-        self._widget_add_label(card["title"], x + 52, y + h - 31, w - 68, 18, size=12, weight="bold")
+        # Reserve a full two-row column for the service name. Single-metric
+        # cards use the same column but center their detail vertically.
+        title_w = min(82, max(66, int(w * 0.23)))
+        detail_x = x + 14 + title_w
+        value_w = 64
+        value_x = x + w - 14 - value_w
+        detail_w = max(70, value_x - detail_x - 8)
+        self._widget_add_label(card["title"], x + 14, y + (h - 17) / 2, title_w, 17, size=12, weight="bold")
 
         metrics = card.get("metrics") or []
         if metrics:
-            reset_text = card.get("reset_text") or self._card_reset_text(metrics)
-            row_x = x + 16
-            row_w = max(120, w - 30)
-            value_w = 44
-            label_w = 28
-            bar_x = row_x + label_w + 6
-            bar_w = max(46, row_w - label_w - value_w - 14)
-            first_y = y + 37
-            if reset_text:
-                if len(metrics) == 1:
-                    # A single-window card leaves the lower half of the card
-                    # empty. Put the reset line there at a readable size instead
-                    # of squeezing it into the narrow strip beside the icon.
-                    self._widget_add_label(reset_text, row_x, y + 15, row_w, 15, size=10, color="#a1a1aa")
-                else:
-                    self._widget_add_label(reset_text, x + 58, y + h - 47, max(80, w - 72), 14, size=9, color="#8b8b93")
             for index, metric in enumerate(metrics[:2]):
-                row_y = first_y - index * 21
-                self._widget_add_label(metric["label"], row_x, row_y, label_w, 13, size=10, weight="medium", color="#a1a1aa")
-                self._widget_add_progress(bar_x, row_y + 3, bar_w, 7, metric["pct"])
-                self._widget_add_label(metric["value"], x + w - 14 - value_w, row_y - 3, value_w, 18, size=14, weight="bold", color=metric["color"], align="right")
+                row_y = y + (h - 17) / 2 if len(metrics) == 1 else y + h - 31 - index * 19
+                self._widget_add_label(
+                    metric["label"],
+                    detail_x,
+                    row_y,
+                    min(28, detail_w),
+                    17,
+                    size=11,
+                    color="#a1a1aa",
+                )
+                reset = metric.get("reset")
+                reset_text = ""
+                if reset is not None:
+                    formatted = _fmt_widget_reset_epoch_or_iso(reset, self._state["lang"])
+                    if not formatted or formatted == "?":
+                        formatted = str(reset)
+                    reset_text = f"↻ {formatted}"
+                elif len(metrics) == 1 and card.get("reset_text"):
+                    reset_text = card["reset_text"]
+                self._widget_add_label(
+                    reset_text,
+                    detail_x + min(28, detail_w),
+                    row_y,
+                    max(32, detail_w - min(28, detail_w)),
+                    17,
+                    size=11,
+                    color="#c4c4ca",
+                )
+                self._widget_add_label(
+                    metric["value"],
+                    value_x,
+                    row_y,
+                    value_w,
+                    17,
+                    size=13,
+                    weight="bold",
+                    color=metric["color"],
+                    align="right",
+                )
         else:
-            self._widget_add_label(card["value"], x + 14, y + 45, w - 28, 22, size=17, weight="bold", color=card["value_color"], align="right")
-            self._widget_add_label(card["subtitle"], x + 14, y + 27, w - 28, 16, size=11, color="#a1a1aa")
+            detail = card.get("subtitle") or card.get("value") or ""
+            if card.get("value") and card.get("subtitle"):
+                self._widget_add_label(card["subtitle"], detail_x, y + (h - 17) / 2, detail_w, 17, size=11, color="#a1a1aa")
+                self._widget_add_label(
+                    card["value"],
+                    value_x,
+                    y + (h - 17) / 2,
+                    value_w,
+                    17,
+                    size=13,
+                    weight="bold",
+                    color=card.get("value_color") or "#d4d4d8",
+                    align="right",
+                )
+            else:
+                self._widget_add_label(
+                    detail,
+                    detail_x,
+                    y + (h - 17) / 2,
+                    detail_w,
+                    17,
+                    size=11,
+                    weight="bold" if card.get("value") else "regular",
+                    color=card.get("value_color") or "#d4d4d8",
+                )
 
     def _widget_summary_cards(self):
         services = self._state.get("services") or list(_SERVICES)
@@ -2270,15 +2551,28 @@ class AiLimitApp(rumps.App):
 
     def _widget_alert_rows(self):
         rows = []
+        provider = "AI"
+        provider_codes = {
+            "Claude": "CL",
+            "CodeX": "CX",
+            "Antigravity": "AG",
+            "Gemini": "GM",
+            "Copilot": "CP",
+            "DeepSeek": "DS",
+        }
         for item in self._widget_detail_rows(include_disabled=False):
             if item.get("type") == "section":
+                provider = provider_codes.get(item.get("name"), "AI")
+                continue
+            if item.get("kind") != "percent":
                 continue
             pct = item["pct"]
             if pct > 20:
                 continue
             bg, border, fg, symbol = _widget_risk_tone(pct)
             rows.append({
-                "text": _short_widget_name(item["name"], 42),
+                "text": _short_widget_name(f"{provider} · {item['name']}", 42),
+                "provider": provider,
                 "value": item["value"],
                 "bg": bg,
                 "border": border,
@@ -2334,12 +2628,13 @@ class AiLimitApp(rumps.App):
 
     def _widget_detail_rows(self, include_disabled=True):
         rows = []
+        lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
 
         def section(name, color):
             rows.append({"type": "section", "name": name, "color": color})
 
-        def append(name, pct, disabled=False, value=None, reset=None, unknown=False):
+        def append(name, pct=None, disabled=False, value=None, reset=None, unknown=False, kind="percent", color=None):
             if disabled and not include_disabled:
                 return
             if unknown and not include_disabled:
@@ -2353,12 +2648,13 @@ class AiLimitApp(rumps.App):
             else:
                 display_value = f"{pct}%{suffix}"
             rows.append({
-                "name": _short_widget_name(name, 44),
+                "name": _compact_widget_quota_name(name),
                 "pct": pct,
                 "value": display_value,
                 "reset": self._format_detail_reset(reset),
-                "color": "#71717a" if (disabled or unknown) else _widget_risk_color(pct),
+                "color": "#71717a" if (disabled or unknown) else (color or _widget_risk_color(pct)),
                 "disabled": disabled or unknown,
+                "kind": kind,
             })
 
         if "claude" in services and self._claude and not self._claude.get("error"):
@@ -2371,10 +2667,19 @@ class AiLimitApp(rumps.App):
                 section("CodeX", "#93c5fd")
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
+                credit_text = _codex_credit_summary(self._codex or {}, lang)
+                if credit_text:
+                    value = credit_text.removeprefix("Codex 积分 ").removeprefix("Codex credits ")
+                    append(_tr(lang, "积分", "Credits"), value=value, kind="credit", color="#93c5fd")
         if "deepseek" in services and self._deepseek and not self._deepseek.get("error"):
             primary = self._deepseek.get("primary") or {}
             section("DeepSeek", "#67e8f9")
-            append(_fmt_balance_compact(primary), 100 if _balance_amount(primary) > 0 else 0)
+            append(
+                _tr(lang, "API 余额", "API balance"),
+                value=_fmt_balance_compact(primary),
+                kind="balance",
+                color="#67e8f9",
+            )
         if "google" in services:
             entries = self._widget_google_entries()
             if entries:

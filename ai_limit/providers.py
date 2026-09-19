@@ -293,7 +293,10 @@ def live_codex_rate_limits(timeout: int = REMOTE_TIMEOUT_SEC):
         rate_limits = result.get("rateLimits") or {}
         if not rate_limits:
             raise CodexRemoteError("empty rate limits response")
-        normalized = _normalize_remote_rate_limits(rate_limits)
+        normalized = _normalize_remote_rate_limits(
+            rate_limits,
+            reset_credits=result.get("rateLimitResetCredits"),
+        )
         return datetime.datetime.now(datetime.timezone.utc), normalized
     finally:
         proc.terminate()
@@ -322,7 +325,52 @@ def _wait_codex_app_server(proc: subprocess.Popen, port: int, timeout: int):
     raise CodexRemoteError("app-server start timed out")
 
 
-def _normalize_remote_rate_limits(rate_limits: dict) -> dict:
+def _optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    return bool(value)
+
+
+def _normalize_codex_credits(credits: dict | None) -> dict | None:
+    """Normalize app-server camelCase and web snake_case credit snapshots."""
+    if not isinstance(credits, dict):
+        return None
+    known_fields = {"hasCredits", "has_credits", "unlimited", "balance"}
+    if not known_fields.intersection(credits):
+        return None
+    return {
+        "has_credits": _optional_bool(credits.get("hasCredits", credits.get("has_credits"))),
+        "unlimited": _optional_bool(credits.get("unlimited")),
+        "balance": credits.get("balance"),
+    }
+
+
+def _normalize_rate_limit_reset_credits(summary: dict | None) -> dict | None:
+    """Keep reset-credit inventory separate from the consumable balance."""
+    if not isinstance(summary, dict):
+        return None
+    available_count = summary.get("availableCount", summary.get("available_count"))
+    if available_count is None:
+        return None
+    try:
+        available_count = int(available_count)
+    except (TypeError, ValueError):
+        return None
+    return {"available_count": max(0, available_count)}
+
+
+def _normalize_remote_rate_limits(rate_limits: dict, *, reset_credits: dict | None = None) -> dict:
+    if reset_credits is None:
+        reset_credits = rate_limits.get("rateLimitResetCredits") or rate_limits.get("rate_limit_reset_credits")
+
     def window(window_data):
         if not window_data:
             return None
@@ -337,7 +385,8 @@ def _normalize_remote_rate_limits(rate_limits: dict) -> dict:
         "limit_name": rate_limits.get("limitName"),
         "primary": window(rate_limits.get("primary")),
         "secondary": window(rate_limits.get("secondary")),
-        "credits": rate_limits.get("credits"),
+        "credits": _normalize_codex_credits(rate_limits.get("credits")),
+        "rate_limit_reset_credits": _normalize_rate_limit_reset_credits(reset_credits),
         "plan_type": rate_limits.get("planType"),
         "rate_limit_reached_type": rate_limits.get("rateLimitReachedType"),
     }
@@ -537,6 +586,9 @@ def _get_chatgpt_access_token(cookie_header: str, timeout: int) -> str:
 
 
 def _normalize_web_rate_limits(data: dict) -> dict:
+    nested_rate_limits = data.get("rateLimits")
+    if not isinstance(nested_rate_limits, dict):
+        nested_rate_limits = {}
     def window_kind(window_minutes):
         if window_minutes is None:
             return None
@@ -600,9 +652,15 @@ def _normalize_web_rate_limits(data: dict) -> dict:
     rate_limit = data.get("rate_limit") or {}
     groups = [group_from_rate_limit("Balance", rate_limit, default_group=True)]
     for item in data.get("additional_rate_limits") or []:
+        # GPT-5.3-Codex-Spark is no longer callable, but its legacy quota
+        # bucket may still be returned by the usage endpoint. Do not expose
+        # that stale entitlement as an available quota group.
+        item_name = item.get("limit_name") or item.get("metered_feature") or ""
+        if "spark" in str(item_name).strip().lower():
+            continue
         groups.append(
             group_from_rate_limit(
-                item.get("limit_name") or item.get("metered_feature") or "Additional Codex limit",
+                item_name or "Additional Codex limit",
                 item.get("rate_limit") or {},
             )
         )
@@ -625,7 +683,15 @@ def _normalize_web_rate_limits(data: dict) -> dict:
             "bucket_count": len(buckets),
             "group_count": len(groups),
         },
-        "credits": data.get("credits"),
+        "credits": _normalize_codex_credits(
+            data.get("credits") or nested_rate_limits.get("credits")
+        ),
+        "rate_limit_reset_credits": _normalize_rate_limit_reset_credits(
+            data.get("rate_limit_reset_credits")
+            or data.get("rateLimitResetCredits")
+            or nested_rate_limits.get("rate_limit_reset_credits")
+            or nested_rate_limits.get("rateLimitResetCredits")
+        ),
         "plan_type": data.get("plan_type"),
         "rate_limit_reached_type": rate_limit.get("rate_limit_reached_type"),
     }

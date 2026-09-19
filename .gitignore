@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 .ai/
+.codex-runtime/
 .venv*/
 *.egg-info/
 dist/
 build/
+menubar/dist-*/
+menubar/build-*/

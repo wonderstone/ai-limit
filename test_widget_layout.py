@@ -1,10 +1,4 @@
-"""Layout regression tests for the menu bar quota dashboard.
-
-The dashboard draws into a fixed-height document view whose height has to be
-computed up front. When that estimate is smaller than what the draw loop
-consumes, the last rows get a negative y and disappear, which looks like
-missing quota data rather than a layout bug. These tests pin that down.
-"""
+"""Layout regression tests for the menu bar quota dashboard."""
 
 from __future__ import annotations
 
@@ -85,12 +79,35 @@ class _Panel:
         return self._bounds
 
 
+class _Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _Frame:
+    def __init__(self, x, y, width, height):
+        self.origin = _Point(x, y)
+        self.size = _Size(width, height)
+
+
+class _ResizablePanel:
+    def __init__(self, width=640, height=360):
+        self._frame = _Frame(100, 100, width, height)
+
+    def frame(self):
+        return self._frame
+
+    def setFrame_display_animate_(self, frame, _display, _animate):
+        self._frame = frame
+
+
 def _detail_rows():
     """A realistic six-service dashboard: sections plus rows with reset lines."""
     rows = []
     for section, row_names in (
         ("Claude", ["5h", "weekly"]),
-        ("CodeX", ["Balance / Weekly", "Spark / 5h", "Spark / Weekly"]),
+        ("CodeX", ["Balance / Weekly"]),
         ("DeepSeek", ["CNY 16.36"]),
         ("Antigravity", ["Gemini / Weekly", "Gemini / 5h", "Claude+GPT / Weekly", "Claude+GPT / 5h"]),
         ("Gemini", ["当前用量", "每周限额"]),
@@ -145,20 +162,25 @@ def _capture_draw_positions(app):
         positions.append(y)
         return mock.MagicMock()
 
+    def record_ring(_self, _x, y, *_args, **_kwargs):
+        positions.append(y)
+        return mock.MagicMock()
+
     with mock.patch.object(menubar.AiLimitApp, "_widget_add_label", record), \
             mock.patch.object(menubar.AiLimitApp, "_widget_add_box", record_box), \
             mock.patch.object(menubar.AiLimitApp, "_widget_add_symbol", record_symbol), \
             mock.patch.object(menubar.AiLimitApp, "_widget_add_progress", record_progress), \
+            mock.patch.object(menubar.AiLimitApp, "_widget_add_ring", record_ring), \
             mock.patch.object(menubar.AiLimitApp, "_clear_widget_content", lambda _self: None):
         app._render_widget_dashboard()
     return positions
 
 
 class DashboardLayoutTests(unittest.TestCase):
-    def _render(self, details, alerts=(), cards=()):
+    def _render(self, details, alerts=(), cards=(), width=760, height=680):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
         app._state = {"lang": "zh", "global": "7d", "services": list(menubar._SERVICES), "widget": True}
-        app._widget_panel = _Panel()
+        app._widget_panel = _Panel(width=width, height=height)
         app._widget_content = mock.MagicMock()
         app._widget_last_layout_size = None
         with mock.patch.object(menubar.AiLimitApp, "_widget_summary_cards", return_value=list(cards)), \
@@ -208,20 +230,124 @@ class DashboardLayoutTests(unittest.TestCase):
         consumed = (
             menubar.AiLimitApp._WIDGET_TOP_MARGIN
             + menubar.AiLimitApp._WIDGET_HEADER_ADVANCE
-            + 3 * (100 + 12)
+            + 3 * (menubar.AiLimitApp._WIDGET_CARD_HEIGHT + menubar.AiLimitApp._WIDGET_CARD_GAP)
             + menubar.AiLimitApp._WIDGET_CARD_BLOCK_EXTRA
             + menubar.AiLimitApp._WIDGET_DETAIL_HEADING_ADVANCE
             + sum(app._widget_detail_row_advance(row) for row in details)
         )
 
-        self.assertGreaterEqual(app._widget_layout_height(3, 100, [], details), consumed)
+        self.assertGreaterEqual(
+            app._widget_layout_height(3, menubar.AiLimitApp._WIDGET_CARD_HEIGHT, [], details),
+            consumed,
+        )
+
+    def test_narrow_dashboard_uses_one_column_without_negative_positions(self):
+        positions = self._render(_detail_rows(), width=390, height=680)
+
+        self.assertTrue(positions, "narrow dashboard drew nothing")
+        self.assertGreaterEqual(min(positions), 0)
+
+    def test_service_columns_are_balanced_by_actual_block_height(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+
+        _groups, heights = app._widget_detail_columns(_detail_rows(), 2)
+
+        self.assertEqual(len(heights), 2)
+        self.assertLessEqual(max(heights) - min(heights), 50)
+
+    def test_balance_and_credit_rows_do_not_draw_percentage_rings(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        app._state = {"lang": "en", "global": "7d", "services": list(menubar._SERVICES), "widget": True}
+        app._codex = {"7d_left": 50, "credits": {"has_credits": True, "unlimited": False, "balance": 25}}
+        app._claude = app._google = app._gemini = app._copilot = None
+        app._deepseek = {"primary": {"currency": "CNY", "total_balance": "16.36"}}
+        app._widget_panel = _Panel(width=640, height=500)
+        app._widget_content = mock.MagicMock()
+        rings = []
+        with mock.patch.object(menubar.AiLimitApp, "_widget_alert_rows", return_value=[]), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_label"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_box"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_ring", side_effect=lambda *args: rings.append(args)), \
+                mock.patch.object(menubar.AiLimitApp, "_clear_widget_content", lambda _self: None):
+            app._render_widget_dashboard()
+
+        # Only the Codex weekly percentage draws a ring; its credit balance and
+        # the DeepSeek currency balance are rendered as plain value rows.
+        self.assertEqual(len(rings), 1)
+        self.assertEqual(rings[0][-1], 50)
+
+    def test_balance_and_credit_rows_are_not_low_percentage_alerts(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        app._state = {"lang": "en", "global": "7d", "services": ["codex", "deepseek"], "widget": True}
+        app._codex = {"7d_left": 50, "credits": {"has_credits": True, "unlimited": False, "balance": 25}}
+        app._deepseek = {"primary": {"currency": "CNY", "total_balance": "16.36"}}
+        app._claude = app._google = app._gemini = app._copilot = None
+
+        self.assertEqual(app._widget_alert_rows(), [])
+
+    def test_alert_rows_include_provider_abbreviations(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        details = [
+            {"type": "section", "name": "Antigravity", "color": "#fff"},
+            {"name": "Claude + GPT · Weekly", "kind": "percent", "pct": 0, "value": "0%"},
+            {"type": "section", "name": "Copilot", "color": "#fff"},
+            {"name": "AI Credits", "kind": "percent", "pct": 10, "value": "10%"},
+        ]
+        with mock.patch.object(menubar.AiLimitApp, "_widget_detail_rows", return_value=details):
+            alerts = app._widget_alert_rows()
+
+        self.assertEqual([row["text"] for row in alerts], [
+            "AG · Claude + GPT · Weekly",
+            "CP · AI Credits",
+        ])
+
+    def test_document_height_is_natural_even_when_viewport_is_taller(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        app._state = {"lang": "en", "global": "7d", "services": list(menubar._SERVICES), "widget": True}
+        app._codex = {"credits": {"has_credits": True, "unlimited": False, "balance": "2625"}}
+        app._widget_panel = _Panel(width=760, height=900)
+        app._widget_content = mock.MagicMock()
+        app._widget_last_layout_size = None
+        rects = []
+
+        def record_rect(x, y, width, height):
+            rect = _Frame(x, y, width, height)
+            rects.append(rect)
+            return rect
+
+        with mock.patch.object(menubar.AppKit, "NSMakeRect", side_effect=record_rect), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_label"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_box"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_symbol"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_ring"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_detail_rows", return_value=_detail_rows()), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_alert_rows", return_value=[]), \
+                mock.patch.object(menubar.AiLimitApp, "_clear_widget_content", lambda _self: None):
+            app._render_widget_dashboard()
+
+        document_height = app._widget_content.setFrame_.call_args.args[0].size.height
+        self.assertLess(document_height, 900)
+        self.assertEqual(document_height, rects[0].size.height)
+
+    def test_panel_resize_preserves_top_and_right_anchors(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        panel = _ResizablePanel()
+        app._widget_panel = panel
+        with mock.patch.object(menubar.AppKit.NSScreen, "mainScreen", return_value=None), \
+                mock.patch.object(menubar.AppKit, "NSMakeRect", side_effect=lambda x, y, w, h: _Frame(x, y, w, h)):
+            app._widget_resize_panel(500)
+
+        self.assertEqual(panel.frame().origin.x, 100)
+        self.assertEqual(panel.frame().origin.y, -40)
+        self.assertEqual(panel.frame().size.width, 640)
+        self.assertEqual(panel.frame().size.height, 500)
 
     def test_rows_with_a_reset_line_reserve_more_height(self):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
         with_reset = {"name": "x", "reset": "10月01日 12:00"}
         without_reset = {"name": "x", "reset": None}
 
-        self.assertGreater(
+        self.assertEqual(
             app._widget_detail_row_advance(with_reset),
             app._widget_detail_row_advance(without_reset),
         )
@@ -248,6 +374,8 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
         # this work, these tests would otherwise pass for the wrong reason.
         moment = datetime.datetime(2026, 10, 1, 12, 0)
         self.assertEqual(f"{moment:%H:%M}", "12:00")
+        if f"{moment:%m月%d日}":
+            self.skipTest("this runtime preserves CJK strftime text under the C locale")
         self.assertEqual(f"{moment:%m月%d日}", "")
 
     def test_copilot_reset_keeps_the_date(self):

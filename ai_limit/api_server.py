@@ -233,6 +233,8 @@ def _codex_rate_limits_payload(
         "buckets": buckets,
         "primary": rate_limits.get("primary") or None,
         "secondary": rate_limits.get("secondary") or None,
+        "credits": rate_limits.get("credits") or None,
+        "rate_limit_reset_credits": rate_limits.get("rate_limit_reset_credits") or None,
         "group_count": len(groups),
         "bucket_count": len(buckets),
         "fallback_reason": fallback_reason,

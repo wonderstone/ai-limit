@@ -33,7 +33,11 @@ class AggregateIsolationTests(unittest.TestCase):
         self.assertIn("deadline", payload["providers"]["google"]["error"])
 
     def test_authorized_app_server_refresh_updates_safe_disk_cache(self):
-        rate_limits = {"primary": {"used_percent": 1, "window_minutes": 10080, "resets_at": 123}}
+        rate_limits = {
+            "primary": {"used_percent": 1, "window_minutes": 10080, "resets_at": 123},
+            "credits": {"has_credits": True, "unlimited": False, "balance": "2625"},
+            "rate_limit_reset_credits": {"available_count": 0},
+        }
         with (
             mock.patch.object(api_server, "current_codex_rate_limits", return_value=(None, rate_limits, "web", None)),
             mock.patch.object(api_server, "_write_codex_disk_cache") as write_cache,
@@ -41,6 +45,8 @@ class AggregateIsolationTests(unittest.TestCase):
         ):
             payload = api_server._codex_payload(allow_app_server=True)
         self.assertTrue(payload["available"])
+        self.assertEqual(payload["credits"]["balance"], "2625")
+        self.assertEqual(payload["rate_limit_reset_credits"], {"available_count": 0})
         write_cache.assert_called_once()
 
     def test_safe_request_refreshes_web_after_disk_cache_ttl(self):
