@@ -115,7 +115,7 @@ class TokenResolutionTests(unittest.TestCase):
 
 class ResetLabelTests(unittest.TestCase):
     def test_reset_beyond_next_week_uses_calendar_date(self):
-        reset = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=usage.TZ_LOCAL)
+        reset = datetime.datetime(2026, 10, 1, 12, 0).astimezone()
 
         class FixedDateTime(datetime.datetime):
             @classmethod

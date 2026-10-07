@@ -379,13 +379,13 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
         self.assertEqual(f"{moment:%m月%d日}", "")
 
     def test_copilot_reset_keeps_the_date(self):
-        text = menubar._fmt_copilot_reset("2026-10-01T00:00:00.000Z", "zh")
+        text = menubar._fmt_copilot_reset(datetime.datetime(2026, 10, 1, 12).astimezone().isoformat(), "zh")
 
         self.assertIn("10月01日", text)
         self.assertIn("12:00", text)
 
     def test_copilot_reset_english_keeps_the_date(self):
-        text = menubar._fmt_copilot_reset("2026-10-01T00:00:00.000Z", "en")
+        text = menubar._fmt_copilot_reset(datetime.datetime(2026, 10, 1, 12).astimezone().isoformat(), "en")
 
         self.assertIn("Oct 1", text)
         self.assertIn("12:00", text)
@@ -393,7 +393,7 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
     def test_copilot_reset_explains_why_the_date_is_next_month(self):
         # "本月" labels the allowance window while the date starts the next one,
         # so the countdown has to be there to make the pairing readable.
-        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=menubar.TZ_LOCAL)
+        moment = datetime.datetime(2026, 10, 1, 12, 0).astimezone()
 
         class _Now(datetime.datetime):
             @classmethod
@@ -409,7 +409,7 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
         self.assertEqual(en, "Oct 1 12:00 · in 15 days")
 
     def test_distant_reset_label_keeps_the_date(self):
-        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=menubar.TZ_LOCAL)
+        moment = datetime.datetime(2026, 10, 1, 12, 0).astimezone()
 
         class _Now(datetime.datetime):
             @classmethod
@@ -423,7 +423,7 @@ class CJKUnderPosixLocaleTests(unittest.TestCase):
         self.assertIn("10月01日", text)
 
     def test_cli_distant_reset_label_keeps_the_date(self):
-        moment = datetime.datetime(2026, 10, 1, 12, 0, tzinfo=usage.TZ_LOCAL)
+        moment = datetime.datetime(2026, 10, 1, 12, 0).astimezone()
 
         class _Now(datetime.datetime):
             @classmethod

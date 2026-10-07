@@ -37,8 +37,7 @@ from ai_limit.providers import (
 
 CLAUDE_BASE = pathlib.Path.home() / ".claude" / "projects"
 CODEX_BASE = pathlib.Path.home() / ".codex" / "sessions"
-TZ_LOCAL = datetime.datetime.now().astimezone().tzinfo
-TZ_ABBR  = datetime.datetime.now().astimezone().strftime('%Z')
+# Resolve local offsets per timestamp: a startup tzinfo snapshot freezes DST.
 # ── 外观配置（可直接修改） ────────────────────────────────────────────────────
 WARN_THRESHOLD = 20    # 剩余低于此值（%）显示黄色
 CRIT_THRESHOLD = 10    # 剩余低于此值（%）显示红色
@@ -72,11 +71,11 @@ def _bold_bar(pct: float, width: int = 20) -> str:
 
 
 def ts_to_local(iso: str) -> datetime.datetime:
-    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ_LOCAL)
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
 
 
 def epoch_to_local(epoch: int) -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(epoch, tz=TZ_LOCAL)
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).astimezone()
 
 
 def bar(pct: float, width: int = 20) -> str:
@@ -112,13 +111,13 @@ def fmt_money(value: str, currency: str) -> str:
 
 
 def fmt_dt(dt: datetime.datetime) -> str:
-    return f"{dt.strftime('%m-%d %H:%M')} {TZ_ABBR}"
+    return f"{dt.strftime('%m-%d %H:%M')} {dt.tzname()}"
 
 
 def fmt_reset_dt(dt: datetime.datetime) -> str:
     _bare_zh = ["一", "二", "三", "四", "五", "六", "日"]
     _bare_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    today = datetime.datetime.now(TZ_LOCAL).date()
+    today = datetime.datetime.now().astimezone().date()
     target = dt.date()
     days = (target - today).days
     today_monday = today - datetime.timedelta(days=today.weekday())
@@ -155,8 +154,8 @@ def fmt_reset_dt(dt: datetime.datetime) -> str:
         else:
             wd = f"{_bare_en[dt.weekday()]:<8}"
     if explicit_date:
-        return f"{wd} {dt.strftime('%H:%M')} {TZ_ABBR}"
-    return f"{wd} {dt.strftime('%m-%d %H:%M')} {TZ_ABBR}"
+        return f"{wd} {dt.strftime('%H:%M')} {dt.tzname()}"
+    return f"{wd} {dt.strftime('%m-%d %H:%M')} {dt.tzname()}"
 
 
 # ── Claude 解析 ───────────────────────────────────────────────────────────────
@@ -206,7 +205,7 @@ def _parse_claude_file(jf: pathlib.Path, since: datetime.datetime, totals: dict)
             d["cache_read"] += usage.get("cache_read_input_tokens", 0)
             d["output"] += usage.get("output_tokens", 0)
             d["calls"] += 1
-            d["days"].add(t.astimezone(TZ_LOCAL).date())
+            d["days"].add(t.astimezone().date())
 
 
 def latest_codex_rate_limits():
@@ -281,7 +280,7 @@ def _parse_codex_file(jf: pathlib.Path, since: datetime.datetime, by_day: dict):
                 continue
             info = payload.get("info") or {}
             last_usage = info.get("last_token_usage") or {}
-            day = ts.astimezone(TZ_LOCAL).date()
+            day = ts.astimezone().date()
             by_day.setdefault(day, {"input": 0, "output": 0, "calls": 0})
             by_day[day]["input"] += last_usage.get("input_tokens", 0)
             by_day[day]["output"] += last_usage.get("output_tokens", 0)
@@ -299,7 +298,7 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
     print(f"\n{_DIM}{SEP}{_RST}")
     print(f"{_BOLD}{title.center(52)}{_RST}")
     print()
-    since_local = since.astimezone(TZ_LOCAL)
+    since_local = since.astimezone()
     print(f"  {_DIM}{t('统计自', 'Since')}: {fmt_dt(since_local)}  ({t(f'近 {days_count} 天', f'last {days_count} days')}){_RST}")
 
     if not totals:
@@ -362,7 +361,7 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
                 reset_dt = None
                 if resets_at:
                     try:
-                        reset_dt = datetime.datetime.fromisoformat(resets_at).astimezone(TZ_LOCAL)
+                        reset_dt = datetime.datetime.fromisoformat(resets_at).astimezone()
                         print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(reset_dt)}{_RST}")
                     except Exception:
                         pass
@@ -370,7 +369,7 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
                 if win_key == "7d" and used and reset_dt:
                     window_min = 7 * 24 * 60
                     elapsed = (datetime.timedelta(minutes=window_min)
-                               - (reset_dt - datetime.datetime.now(TZ_LOCAL)))
+                               - (reset_dt - datetime.datetime.now().astimezone()))
                     if elapsed.total_seconds() > 0:
                         rate = used / (elapsed.total_seconds() / 3600)
                         if rate > 0:
@@ -407,8 +406,8 @@ def render_codex(since: datetime.datetime):
             print(t("  （未找到 CodeX 数据）", "  (no CodeX data found)"))
         return
 
-    now_local = datetime.datetime.now(TZ_LOCAL)
-    ts_local = ts.astimezone(TZ_LOCAL)
+    now_local = datetime.datetime.now().astimezone()
+    ts_local = ts.astimezone()
 
     source_labels = {
         "live": t("实时", "live"),
@@ -507,7 +506,7 @@ def render_codex(since: datetime.datetime):
         remaining_pct = 100 - w_pct
         elapsed_since_reset = (
             datetime.timedelta(minutes=w_min)
-            - (w_reset - datetime.datetime.now(TZ_LOCAL))
+            - (w_reset - datetime.datetime.now().astimezone())
         )
         if elapsed_since_reset.total_seconds() > 0:
             rate_per_hour = w_pct / (elapsed_since_reset.total_seconds() / 3600)
@@ -534,7 +533,7 @@ def render_deepseek():
         print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
         return
 
-    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  (api key live){_RST}")
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  (api key live){_RST}")
     print(f"  {_DIM}{t('数据来源', 'Source')}: api.deepseek.com /user/balance  (API key){_RST}")
     print()
     available = data.get("is_available")
@@ -568,7 +567,7 @@ def render_google():
         if quota_state == "unavailable"
         else ("agy usage fallback" if "agy /usage" in source else "antigravity app live")
     )
-    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  ({live_label}){_RST}")
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  ({live_label}){_RST}")
     print(f"  {_DIM}{t('数据来源', 'Source')}: {source}  (Antigravity CLI){_RST}")
     print()
 
@@ -643,7 +642,7 @@ def render_gemini_app():
         print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
         return
 
-    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone(TZ_LOCAL))}  (browser cookie live){_RST}")
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  (browser cookie live){_RST}")
     print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('source') or 'gemini.google.com/usage'}  (Chrome cookie){_RST}")
     print()
 
@@ -723,11 +722,11 @@ def main():
         since = now_utc - datetime.timedelta(days=args.days)
         days_count = args.days
 
-    now_local = datetime.datetime.now(TZ_LOCAL)
+    now_local = datetime.datetime.now().astimezone()
     _wd_zh = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     _wd_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     wd_now = _wd_zh[now_local.weekday()] if LANG == "zh" else _wd_en[now_local.weekday()]
-    print(f"\n{_DIM}{t('查询时间', 'Queried at')}: {wd_now} {now_local.strftime('%m-%d %H:%M')} {TZ_ABBR}{_RST}")
+    print(f"\n{_DIM}{t('查询时间', 'Queried at')}: {wd_now} {now_local.strftime('%m-%d %H:%M')} {now_local.tzname()}{_RST}")
 
     claude_totals = collect_claude(since)
 

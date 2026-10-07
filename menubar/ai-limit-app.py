@@ -45,7 +45,6 @@ from usage import (
     live_claude_plan,
     live_claude_usage,
     latest_codex_rate_limits,
-    TZ_LOCAL,
     epoch_to_local,
 )
 from ai_limit.providers import (
@@ -310,7 +309,7 @@ def _zh_date(dt, with_year=False):
 
 
 def _fmt_reset_dt(dt, lang):
-    today = datetime.datetime.now(TZ_LOCAL).date()
+    today = datetime.datetime.now().astimezone().date()
     target = dt.date()
     days = (target - today).days
     today_monday = today - datetime.timedelta(days=today.weekday())
@@ -342,7 +341,7 @@ def _fmt_reset_epoch(epoch, lang="zh"):
 
 def _fmt_reset_iso(iso, lang="zh"):
     try:
-        return _fmt_reset_dt(datetime.datetime.fromisoformat(iso).astimezone(TZ_LOCAL), lang)
+        return _fmt_reset_dt(datetime.datetime.fromisoformat(iso).astimezone(), lang)
     except Exception:
         return "?"
 
@@ -363,8 +362,8 @@ def _fmt_copilot_reset(value, lang="zh"):
         else:
             reset = datetime.datetime.fromisoformat(
                 str(value).replace("Z", "+00:00")
-            ).astimezone(TZ_LOCAL)
-        now = datetime.datetime.now(TZ_LOCAL)
+            ).astimezone()
+        now = datetime.datetime.now().astimezone()
         show_year = reset.year != now.year
         if lang == "en":
             date_text = f"{reset:%b} {reset.day}"
@@ -1664,7 +1663,7 @@ class AiLimitApp(rumps.App):
             google,
             gemini,
         )
-        now = datetime.datetime.now(TZ_LOCAL).strftime("%H:%M:%S")
+        now = datetime.datetime.now().astimezone().strftime("%H:%M:%S")
         self._last_refresh.title = _tr(lang, f"上次刷新: {now}", f"Last refresh: {now}")
         self._render_widget()
 
@@ -2089,7 +2088,7 @@ class AiLimitApp(rumps.App):
         if content_w < 470:
             self._widget_add_label("AI Limit", margin, y(top, 24), inner_w, 24, size=21, weight="bold")
             self._widget_add_label(
-                _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
+                _tr(lang, f"更新 {datetime.datetime.now().astimezone():%H:%M:%S}", f"Updated {datetime.datetime.now().astimezone():%H:%M:%S}"),
                 margin,
                 y(top + 27, 18),
                 inner_w,
@@ -2113,7 +2112,7 @@ class AiLimitApp(rumps.App):
             right_x = max(margin + 180, content_w - margin - 220)
             right_w = max(120, content_w - margin - right_x)
             self._widget_add_label(
-                _tr(lang, f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}", f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}"),
+                _tr(lang, f"更新 {datetime.datetime.now().astimezone():%H:%M:%S}", f"Updated {datetime.datetime.now().astimezone():%H:%M:%S}"),
                 right_x,
                 y(top + 1, 18),
                 right_w,
@@ -2818,8 +2817,8 @@ class AiLimitApp(rumps.App):
             "AI Limit",
             _tr(
                 lang,
-                f"更新 {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}    菜单栏模式 {self._state['global']}",
-                f"Updated {datetime.datetime.now(TZ_LOCAL):%H:%M:%S}    Menu mode {self._state['global']}",
+                f"更新 {datetime.datetime.now().astimezone():%H:%M:%S}    菜单栏模式 {self._state['global']}",
+                f"Updated {datetime.datetime.now().astimezone():%H:%M:%S}    Menu mode {self._state['global']}",
             ),
             "",
         ]
