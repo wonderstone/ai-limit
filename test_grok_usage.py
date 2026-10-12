@@ -134,6 +134,12 @@ class GrpcWebFramingTests(unittest.TestCase):
         with self.assertRaises(GrokAuthError):
             _parse_grpc_web_proto(_grpc_web(b"", status=16, detail="no%20session"))
 
+    def test_failed_precondition_names_the_missing_subscription(self):
+        with self.assertRaises(GrokUsageError) as ctx:
+            _parse_grpc_web_proto(_grpc_web(b"", status=9))
+        self.assertNotIsInstance(ctx.exception, GrokAuthError)
+        self.assertIn("SuperGrok", str(ctx.exception))
+
     def test_other_grpc_status_is_a_usage_error(self):
         with self.assertRaises(GrokUsageError) as ctx:
             _parse_grpc_web_proto(_grpc_web(b"", status=13, detail="boom"))

@@ -2798,6 +2798,15 @@ def _raise_grok_grpc_status(code: int, detail: str = ""):
                 "grok.com session expired; open grok.com in Chrome and sign in",
             )
         )
+    # 9 FAILED_PRECONDITION: seen for a signed-in account with no paid
+    # SuperGrok / Premium+ pool behind it.
+    if code == 9:
+        raise GrokUsageError(
+            t(
+                "grok.com 未返回额度池：当前登录的账号可能没有 SuperGrok / Premium+ 订阅",
+                "grok.com returned no usage pool: the signed-in account may lack SuperGrok / Premium+",
+            )
+        )
     raise GrokUsageError(f"grpc-status {code}{': ' + detail if detail else ''}")
 
 
