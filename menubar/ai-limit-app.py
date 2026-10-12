@@ -65,14 +65,19 @@ from ai_limit.providers import (
     GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
+    GROK_USAGE_URL,
+    GrokAuthError,
+    GrokUsageError,
     has_copilot_credentials,
     has_deepseek_api_key,
     has_gemini_app_cookies,
     has_google_oauth_creds,
+    has_grok_cookies,
     live_copilot_quota,
     live_deepseek_balance,
     live_gemini_app_usage,
     live_google_quota,
+    live_grok_usage,
 )
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -84,7 +89,7 @@ _ERROR_CACHE_TTL = 5
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
-_SERVICES      = ("claude", "codex", "deepseek", "google", "gemini", "copilot")
+_SERVICES      = ("claude", "codex", "deepseek", "google", "gemini", "copilot", "grok")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -116,6 +121,8 @@ def _default_services():
         services.append("gemini")
     if has_copilot_credentials():
         services.append("copilot")
+    if has_grok_cookies():
+        services.append("grok")
     return services
 
 
@@ -274,6 +281,7 @@ def _status_service_label(service):
         "google": "G",
         "gemini": "M",
         "copilot": "CP",
+        "grok": "GK",
     }.get(service, service[:1].upper())
 
 
@@ -388,7 +396,13 @@ def _fmt_copilot_reset(value, lang="zh"):
 # ── 状态 / 缓存 ──────────────────────────────────────────────────────────────
 
 def _load_state():
-    state = {"global": "5h", "lang": "zh", "services": _default_services(), "widget": True}
+    state = {
+        "global": "5h",
+        "lang": "zh",
+        "services": _default_services(),
+        "widget": True,
+        "offered": ["grok"],
+    }
     try:
         raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -407,6 +421,12 @@ def _load_state():
                     svc.append("gemini")
                 if "copilot" not in svc and has_copilot_credentials():
                     svc.append("copilot")
+                # Services added after a user's state file exists are switched
+                # on once when signed in; after that the Services toggle wins.
+                offered = [s for s in raw.get("offered") or [] if s in _SERVICES]
+                if "grok" not in offered and "grok" not in svc and has_grok_cookies():
+                    svc.append("grok")
+                state["offered"] = sorted(set(offered) | {"grok"})
                 if svc:
                     state["services"] = svc
     except Exception:
@@ -438,6 +458,7 @@ def _load_cache():
                 "google": raw.get("google"),
                 "gemini": raw.get("gemini"),
                 "copilot": raw.get("copilot"),
+                "grok": raw.get("grok"),
             }
             # Older builds stored only claude/codex. Keep accepting that shape
             # so users do not need to delete their cache after upgrading.
@@ -451,16 +472,18 @@ def _load_cache():
 def _save_cache(claude, cached):
     try:
         if isinstance(cached, dict) and (
-            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "copilot" in cached
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached
+            or "copilot" in cached or "grok" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             google = cached.get("google")
             gemini = cached.get("gemini")
             copilot = cached.get("copilot")
+            grok = cached.get("grok")
         else:
             codex = cached
-            deepseek = google = gemini = copilot = None
+            deepseek = google = gemini = copilot = grok = None
         _CACHE_PATH.write_text(
             json.dumps({
                 "cached_at": datetime.datetime.now().timestamp(),
@@ -470,6 +493,7 @@ def _save_cache(claude, cached):
                 "google": google,
                 "gemini": gemini,
                 "copilot": copilot,
+                "grok": grok,
             }, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -746,6 +770,34 @@ def _fetch_copilot(lang):
     except CopilotAuthError as e:
         return {"error": str(e)}
     except CopilotQuotaError as e:
+        return {"error": str(e)}
+    except (socket.timeout, TimeoutError):
+        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+    except urllib.error.URLError:
+        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fetch_grok(lang):
+    import socket, urllib.error
+    try:
+        _ts, data = live_grok_usage()
+        summary = data.get("summary") or {}
+        return {
+            "left": summary.get("remaining_percent"),
+            "used": summary.get("used_percent"),
+            "reset": summary.get("reset_time"),
+            "window": summary.get("window"),
+            "prepaid_balance_cents": data.get("prepaid_balance_cents") or 0,
+            "on_demand_cap_cents": data.get("on_demand_cap_cents") or 0,
+            "on_demand_used_cents": data.get("on_demand_used_cents") or 0,
+            "products": data.get("products") or [],
+            "source": data.get("source") or "grok.com GrokBuildBilling/GetGrokCreditsConfig",
+        }
+    except GrokAuthError as e:
+        return {"error": str(e)}
+    except GrokUsageError as e:
         return {"error": str(e)}
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
@@ -1060,6 +1112,18 @@ def _codex_credit_summary(data, lang="zh"):
     return _tr(lang, f"Codex 积分 {balance}", f"Codex credits {balance}")
 
 
+def _grok_credit_text(data):
+    """Prepaid Extra Usage Credits; hidden at $0 like the empty Grok page row."""
+    cents = (data or {}).get("prepaid_balance_cents") or 0
+    try:
+        cents = int(cents)
+    except (TypeError, ValueError):
+        return None
+    if cents <= 0:
+        return None
+    return f"${cents / 100:,.2f}"
+
+
 def _compact_widget_quota_name(value):
     """Shorten provider-owned quota labels without losing their window."""
     text = str(value or "limit").strip()
@@ -1093,6 +1157,7 @@ class AiLimitApp(rumps.App):
         self._google = None
         self._gemini = None
         self._copilot = None
+        self._grok = None
         self._widget_panel = None
         self._widget_content = None
         self._widget_last_layout_size = None
@@ -1170,6 +1235,7 @@ class AiLimitApp(rumps.App):
         self._svc_google = rumps.MenuItem("Google", callback=self._toggle_google)
         self._svc_gemini = rumps.MenuItem("Gemini App", callback=self._toggle_gemini)
         self._svc_copilot = rumps.MenuItem("Copilot", callback=self._toggle_copilot)
+        self._svc_grok = rumps.MenuItem("Grok", callback=self._toggle_grok)
         svc_label = "监控服务" if lang == "zh" else "Services"
         self._svc_menu = rumps.MenuItem(svc_label)
         self._svc_menu.add(self._svc_claude)
@@ -1178,6 +1244,7 @@ class AiLimitApp(rumps.App):
         self._svc_menu.add(self._svc_google)
         self._svc_menu.add(self._svc_gemini)
         self._svc_menu.add(self._svc_copilot)
+        self._svc_menu.add(self._svc_grok)
 
         # 开机自启
         self._login_item = rumps.MenuItem(
@@ -1219,6 +1286,10 @@ class AiLimitApp(rumps.App):
             "打开 Copilot 用量页" if lang == "zh" else "Open Copilot usage",
             callback=lambda _: webbrowser.open(COPILOT_USAGE_URL),
         )
+        self._grok_dash = rumps.MenuItem(
+            "打开 Grok 用量页" if lang == "zh" else "Open Grok usage",
+            callback=lambda _: webbrowser.open(GROK_USAGE_URL),
+        )
 
         # 项目信息子菜单
         about_label = f"项目信息（ai-limit {__version__}）" if lang == "zh" else f"Project (ai-limit {__version__})"
@@ -1231,13 +1302,13 @@ class AiLimitApp(rumps.App):
             f"版本：ai-limit {__version__}" if lang == "zh" else f"Version: ai-limit {__version__}"
         ))
         self._about_scope  = _disable(rumps.MenuItem(
-            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot"
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot / Grok" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot / Grok"
         ))
         self._about_surfaces = _disable(rumps.MenuItem(
             "界面：菜单栏 / CLI / daemon" if lang == "zh" else "Surfaces: menu bar / CLI / daemon"
         ))
         self._about_status = _disable(rumps.MenuItem(
-            "状态：当前版本已接入 Google、Gemini App 与 GitHub Copilot 配额" if lang == "zh" else "Status: current build includes Google, Gemini App, and GitHub Copilot quota"
+            "状态：当前版本已接入 Google、Gemini App、GitHub Copilot 与 Grok 配额" if lang == "zh" else "Status: current build includes Google, Gemini App, GitHub Copilot, and Grok quota"
         ))
         self._about_menu.add(self._about_repo)
         self._about_menu.add(self._about_ver)
@@ -1266,6 +1337,7 @@ class AiLimitApp(rumps.App):
             self._google_dash,
             self._gemini_dash,
             self._copilot_dash,
+            self._grok_dash,
             None,
             self._about_menu,
             None,
@@ -1325,7 +1397,7 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is None:
             return
-        claude, codex, deepseek, google, gemini, copilot = pending
+        claude, codex, deepseek, google, gemini, copilot, grok = pending
         if claude is not None:
             self._claude = claude
         if codex is not None:
@@ -1343,6 +1415,8 @@ class AiLimitApp(rumps.App):
             self._gemini = gemini
         if copilot is not None:
             self._copilot = copilot
+        if grok is not None:
+            self._grok = grok
         _save_cache(
             self._claude,
             {
@@ -1351,6 +1425,7 @@ class AiLimitApp(rumps.App):
                 "google": self._google,
                 "gemini": self._gemini,
                 "copilot": self._copilot,
+                "grok": self._grok,
             },
         )
         self._render()
@@ -1363,14 +1438,17 @@ class AiLimitApp(rumps.App):
         google = None
         gemini = None
         copilot = None
+        grok = None
         if isinstance(cached, dict) and (
-            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached or "copilot" in cached
+            "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached
+            or "copilot" in cached or "grok" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             google = cached.get("google")
             gemini = cached.get("gemini")
             copilot = cached.get("copilot")
+            grok = cached.get("grok")
         else:
             codex = cached
         # 不按 services 过滤——内存里保留两份数据，UI 显示由 _render 控
@@ -1386,6 +1464,8 @@ class AiLimitApp(rumps.App):
             self._gemini = gemini
         if copilot is not None:
             self._copilot = copilot
+        if grok is not None:
+            self._grok = grok
         self._render()
 
     def _kick_background_fetch(self):
@@ -1403,8 +1483,9 @@ class AiLimitApp(rumps.App):
         google = _fetch_google(lang) if "google" in services else None
         gemini = _fetch_gemini_app(lang) if "gemini" in services else None
         copilot = _fetch_copilot(lang) if "copilot" in services else None
+        grok = _fetch_grok(lang) if "grok" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google, gemini, copilot)
+            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -2276,6 +2357,7 @@ class AiLimitApp(rumps.App):
             ("google", "Antigravity", "globe", "#dc2626", self._google or {}),
             ("gemini", "Gemini", "sparkles", "#9333ea", self._gemini or {}),
             ("copilot", "Copilot", "chevron.left.forwardslash.chevron.right", "#0f766e", self._copilot or {}),
+            ("grok", "Grok", "bolt.fill", "#52525b", self._grok or {}),
             ("deepseek", "DeepSeek", "dollarsign.circle.fill", "#0891b2", self._deepseek or {}),
         ]
         for service, title, symbol, accent, data in specs:
@@ -2393,6 +2475,20 @@ class AiLimitApp(rumps.App):
             if not metrics:
                 value = _tr(lang, "未知", "Unknown")
                 subtitle = _short_widget_name(data.get("unit") or "Copilot", 38)
+        elif service == "grok" and data:
+            # One shared SuperGrok pool across Chat / Imagine / Build / Voice /
+            # API, on an account-specific weekly schedule.
+            weekly = data.get("window") != "monthly"
+            metrics = self._quota_card_metrics([
+                (_tr(lang, "1周", "1w") if weekly else _tr(lang, "本月", "Mo"), data.get("left"), None),
+            ])
+            grok_reset = _fmt_copilot_reset(data.get("reset"), lang)
+            if grok_reset != "?":
+                reset_text = _tr(lang, f"重置 {grok_reset}", f"Resets {grok_reset}")
+            pct = self._metric_floor(metrics)
+            if not metrics:
+                value = _tr(lang, "未知", "Unknown")
+                subtitle = "SuperGrok"
 
         pct = _widget_pct_value(pct)
         value_color = _widget_risk_color(pct)
@@ -2557,6 +2653,7 @@ class AiLimitApp(rumps.App):
             "Antigravity": "AG",
             "Gemini": "GM",
             "Copilot": "CP",
+            "Grok": "GK",
             "DeepSeek": "DS",
         }
         for item in self._widget_detail_rows(include_disabled=False):
@@ -2591,6 +2688,7 @@ class AiLimitApp(rumps.App):
             ("google", self._google or {}),
             ("gemini", self._gemini or {}),
             ("copilot", self._copilot or {}),
+            ("grok", self._grok or {}),
         ):
             if service in (self._state.get("services") or list(_SERVICES)) and data.get("error"):
                 error_services.append(service)
@@ -2611,6 +2709,8 @@ class AiLimitApp(rumps.App):
 
     def _compact_bar_label(self, name):
         text = str(name or "").lower()
+        if text.startswith("grok"):
+            return "GK"
         if text.startswith("5h") or text.startswith("weekly"):
             return "C"
         if "balance" in text or "spark" in text or "codex" in text:
@@ -2697,6 +2797,18 @@ class AiLimitApp(rumps.App):
                 section("Copilot", "#5eead4")
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
+        if "grok" in services and self._grok and not self._grok.get("error"):
+            data = self._grok
+            section("Grok", "#d4d4d8")
+            append(
+                "Grok / Monthly" if data.get("window") == "monthly" else "Grok / Weekly",
+                data.get("left"),
+                reset=_fmt_copilot_reset(data.get("reset"), lang),
+                unknown=data.get("left") is None,
+            )
+            credits = _grok_credit_text(data)
+            if credits:
+                append(_tr(lang, "额外积分", "Extra credits"), value=credits, kind="credit", color="#d4d4d8")
         return rows[:34]
 
     def _widget_codex_entries(self):
@@ -2834,6 +2946,8 @@ class AiLimitApp(rumps.App):
             lines.extend(self._widget_gemini_lines())
         if "copilot" in services:
             lines.extend(self._widget_copilot_lines())
+        if "grok" in services:
+            lines.extend(self._widget_grok_lines())
         return "\n".join(lines).rstrip() + "\n"
 
     def _widget_section(self, title, data, source=None):
@@ -2979,6 +3093,33 @@ class AiLimitApp(rumps.App):
         lines.append("")
         return lines
 
+    def _widget_grok_lines(self):
+        lang = self._state["lang"]
+        data = self._grok or {}
+        lines = self._widget_section("Grok", data, data.get("source") or "grok.com GrokBuildBilling/GetGrokCreditsConfig")
+        if data and not data.get("error"):
+            lines.append(
+                self._widget_quota_row(
+                    _tr(lang, "SuperGrok 每周额度", "SuperGrok weekly pool")
+                    if data.get("window") != "monthly"
+                    else _tr(lang, "SuperGrok 每月额度", "SuperGrok monthly pool"),
+                    data.get("left"),
+                    data.get("used"),
+                    reset=_fmt_copilot_reset(data.get("reset"), lang),
+                )
+            )
+            credits = _grok_credit_text(data)
+            if credits:
+                lines.append(_tr(lang, f"  额外积分 {credits}", f"  Extra credits {credits}"))
+            products = [item for item in data.get("products") or [] if item.get("used_percent")]
+            if products:
+                breakdown = ", ".join(
+                    f"{item.get('display_name')} {item.get('used_percent'):g}%" for item in products
+                )
+                lines.append(_tr(lang, f"  用量构成：{breakdown}", f"  Used by: {breakdown}"))
+        lines.append("")
+        return lines
+
     # ── 模式 / 语言切换 ──────────────────────────────────────────────────────
 
     def _set_mode_5h(self, _):
@@ -3032,6 +3173,7 @@ class AiLimitApp(rumps.App):
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")
         self._copilot_dash.title = _tr(lang, "打开 Copilot 用量页", "Open Copilot usage")
+        self._grok_dash.title = _tr(lang, "打开 Grok 用量页", "Open Grok usage")
         self._about_repo.title = _tr(lang, "打开项目仓库", "Open project repository")
         self._about_menu.title  = _tr(lang,
             f"项目信息（ai-limit {__version__}）",
@@ -3042,16 +3184,16 @@ class AiLimitApp(rumps.App):
             f"Version: ai-limit {__version__}",
         )
         self._about_scope.title = _tr(lang,
-            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot",
-            "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot",
+            "监控：Claude / CodeX / DeepSeek / Google / Gemini App / Copilot / Grok",
+            "Monitors: Claude / CodeX / DeepSeek / Google / Gemini App / Copilot / Grok",
         )
         self._about_surfaces.title = _tr(lang,
             "界面：菜单栏 / CLI / daemon",
             "Surfaces: menu bar / CLI / daemon",
         )
         self._about_status.title = _tr(lang,
-            "状态：当前版本已接入 Google、Gemini App 与 GitHub Copilot 配额",
-            "Status: current build includes Google, Gemini App, and GitHub Copilot quota",
+            "状态：当前版本已接入 Google、Gemini App、GitHub Copilot 与 Grok 配额",
+            "Status: current build includes Google, Gemini App, GitHub Copilot, and Grok quota",
         )
         self._update_login_item_check()
         self._update_widget_item()
@@ -3085,6 +3227,9 @@ class AiLimitApp(rumps.App):
 
     def _toggle_copilot(self, _):
         self._toggle_service("copilot")
+
+    def _toggle_grok(self, _):
+        self._toggle_service("grok")
 
     def _toggle_service(self, service):
         svc = list(self._state.get("services") or list(_SERVICES))
@@ -3123,6 +3268,7 @@ class AiLimitApp(rumps.App):
         self._svc_google.title = ("✓ " if "google" in svc else "  ") + "Google"
         self._svc_gemini.title = ("✓ " if "gemini" in svc else "  ") + "Gemini App"
         self._svc_copilot.title = ("✓ " if "copilot" in svc else "  ") + "Copilot"
+        self._svc_grok.title = ("✓ " if "grok" in svc else "  ") + "Grok"
         enabled = []
         if "claude" in svc:
             enabled.append("Claude Code")
@@ -3136,6 +3282,8 @@ class AiLimitApp(rumps.App):
             enabled.append("Gemini App")
         if "copilot" in svc:
             enabled.append("Copilot")
+        if "grok" in svc:
+            enabled.append("Grok")
         summary = _tr(lang, "全部", "All") if len(svc) == len(_SERVICES) else ", ".join(enabled)
         self._svc_menu.title = _tr(lang, f"监控服务（{summary}）", f"Services ({summary})")
 

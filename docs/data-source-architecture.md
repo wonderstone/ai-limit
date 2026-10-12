@@ -19,6 +19,7 @@ It should not automate browser windows in the background. A browser may be opene
 | Antigravity | Running Antigravity local sidecar plus local CSRF token | `https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` | gRPC-web JSON | No |
 | Antigravity fallback | `agy` CLI and local logs | `agy /usage`, `~/.gemini/antigravity-cli/log` | CLI text / log text | No |
 | GitHub Copilot | GitHub OAuth/PAT token from env, `copilot-cli` Keychain entry, or `gh auth token` | `https://api.github.com/copilot_internal/user` | JSON (`quota_snapshots`) | No |
+| Grok | Browser cookie for `grok.com` (`sso` / `sso-rw`), searched across every Chrome profile | `https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` | gRPC-web binary protobuf | No |
 
 ## Shared Browser-Session Pattern
 
@@ -45,6 +46,7 @@ ai-limit should use the smallest existing local credential material needed to re
 | Gemini page tokens: `cfb2h`, `FdrFJe`, `SNlM0e` | Gemini App | HTML returned by `https://gemini.google.com/usage`, requested with Google cookies | Used as batchexecute query/body parameters | No |
 | Google OAuth refresh/access token | Google Code Assist / Gemini CLI | `~/.gemini/oauth_creds.json` | Refreshes and calls `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | No new copy; reads existing file |
 | Antigravity CSRF token | Antigravity sidecar | Antigravity language-server process arguments | Sent as `x-codeium-csrf-token` to the local sidecar | No |
+| grok.com cookies (`sso`, `sso-rw`, `cf_clearance`) | Grok | `browser_cookie3` reading each Chrome profile's cookie DB, then Firefox | Sent as the request `Cookie` header | No |
 | GitHub token (`gho_` / `ghu_` / `github_pat_`) | GitHub Copilot | `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, then the `copilot-cli` Keychain item, then `gh auth token` | Sent as `Authorization: token …` to `copilot_internal/user` | No |
 
 Important distinctions:
@@ -201,6 +203,30 @@ Risk profile:
 - `401`/`403` mean the token expired or lacks Copilot access; `404` means the account has no Copilot subscription. Both are surfaced as sign-in guidance, not as a quota number.
 - The reset is a fixed monthly boundary (first day of the month, 00:00 UTC), not a rolling window like Claude/Codex.
 - Do not fall back to scraping github.com settings pages or to the Copilot SDK server mode from the menu bar app; the single narrow read above is the intended boundary.
+
+## Grok
+
+Grok quota uses the active `grok.com` browser session and reads the same RPC as grok.com Settings → Usage.
+
+Flow:
+
+1. Read `grok.com` cookies from each Chrome profile (`Default`, `Profile N`), then Firefox; the first jar holding `sso` / `sso-rw` wins. `browser_cookie3` alone only opens Chrome's Default profile, and grok.com is often signed in under another one.
+2. `POST https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` with `Content-Type: application/grpc-web+proto`, `X-Grpc-Web: 1`, and an empty request frame (`00 00 00 00 00`).
+3. Unframe the gRPC-web reply (data frame + `0x80` trailer frame); a non-zero `grpc-status` is an error, `7`/`16` meaning the session is not accepted.
+4. Decode `GetGrokCreditsConfigResponse.config` (`GrokCreditsConfig`) with a small built-in protobuf reader:
+   - `1 credit_usage_percent` (float): share of the pool used; shown as `ceil(used)` like the page.
+   - `8 current_period` (`type` 2 = weekly, 1 = monthly; `start`/`end` timestamps): `end` is the reset time.
+   - `7 product_usage[]` (`billing_product.Product` enum + `usage_percent`): Chat / Imagine / Build / Voice / API / Grok Bot share.
+   - `12 prepaid_balance`, `2 on_demand_cap`, `3 on_demand_used` (`prod_charger.Cent { int64 val }`): Extra Usage Credits.
+   - `11 is_unified_billing_user`: false means the account is not on the shared pool; reported as an error instead of a number.
+
+Field numbers come from the `grok_build_billing.proto` descriptor embedded in grok.com's own JS bundle.
+
+Risk profile:
+
+- Internal endpoint and protobuf schema; field numbers or the RPC name may change.
+- Cloudflare fronts grok.com; the request relies on the browser's `cf_clearance` cookie and a browser-like User-Agent.
+- Grok Bot appears only as a product share of the same pool here; it has no separate quota in this RPC.
 
 ## Maintenance Rules
 

@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/zhuchenxi113/ai-limit/main/install.
 
 - 中英文切换
 - 5小时 / 7天 窗口切换
-- Claude、CodeX、Google 和 GitHub Copilot 额度同时显示，可单独切换
+- Claude、CodeX、Google、GitHub Copilot 和 Grok 额度同时显示，可单独切换
 - 手动刷新
 - 点击展开详细数据（套餐、用量、重置时间）
 
@@ -67,6 +67,7 @@ bash make-dmg.sh
 - Chrome 或 Firefox 已登录 [chatgpt.com](https://chatgpt.com)（用于读取 CodeX 额度，推荐路径）
 - 本机 Gemini CLI / Antigravity 已登录（用于读取 Google 额度）
 - 本机 Copilot CLI（`copilot login`）或 GitHub CLI（`gh auth login`）已登录（用于菜单栏 App 读取 GitHub Copilot 额度）
+- Chrome 或 Firefox 已登录 [grok.com](https://grok.com)，且为 SuperGrok / X Premium+ 订阅（用于菜单栏 App 读取 Grok 额度；任意 Chrome profile 均可）
 - 可选：[CodeX CLI](https://developers.openai.com/codex/cli) 已安装并登录（作为浏览器 cookie 失效时的兜底路径）
 
 ### 使用前提
@@ -77,6 +78,7 @@ ai-limit 只读取你本机已有的 Claude / ChatGPT 登录态与本地使用�
 - 已开通并登录 ChatGPT / CodeX：显示 CodeX 额度。
 - 已开通并登录 Gemini CLI / Antigravity：显示 Google 额度。
 - 已登录 Copilot CLI 或 GitHub CLI：菜单栏 App 显示 GitHub Copilot 当月 AI credits 额度。
+- 已登录 grok.com：菜单栏 App 显示 SuperGrok 每周额度池（以及 Extra Usage Credits 余额，如有）。
 - 未开通或未登录的服务会显示 ⚠️ 提示，可在菜单栏 App 的「监控服务」里关闭对应显示。
 - 如果两个服务都不可用，菜单栏会显示 `ai-limit ⚠️` 或对应错误提示。
 
@@ -171,6 +173,14 @@ ai-limit 会复用你本机已经存在的登录态。Gemini App 和 Claude、Ch
 | 当月 AI credits（旧计费为 premium requests） | GitHub token → `api.github.com/copilot_internal/user` → `quota_snapshots.premium_interactions` |
 
 token 的查找顺序与 Copilot CLI 一致：`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` 环境变量 → `copilot login` 写入 Keychain 的 `copilot-cli` 条目 → `gh auth token`。这是 Copilot CLI 底部额度栏使用的同一个内部接口，**非公开 REST API**，可能随版本变化。目前 Copilot 只在菜单栏 App 中显示。
+
+### Grok
+
+| 数据 | 来源 |
+|------|------|
+| SuperGrok 每周额度池、重置时间、Extra Usage Credits、各产品占比 | grok.com 浏览器 Cookie（任意 Chrome profile）→ `grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`（gRPC-web，protobuf） |
+
+这就是 grok.com 设置页 Settings → Usage 自己发出的请求。2026 年 6 月起，付费档（SuperGrok、X Premium+）的 Chat、Imagine、Build、Voice、API 共用一个按算力计费的每周额度池，重置时间因账号而异。这是**内部接口**，可能随版本变化。目前 Grok 只在菜单栏 App 中显示。
 
 ## 说明
 

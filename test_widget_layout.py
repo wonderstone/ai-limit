@@ -259,7 +259,7 @@ class DashboardLayoutTests(unittest.TestCase):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
         app._state = {"lang": "en", "global": "7d", "services": list(menubar._SERVICES), "widget": True}
         app._codex = {"7d_left": 50, "credits": {"has_credits": True, "unlimited": False, "balance": 25}}
-        app._claude = app._google = app._gemini = app._copilot = None
+        app._claude = app._google = app._gemini = app._copilot = app._grok = None
         app._deepseek = {"primary": {"currency": "CNY", "total_balance": "16.36"}}
         app._widget_panel = _Panel(width=640, height=500)
         app._widget_content = mock.MagicMock()
@@ -281,7 +281,7 @@ class DashboardLayoutTests(unittest.TestCase):
         app._state = {"lang": "en", "global": "7d", "services": ["codex", "deepseek"], "widget": True}
         app._codex = {"7d_left": 50, "credits": {"has_credits": True, "unlimited": False, "balance": 25}}
         app._deepseek = {"primary": {"currency": "CNY", "total_balance": "16.36"}}
-        app._claude = app._google = app._gemini = app._copilot = None
+        app._claude = app._google = app._gemini = app._copilot = app._grok = None
 
         self.assertEqual(app._widget_alert_rows(), [])
 

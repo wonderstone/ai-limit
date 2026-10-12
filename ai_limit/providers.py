@@ -41,6 +41,9 @@ COPILOT_USAGE_URL = "https://github.com/settings/billing"
 COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 COPILOT_KEYCHAIN_SERVICE = "copilot-cli"
 COPILOT_TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
+GROK_CREDITS_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+GROK_USAGE_URL = "https://grok.com/?_s=usage"
+GROK_SESSION_COOKIES = ("sso", "sso-rw")
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
@@ -146,6 +149,14 @@ class CopilotQuotaError(Exception):
 
 class CopilotAuthError(CopilotQuotaError):
     """No usable GitHub token, or the token has no Copilot access."""
+
+
+class GrokUsageError(Exception):
+    pass
+
+
+class GrokAuthError(GrokUsageError):
+    """No grok.com browser session, or the session was rejected."""
 
 
 def clear_provider_caches() -> None:
@@ -2644,4 +2655,325 @@ def live_copilot_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
 
     normalized = _normalize_copilot_quota(data)
     normalized["token_source"] = token_source
+    return datetime.datetime.now(datetime.timezone.utc), normalized
+
+
+# ── Grok (SuperGrok weekly pool) ──────────────────────────────────────────────
+#
+# grok.com Settings → Usage reads `GrokBuildBilling/GetGrokCreditsConfig`, a
+# Connect service spoken as gRPC-web with binary protobuf. The schema below is
+# the subset of `prod/grok/backend/proto/grok_build_billing.proto` the usage
+# page reads; field numbers come from the descriptor shipped in grok.com's own
+# JS bundle.
+#
+#   GetGrokCreditsConfigResponse { GrokCreditsConfig config = 1; }
+#   GrokCreditsConfig {
+#     float credit_usage_percent = 1;      Cent on_demand_cap = 2;
+#     Cent on_demand_used = 3;             Timestamp billing_period_start = 4;
+#     Timestamp billing_period_end = 5;    repeated ProductUsage product_usage = 7;
+#     UsagePeriod current_period = 8;      bool is_unified_billing_user = 11;
+#     Cent prepaid_balance = 12;
+#   }
+#   UsagePeriod { UsagePeriodType type = 1; Timestamp start = 2; Timestamp end = 3; }
+#   ProductUsage { billing_product.Product product = 1; float usage_percent = 2; }
+#   prod_charger.Cent { int64 val = 1; }
+
+_GROK_PERIOD_TYPES = {1: "monthly", 2: "weekly"}
+_GROK_PRODUCTS = {
+    1: ("api", "API"),
+    2: ("build", "Build"),
+    3: ("plugins", "Plugins"),
+    4: ("chat", "Chat"),
+    5: ("imagine", "Imagine"),
+    6: ("voice", "Voice"),
+    7: ("app_builder", "App Builder"),
+    8: ("tasks", "Tasks"),
+    9: ("grok_bot", "Grok Bot"),
+}
+
+
+def _pb_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    result = shift = 0
+    while True:
+        if pos >= len(buf):
+            raise GrokUsageError("truncated protobuf varint")
+        byte = buf[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return result, pos
+        shift += 7
+
+
+def _pb_fields(buf: bytes) -> dict[int, list]:
+    """Decode one protobuf message into ``{field_number: [raw values]}``."""
+    fields: dict[int, list] = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_varint(buf, pos)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, pos = _pb_varint(buf, pos)
+        elif wire == 1:
+            value, pos = buf[pos:pos + 8], pos + 8
+        elif wire == 2:
+            size, pos = _pb_varint(buf, pos)
+            value, pos = buf[pos:pos + size], pos + size
+        elif wire == 5:
+            value, pos = buf[pos:pos + 4], pos + 4
+        else:
+            raise GrokUsageError(f"unsupported protobuf wire type {wire}")
+        fields.setdefault(number, []).append(value)
+    return fields
+
+
+def _pb_first(fields: dict, number: int, default=None):
+    values = fields.get(number)
+    return values[-1] if values else default
+
+
+def _pb_float(fields: dict, number: int) -> float:
+    raw = _pb_first(fields, number)
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 4:
+        return 0.0
+    value = struct.unpack("<f", raw)[0]
+    return value if value == value and value not in (float("inf"), float("-inf")) else 0.0
+
+
+def _pb_int64(value) -> int:
+    value = int(value or 0)
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _pb_cent(fields: dict, number: int) -> int:
+    raw = _pb_first(fields, number)
+    if not raw:
+        return 0
+    return _pb_int64(_pb_first(_pb_fields(raw), 1, 0))
+
+
+def _pb_timestamp_iso(raw) -> str | None:
+    if not raw:
+        return None
+    ts = _pb_fields(raw)
+    seconds = _pb_int64(_pb_first(ts, 1, 0))
+    if seconds <= 0:
+        return None
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_grpc_web_proto(raw: bytes) -> bytes:
+    """Return the single data frame of a unary gRPC-web response.
+
+    Trailers ride in a frame flagged 0x80; a non-zero ``grpc-status`` there
+    (or in the HTTP headers for trailers-only replies) is an RPC error.
+    """
+    message = None
+    trailers = ""
+    pos = 0
+    while pos + 5 <= len(raw):
+        flag = raw[pos]
+        size = struct.unpack(">I", raw[pos + 1:pos + 5])[0]
+        body = raw[pos + 5:pos + 5 + size]
+        pos += 5 + size
+        if flag & 0x80:
+            trailers += body.decode("utf-8", "replace")
+        elif message is None:
+            message = body
+    status = re.search(r"grpc-status:\s*(\d+)", trailers)
+    if status and status.group(1) != "0":
+        detail = re.search(r"grpc-message:\s*([^\r\n]*)", trailers)
+        _raise_grok_grpc_status(int(status.group(1)), urllib.parse.unquote(detail.group(1)) if detail else "")
+    if message is None:
+        raise GrokUsageError("Grok usage response carried no message frame")
+    return message
+
+
+def _raise_grok_grpc_status(code: int, detail: str = ""):
+    # 16 UNAUTHENTICATED, 7 PERMISSION_DENIED
+    if code in (7, 16):
+        raise GrokAuthError(
+            t(
+                "grok.com 登录已失效，请先在 Chrome 打开 grok.com 并登录",
+                "grok.com session expired; open grok.com in Chrome and sign in",
+            )
+        )
+    raise GrokUsageError(f"grpc-status {code}{': ' + detail if detail else ''}")
+
+
+def _normalize_grok_credits_config(message: bytes) -> dict:
+    response = _pb_fields(message)
+    config_raw = _pb_first(response, 1)
+    config = _pb_fields(config_raw) if config_raw else {}
+    unified = bool(_pb_first(config, 11, 0))
+    if not unified:
+        # The usage page treats this as "gated off": the account is not on the
+        # shared weekly pool, so there is no percentage to show.
+        raise GrokUsageError(
+            t(
+                "该 Grok 账号未启用 SuperGrok 每周额度池",
+                "this Grok account is not on the SuperGrok weekly usage pool",
+            )
+        )
+
+    used = max(0.0, min(100.0, _pb_float(config, 1)))
+    period_raw = _pb_first(config, 8)
+    period = _pb_fields(period_raw) if period_raw else {}
+    period_type = _GROK_PERIOD_TYPES.get(_pb_first(period, 1, 0), "unspecified")
+    period_start = _pb_timestamp_iso(_pb_first(period, 2))
+    period_end = _pb_timestamp_iso(_pb_first(period, 3))
+    billing_end = _pb_timestamp_iso(_pb_first(config, 5))
+    reset_time = period_end or billing_end
+
+    products = []
+    for raw in config.get(7, []):
+        item = _pb_fields(raw)
+        product_id, display_name = _GROK_PRODUCTS.get(
+            _pb_first(item, 1, 0), (f"product_{_pb_first(item, 1, 0)}", "Other")
+        )
+        products.append(
+            {
+                "product": product_id,
+                "display_name": display_name,
+                "used_percent": round(max(0.0, _pb_float(item, 2)), 2),
+            }
+        )
+    products.sort(key=lambda item: item["used_percent"], reverse=True)
+
+    # Settings → Usage prints Math.ceil(used); mirror it so both read the same.
+    used_display = int(-(-used // 1))
+    window = "weekly" if period_type == "weekly" else period_type
+    primary = {
+        "bucket_id": "supergrok_pool",
+        "display_name": "Weekly" if window == "weekly" else "Usage",
+        "window": window,
+        "used_percent": used_display,
+        "remaining_percent": max(0, 100 - used_display),
+        "reset_time": reset_time,
+    }
+    prepaid_cents = max(0, _pb_cent(config, 12))
+    on_demand_cap_cents = max(0, _pb_cent(config, 2))
+    on_demand_used_cents = max(0, _pb_cent(config, 3))
+    return {
+        "source": "grok.com GrokBuildBilling/GetGrokCreditsConfig",
+        "period_type": period_type,
+        "period_start": period_start,
+        "reset_time": reset_time,
+        "billing_period_end": billing_end,
+        "primary": primary,
+        "buckets": [primary],
+        "products": products,
+        "prepaid_balance_cents": prepaid_cents,
+        "on_demand_cap_cents": on_demand_cap_cents,
+        "on_demand_used_cents": on_demand_used_cents,
+        "summary": {
+            "used_percent": used_display,
+            "used_percent_exact": round(used, 2),
+            "remaining_percent": primary["remaining_percent"],
+            "reset_time": reset_time,
+            "window": window,
+            "prepaid_balance_usd": prepaid_cents / 100.0,
+            "on_demand_enabled": on_demand_cap_cents > 0,
+            "product_count": len(products),
+        },
+    }
+
+
+def _chrome_profile_cookie_files() -> list[pathlib.Path]:
+    root = pathlib.Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    profiles = [root / "Default"] + sorted(root.glob("Profile *"))
+    files = []
+    for profile in profiles:
+        for candidate in (profile / "Network" / "Cookies", profile / "Cookies"):
+            if candidate.is_file():
+                files.append(candidate)
+                break
+    return files
+
+
+def _load_grok_cookies():
+    try:
+        import browser_cookie3
+    except ImportError as exc:
+        raise GrokUsageError(
+            t(
+                "未安装 browser_cookie3，请先运行: pip install browser-cookie3",
+                "browser_cookie3 not installed, run: pip install browser-cookie3",
+            )
+        ) from exc
+    errs = []
+    # browser_cookie3 only opens Chrome's Default profile on its own; grok.com
+    # is often signed in under a second profile, so try each one explicitly.
+    loaders = [
+        (f"Chrome/{(path.parent.parent if path.parent.name == 'Network' else path.parent).name}", lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="grok.com"))
+        for path in _chrome_profile_cookie_files()
+    ]
+    loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="grok.com")))
+    for name, loader in loaders:
+        try:
+            cookies = [(c.name, c.value) for c in loader()]
+            if any(cookie_name in GROK_SESSION_COOKIES for cookie_name, _ in cookies):
+                return cookies
+        except Exception as exc:
+            errs.append(f"{name}: {exc}")
+    detail = f" ({'; '.join(errs)})" if errs else ""
+    raise GrokAuthError(
+        t(
+            f"未找到 grok.com 登录 cookie{detail}，请先在浏览器登录 grok.com",
+            f"grok.com sign-in cookies not found{detail}; sign in to grok.com in your browser",
+        )
+    )
+
+
+def has_grok_cookies() -> bool:
+    try:
+        _load_grok_cookies()
+    except GrokUsageError:
+        return False
+    return True
+
+
+def live_grok_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    import urllib.error
+    import urllib.request
+
+    cookies = _load_grok_cookies()
+    req = urllib.request.Request(
+        GROK_CREDITS_URL,
+        # An empty GetGrokCreditsConfigRequest: one uncompressed, zero-length frame.
+        data=b"\x00\x00\x00\x00\x00",
+        method="POST",
+        headers={
+            "Cookie": "; ".join(f"{name}={value}" for name, value in cookies),
+            "Content-Type": "application/grpc-web+proto",
+            "Accept": "application/grpc-web+proto",
+            "X-Grpc-Web": "1",
+            "X-User-Agent": "connect-es/2.1.1",
+            "User-Agent": CHATGPT_UA,
+            "Origin": "https://grok.com",
+            "Referer": GROK_USAGE_URL,
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            header_status = response.headers.get("grpc-status")
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise GrokAuthError(
+                t(
+                    f"HTTP {exc.code}：grok.com 登录已失效或被拦截，请在 Chrome 重新打开 grok.com",
+                    f"HTTP {exc.code}: grok.com session expired or blocked; reopen grok.com in Chrome",
+                )
+            ) from exc
+        raise GrokUsageError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise GrokUsageError(str(exc)) from exc
+
+    if header_status and header_status != "0":
+        _raise_grok_grpc_status(int(header_status))
+    normalized = _normalize_grok_credits_config(_parse_grpc_web_proto(body))
     return datetime.datetime.now(datetime.timezone.utc), normalized

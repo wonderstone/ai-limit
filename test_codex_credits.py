@@ -151,7 +151,7 @@ class TestCodexCreditMenuBar(unittest.TestCase):
         app._codex = {"credits": {"has_credits": True, "unlimited": False, "balance": "2625"}}
         app._widget_panel = _Panel(width=760, height=900)
         app._widget_content = mock.MagicMock()
-        app._claude = app._deepseek = app._google = app._gemini = app._copilot = None
+        app._claude = app._deepseek = app._google = app._gemini = app._copilot = app._grok = None
 
         rows = app._widget_detail_rows()
 
