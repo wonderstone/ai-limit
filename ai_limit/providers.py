@@ -44,6 +44,7 @@ COPILOT_TOKEN_PREFIXES = ("gho_", "ghu_", "github_pat_")
 GROK_CREDITS_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
 GROK_USAGE_URL = "https://grok.com/?_s=usage"
 GROK_SESSION_COOKIES = ("sso", "sso-rw")
+GROK_CHROME_PROFILE_PATH = pathlib.Path.home() / ".config" / "ai-limit" / "grok-chrome-profile"
 REMOTE_TIMEOUT_SEC = 15
 CLAUDE_WEB_TIMEOUT_SEC = 15
 CODEX_WINDOW_CACHE = pathlib.Path.home() / ".codex_window_cache"
@@ -2913,11 +2914,25 @@ def _load_grok_cookies():
     errs = []
     # browser_cookie3 only opens Chrome's Default profile on its own; grok.com
     # is often signed in under a second profile, so try each one explicitly.
+    try:
+        selected_profile = GROK_CHROME_PROFILE_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        selected_profile = ""
+    except OSError as exc:
+        raise GrokUsageError("Cannot read Grok Chrome profile setting") from exc
+    cookie_files = _chrome_profile_cookie_files()
+    if selected_profile:
+        # An explicit account selection must never silently fall back to another.
+        cookie_files = [
+            path for path in cookie_files
+            if (path.parent.parent if path.parent.name == "Network" else path.parent).name == selected_profile
+        ]
     loaders = [
         (f"Chrome/{(path.parent.parent if path.parent.name == 'Network' else path.parent).name}", lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="grok.com"))
-        for path in _chrome_profile_cookie_files()
+        for path in cookie_files
     ]
-    loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="grok.com")))
+    if not selected_profile:
+        loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="grok.com")))
     for name, loader in loaders:
         try:
             cookies = [(c.name, c.value) for c in loader()]

@@ -206,6 +206,11 @@ Risk profile:
 
 ## Grok
 
+To pin Grok to a specific Chrome account, put its profile directory name (for example,
+`Profile 1`) in `~/.config/ai-limit/grok-chrome-profile`. This affects only Grok.
+When set, no other Chrome profile or Firefox session is used as a fallback.
+Remove the file to restore automatic discovery. The file contains no credentials.
+
 Grok quota uses the active `grok.com` browser session and reads the same RPC as grok.com Settings → Usage.
 
 Flow:

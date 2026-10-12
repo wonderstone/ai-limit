@@ -1,5 +1,11 @@
 import struct
 import unittest
+import pathlib
+import tempfile
+from types import SimpleNamespace
+from unittest import mock
+
+import ai_limit.providers as providers
 
 from ai_limit.providers import (
     GrokAuthError,
@@ -80,6 +86,41 @@ def _grpc_web(message, status=0, detail=""):
         b"\x00" + struct.pack(">I", len(message)) + message
         + b"\x80" + struct.pack(">I", len(trailer)) + trailer
     )
+
+
+class GrokProfileSelectionTests(unittest.TestCase):
+    def test_explicit_profile_skips_default_account(self):
+        for suffix in ("Cookies", "Network/Cookies"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                setting = pathlib.Path(tmp) / "profile"
+                setting.write_text("Profile 1\n")
+                files = [pathlib.Path(tmp) / name / suffix for name in ("Default", "Profile 1")]
+                with mock.patch.object(providers, "GROK_CHROME_PROFILE_PATH", setting), mock.patch.object(
+                    providers, "_chrome_profile_cookie_files", return_value=files
+                ), mock.patch("browser_cookie3.chrome", return_value=[SimpleNamespace(name="sso", value="test")]) as chrome, mock.patch("browser_cookie3.firefox") as firefox:
+                    self.assertEqual(providers._load_grok_cookies(), [("sso", "test")])
+                    chrome.assert_called_once_with(cookie_file=str(files[1]), domain_name="grok.com")
+                    firefox.assert_not_called()
+
+    def test_missing_selected_profile_does_not_switch_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            setting = pathlib.Path(tmp) / "profile"
+            setting.write_text("Profile 1")
+            with mock.patch.object(providers, "GROK_CHROME_PROFILE_PATH", setting), mock.patch.object(
+                providers, "_chrome_profile_cookie_files", return_value=[pathlib.Path(tmp) / "Default/Cookies"]
+            ), mock.patch("browser_cookie3.chrome") as chrome, mock.patch("browser_cookie3.firefox") as firefox:
+                with self.assertRaises(GrokAuthError):
+                    providers._load_grok_cookies()
+                chrome.assert_not_called()
+                firefox.assert_not_called()
+
+    def test_no_setting_preserves_default_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(providers, "GROK_CHROME_PROFILE_PATH", pathlib.Path(tmp) / "missing"), mock.patch.object(
+                providers, "_chrome_profile_cookie_files", return_value=[]
+            ), mock.patch("browser_cookie3.firefox", return_value=[SimpleNamespace(name="sso", value="test")]) as firefox:
+                self.assertEqual(providers._load_grok_cookies(), [("sso", "test")])
+                firefox.assert_called_once()
 
 
 class NormalizeGrokCreditsConfigTests(unittest.TestCase):
