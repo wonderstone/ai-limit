@@ -2132,7 +2132,12 @@ class AiLimitApp(rumps.App):
         frame = panel.frame()
         current_width = int(frame.size.width)
         current_height = int(frame.size.height)
-        height = max(self._WIDGET_MIN_HEIGHT, min(self._widget_height_limit(), int(desired_height)))
+        # desired_height is the dashboard's content height, but frame() is the
+        # whole window including the title bar. Sizing the frame to the
+        # content left the clip view one title bar short, and because the
+        # document view grows upward that clipped the header off the top.
+        chrome = self._widget_frame_chrome_height(panel)
+        height = max(self._WIDGET_MIN_HEIGHT, min(self._widget_height_limit(), int(desired_height) + chrome))
         if current_height == height:
             return
 
@@ -2156,6 +2161,39 @@ class AiLimitApp(rumps.App):
             panel.setFrame_display_animate_(new_frame, True, True)
         else:
             panel.setFrame_display_(new_frame, True)
+
+    @staticmethod
+    def _widget_frame_chrome_height(panel):
+        if not hasattr(panel, "frameRectForContentRect_"):
+            return 0
+        try:
+            probe = panel.frameRectForContentRect_(AppKit.NSMakeRect(0, 0, 100, 100))
+            return max(0, int(round(probe.size.height - 100)))
+        except Exception:
+            return 0
+
+    def _widget_keep_top_visible(self, previous_height, natural_height):
+        """Pin the scroll position to the top edge across re-layouts.
+
+        AppKit document views are not flipped, so a document taller than its
+        clip view opens scrolled to the bottom. Keep the distance from the top
+        that the user had (zero on first show) instead.
+        """
+        scroll = self._widget_panel.contentView() if self._widget_panel is not None else None
+        if scroll is None or not hasattr(scroll, "contentView"):
+            return
+        clip = scroll.contentView()
+        if not hasattr(clip, "scrollToPoint_"):
+            return
+        clip_bounds = clip.bounds()
+        clip_h = clip_bounds.size.height
+        from_top = 0
+        if previous_height:
+            from_top = max(0, previous_height - (clip_bounds.origin.y + clip_h))
+        origin_y = max(0, natural_height - clip_h - from_top)
+        clip.scrollToPoint_(AppKit.NSMakePoint(0, origin_y))
+        if hasattr(scroll, "reflectScrolledClipView_"):
+            scroll.reflectScrolledClipView_(clip)
 
     def _widget_height_limit(self):
         limit = self._WIDGET_MAX_HEIGHT
@@ -2193,8 +2231,16 @@ class AiLimitApp(rumps.App):
         self._widget_resize_panel(natural_height)
         scroll = self._widget_panel.contentView() if self._widget_panel is not None else None
         if scroll is not None and hasattr(scroll, "setHasVerticalScroller_"):
-            scroll.setHasVerticalScroller_(natural_height > self._widget_height_limit())
+            visible_h = scroll.bounds().size.height if hasattr(scroll, "bounds") else self._widget_height_limit()
+            scroll.setHasVerticalScroller_(natural_height > visible_h)
+        previous_height = None
+        if hasattr(self._widget_content, "frame"):
+            try:
+                previous_height = float(self._widget_content.frame().size.height)
+            except Exception:
+                previous_height = None
         self._widget_content.setFrame_(AppKit.NSMakeRect(0, 0, content_w, natural_height))
+        self._widget_keep_top_visible(previous_height, natural_height)
         viewport = self._widget_panel.contentView().bounds() if self._widget_panel is not None else bounds
         self._widget_last_layout_size = (int(viewport.size.width), int(viewport.size.height))
         self._clear_widget_content()

@@ -353,6 +353,65 @@ class DashboardLayoutTests(unittest.TestCase):
         )
 
 
+class _TitledPanel(_ResizablePanel):
+    """A panel whose frame carries a 28pt title bar above the content."""
+
+    def frameRectForContentRect_(self, rect):
+        return _Frame(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height + 28)
+
+
+class _Clip:
+    def __init__(self, height, origin_y=0):
+        self._bounds = _Frame(0, origin_y, 640, height)
+        self.scrolled_to = None
+
+    def bounds(self):
+        return self._bounds
+
+    def scrollToPoint_(self, point):
+        self.scrolled_to = point
+
+
+class _Scroll:
+    def __init__(self, clip):
+        self._clip = clip
+
+    def contentView(self):
+        return self._clip
+
+
+class WidgetViewportTests(unittest.TestCase):
+    def test_window_frame_reserves_the_title_bar_above_the_content(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        panel = _TitledPanel()
+        app._widget_panel = panel
+        with mock.patch.object(menubar.AppKit.NSScreen, "mainScreen", return_value=None), \
+                mock.patch.object(menubar.AppKit, "NSMakeRect", side_effect=lambda x, y, w, h: _Frame(x, y, w, h)):
+            app._widget_resize_panel(500)
+
+        # 500pt of dashboard needs a 528pt window, or the header is clipped.
+        self.assertEqual(panel.frame().size.height, 528)
+
+    def test_tall_dashboard_opens_at_its_top_edge(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        clip = _Clip(height=600)
+        app._widget_panel = mock.MagicMock(contentView=mock.MagicMock(return_value=_Scroll(clip)))
+        with mock.patch.object(menubar.AppKit, "NSMakePoint", side_effect=_Point):
+            app._widget_keep_top_visible(None, 900)
+
+        # Non-flipped document: the top edge is visible at origin y = 900 - 600.
+        self.assertEqual(clip.scrolled_to.y, 300)
+
+    def test_refresh_keeps_the_users_distance_from_the_top(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        clip = _Clip(height=600, origin_y=200)  # scrolled 100pt down from the top of a 900pt page
+        app._widget_panel = mock.MagicMock(contentView=mock.MagicMock(return_value=_Scroll(clip)))
+        with mock.patch.object(menubar.AppKit, "NSMakePoint", side_effect=_Point):
+            app._widget_keep_top_visible(900, 950)
+
+        self.assertEqual(clip.scrolled_to.y, 250)
+
+
 class CJKUnderPosixLocaleTests(unittest.TestCase):
     """The packaged app runs with LC_CTYPE=C.
 
