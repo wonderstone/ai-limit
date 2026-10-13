@@ -108,6 +108,27 @@ ANSI_RE = re.compile(
 )
 
 
+# browser_cookie3 falls back to a dummy key when `security` cannot read
+# "Chrome Safe Storage" (login keychain locked), and every cookie then fails to
+# decrypt with this message. Cookies are present; only the key is unreachable.
+CHROME_KEYCHAIN_LOCKED_MARKER = "Unable to get key for cookie decryption"
+
+
+def _chrome_keychain_locked(errors) -> bool:
+    return any(CHROME_KEYCHAIN_LOCKED_MARKER in str(err) for err in errors)
+
+
+def _keychain_locked_error(error_cls):
+    err = error_cls(
+        t(
+            "macOS 钥匙串已锁定，读不到 Chrome 登录态；解锁后点立即刷新",
+            "macOS keychain is locked, so Chrome sign-ins can't be read; unlock it and refresh",
+        )
+    )
+    err.keychain_locked = True
+    return err
+
+
 class ClaudeWebError(Exception):
     pass
 
@@ -199,6 +220,8 @@ def _claude_web_context(referer: str) -> tuple[str, dict]:
             errs.append(f"{name}: {exc}")
 
     if not cookies:
+        if _chrome_keychain_locked(errs):
+            raise _keychain_locked_error(ClaudeWebError)
         detail = f" ({'; '.join(errs)})" if errs else ""
         raise ClaudeWebError(
             t(
@@ -528,6 +551,8 @@ def _load_chatgpt_cookies():
                 return cookies
         except Exception as exc:
             errs.append(f"{name}: {exc}")
+    if _chrome_keychain_locked(errs):
+        raise _keychain_locked_error(CodexWebError)
     detail = f" ({'; '.join(errs)})" if errs else ""
     raise CodexWebError(
         t(
@@ -1939,6 +1964,8 @@ def _gemini_app_cookie_context(timeout: int):
     try:
         jar = browser_cookie3.chrome(domain_name=".google.com")
     except Exception as exc:
+        if _chrome_keychain_locked([exc]):
+            raise _keychain_locked_error(GeminiAppUsageError) from exc
         raise GeminiAppUsageError(f"cannot read Chrome cookies: {exc}") from exc
 
     if not any(cookie.name in {"SID", "__Secure-1PSID", "__Secure-3PSID"} for cookie in jar):
@@ -2940,6 +2967,8 @@ def _load_grok_cookies():
                 return cookies
         except Exception as exc:
             errs.append(f"{name}: {exc}")
+    if _chrome_keychain_locked(errs):
+        raise _keychain_locked_error(GrokAuthError)
     detail = f" ({'; '.join(errs)})" if errs else ""
     raise GrokAuthError(
         t(

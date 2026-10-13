@@ -518,6 +518,40 @@ def _codex_transient_error(codex):
         )
     )
 
+def _error_result(exc, message=None):
+    result = {"error": message or str(exc)}
+    if getattr(exc, "keychain_locked", False):
+        result["keychain_locked"] = True
+    return result
+
+
+def _keep_through_keychain_lock(previous, candidate):
+    """Hold the last good reading while the login keychain is locked.
+
+    A locked keychain only hides the Chrome cookie key; the quota itself has
+    not changed, so blanking the card would be less truthful than showing the
+    previous numbers marked as stale. Real errors still replace the data.
+    """
+    if not (isinstance(candidate, dict) and candidate.get("keychain_locked")):
+        return candidate
+    if not isinstance(previous, dict) or not previous or previous.get("error"):
+        return candidate
+    kept = dict(previous)
+    kept["stale_reason"] = "keychain_locked"
+    kept.setdefault("stale_since", datetime.datetime.now().timestamp())
+    return kept
+
+
+def _stale_note(data, lang):
+    if not isinstance(data, dict) or data.get("stale_reason") != "keychain_locked":
+        return None
+    try:
+        since = datetime.datetime.fromtimestamp(float(data.get("stale_since"))).strftime("%H:%M")
+    except (TypeError, ValueError, OSError):
+        since = "?"
+    return _tr(lang, f"旧数据({since})", f"stale ({since})")
+
+
 def _codex_window_jump(previous, candidate, value_key, reset_key):
     if not isinstance(previous, dict) or not isinstance(candidate, dict):
         return False
@@ -590,7 +624,7 @@ def _fetch_claude(lang):
         msg = str(e)
         if "JSON" in msg or "DOCTYPE" in msg or "html" in msg.lower():
             msg = _tr(lang, "网络不可用或需重新登录 claude.ai", "Network error or re-login at claude.ai required")
-        return {"error": msg}
+        return _error_result(e, msg)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -737,7 +771,7 @@ def _fetch_gemini_app(lang):
             "final_url": data.get("final_url"),
         }
     except GeminiAppUsageError as e:
-        return {"error": str(e)}
+        return _error_result(e)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -796,9 +830,9 @@ def _fetch_grok(lang):
             "source": data.get("source") or "grok.com GrokBuildBilling/GetGrokCreditsConfig",
         }
     except GrokAuthError as e:
-        return {"error": str(e)}
+        return _error_result(e)
     except GrokUsageError as e:
-        return {"error": str(e)}
+        return _error_result(e)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -1399,7 +1433,7 @@ class AiLimitApp(rumps.App):
             return
         claude, codex, deepseek, google, gemini, copilot, grok = pending
         if claude is not None:
-            self._claude = claude
+            self._claude = _keep_through_keychain_lock(self._claude, claude)
         if codex is not None:
             if _codex_transient_error(codex) and isinstance(self._codex, dict) and not self._codex.get("error"):
                 codex = None
@@ -1412,11 +1446,11 @@ class AiLimitApp(rumps.App):
         if google is not None:
             self._google = google
         if gemini is not None:
-            self._gemini = gemini
+            self._gemini = _keep_through_keychain_lock(self._gemini, gemini)
         if copilot is not None:
             self._copilot = copilot
         if grok is not None:
-            self._grok = grok
+            self._grok = _keep_through_keychain_lock(self._grok, grok)
         _save_cache(
             self._claude,
             {
@@ -1519,7 +1553,11 @@ class AiLimitApp(rumps.App):
             elif claude:
                 plan = _fmt_plan(claude.get("plan"), lang)
                 self._claude_header.title = f"Claude Code{plan}"
-                self._claude_source.title = _tr(lang, "  来源：browser live", "  Source: browser live")
+                note = _stale_note(claude, lang)
+                if note:
+                    self._claude_source.title = _tr(lang, f"  来源：{note}，钥匙串已锁定", f"  Source: {note}, keychain locked")
+                else:
+                    self._claude_source.title = _tr(lang, "  来源：browser live", "  Source: browser live")
                 c5_reset = _fmt_reset_iso(claude["5h_reset"], lang)
                 c7_reset = _fmt_reset_iso(claude["7d_reset"], lang)
                 self._claude_5h.title = _detail_text("5h", claude["5h_left"], c5_reset, lang)
@@ -2234,7 +2272,8 @@ class AiLimitApp(rumps.App):
                 for item in block:
                     if item.get("type") == "section":
                         cy = y(block_top, 20)
-                        self._widget_add_label(item["name"], name_x, cy + 2, 150, 16, size=12, weight="bold", color=item["color"])
+                        label = f"{item['name']} · {item['note']}" if item.get("note") else item["name"]
+                        self._widget_add_label(label, name_x, cy + 2, 150, 16, size=12, weight="bold", color=item["color"])
                         self._widget_add_box(ring_x, cy + 8, max(30, bx + detail_w - ring_x), 1, "#323238", radius=0)
                     else:
                         row_h = self._widget_detail_row_height(item)
@@ -2277,7 +2316,13 @@ class AiLimitApp(rumps.App):
         value_w = 64
         value_x = x + w - 14 - value_w
         detail_w = max(70, value_x - detail_x - 8)
-        self._widget_add_label(card["title"], x + 14, y + (h - 17) / 2, title_w, 17, size=12, weight="bold")
+        note = card.get("note")
+        if note:
+            # Stale readings keep their numbers; the title column says so.
+            self._widget_add_label(card["title"], x + 14, y + h / 2 - 1, title_w, 17, size=12, weight="bold")
+            self._widget_add_label(note, x + 14, y + h / 2 - 16, title_w, 14, size=9, color="#fbbf24")
+        else:
+            self._widget_add_label(card["title"], x + 14, y + (h - 17) / 2, title_w, 17, size=12, weight="bold")
 
         metrics = card.get("metrics") or []
         if metrics:
@@ -2505,6 +2550,7 @@ class AiLimitApp(rumps.App):
             "subtitle": subtitle,
             "metrics": metrics,
             "reset_text": reset_text,
+            "note": _stale_note(data, lang),
             "bg": bg,
             "border": border,
         }
@@ -2730,8 +2776,12 @@ class AiLimitApp(rumps.App):
         lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
 
-        def section(name, color):
-            rows.append({"type": "section", "name": name, "color": color})
+        def section(name, color, data=None):
+            row = {"type": "section", "name": name, "color": color}
+            note = _stale_note(data, lang)
+            if note:
+                row["note"] = note
+            rows.append(row)
 
         def append(name, pct=None, disabled=False, value=None, reset=None, unknown=False, kind="percent", color=None):
             if disabled and not include_disabled:
@@ -2757,7 +2807,7 @@ class AiLimitApp(rumps.App):
             })
 
         if "claude" in services and self._claude and not self._claude.get("error"):
-            section("Claude", "#c4b5fd")
+            section("Claude", "#c4b5fd", self._claude)
             append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
         if "codex" in services:
@@ -2788,7 +2838,7 @@ class AiLimitApp(rumps.App):
         if "gemini" in services:
             entries = self._widget_gemini_entries()
             if entries:
-                section("Gemini", "#d8b4fe")
+                section("Gemini", "#d8b4fe", self._gemini)
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"))
         if "copilot" in services:
@@ -2799,7 +2849,7 @@ class AiLimitApp(rumps.App):
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
         if "grok" in services and self._grok and not self._grok.get("error"):
             data = self._grok
-            section("Grok", "#d4d4d8")
+            section("Grok", "#d4d4d8", data)
             append(
                 "Grok / Monthly" if data.get("window") == "monthly" else "Grok / Weekly",
                 data.get("left"),
@@ -2952,6 +3002,9 @@ class AiLimitApp(rumps.App):
 
     def _widget_section(self, title, data, source=None):
         lines = [title]
+        note = _stale_note(data, self._state["lang"])
+        if note:
+            lines.append(_tr(self._state["lang"], f"  ! {note}：macOS 钥匙串已锁定，解锁后自动更新", f"  ! {note}: macOS keychain is locked; updates resume after unlock"))
         if data.get("error"):
             lines.append(f"  ! {_short_widget_error(data.get('error'))}")
         elif source:
