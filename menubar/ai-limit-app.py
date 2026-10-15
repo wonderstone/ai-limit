@@ -2082,6 +2082,7 @@ class AiLimitApp(rumps.App):
     _WIDGET_SECTION_ADVANCE = 22
     _WIDGET_QUOTA_ROW_ADVANCE = 26
     _WIDGET_BLOCK_GAP = 14
+    _WIDGET_WIDE_VALUE_WIDTH = 110
 
     def _widget_header_height(self, content_w, credit_summary):
         if content_w < 470:
@@ -2368,10 +2369,17 @@ class AiLimitApp(rumps.App):
                         name = item["name"]
                         if item.get("reset"):
                             name = f"{name}  ↻ {item['reset']}"
-                        self._widget_add_label(name, name_x, cy + 5, name_w, 16, size=10, color="#d4d4d8")
-                        if item.get("kind") == "percent":
+                        # Balance and credit rows draw no ring, so their value
+                        # can use the ring's space; 58px only fits "100%" and
+                        # cut "$200.00 / $200" or "45,244.69" to an ellipsis.
+                        is_percent = item.get("kind") == "percent"
+                        row_value_w = value_w if is_percent else self._WIDGET_WIDE_VALUE_WIDTH
+                        row_value_x = bx + detail_w - row_value_w
+                        row_name_w = name_w if is_percent else max(40, row_value_x - name_x - 8)
+                        self._widget_add_label(name, name_x, cy + 5, row_name_w, 16, size=10, color="#d4d4d8")
+                        if is_percent:
                             self._widget_add_ring(ring_x, cy + 5, ring_size, item["pct"])
-                        self._widget_add_label(item["value"], value_x, cy + 4, value_w, 18, size=11, weight="bold", color=item["color"], align="right")
+                        self._widget_add_label(item["value"], row_value_x, cy + 4, row_value_w, 18, size=11, weight="bold", color=item["color"], align="right")
                     block_top += self._widget_detail_row_advance(item)
                 block_top += detail_gap
         top += max(detail_heights, default=0)

@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from ai_limit import providers
-from test_widget_layout import menubar
+from test_widget_layout import _Panel, menubar
 
 
 # Trimmed from a real /prepaid/credits response for a Max 20x account, whose
@@ -120,6 +120,22 @@ class MenubarTest(unittest.TestCase):
     def test_no_api_credit_adds_no_row(self):
         app = self._app({"5h_left": 34, "7d_left": 67, "api_credit": None})
         self.assertFalse([row for row in app._widget_detail_rows() if row.get("name") == "API 额度"])
+
+    def test_credit_value_gets_the_wide_column_and_percent_rows_do_not(self):
+        credit = providers._normalize_claude_api_credits(API_ORG, CREDITS)
+        app = self._app({"5h_left": 34, "7d_left": 67, "api_credit": credit})
+        app._widget_panel = _Panel(width=640, height=500)
+        app._widget_content = mock.MagicMock()
+        labels = []
+        with mock.patch.object(menubar.AiLimitApp, "_widget_alert_rows", return_value=[]), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_label", side_effect=lambda text, x, y, w, h, **kw: labels.append((text, w))), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_box"), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_add_ring"), \
+                mock.patch.object(menubar.AiLimitApp, "_clear_widget_content", lambda _self: None):
+            app._render_widget_dashboard()
+        widths = dict(labels)
+        self.assertEqual(widths["$200.00 / $200"], menubar.AiLimitApp._WIDGET_WIDE_VALUE_WIDTH)
+        self.assertEqual(widths["34%"], 58)
 
     def test_console_failure_does_not_hide_chat_quota(self):
         usage = {"five_hour": {"utilization": 66}, "seven_day": {"utilization": 33}}
