@@ -317,6 +317,173 @@ def live_claude_plan(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> str | None:
     return None
 
 
+CLAUDE_PLATFORM_ORIGIN = "https://platform.claude.com"
+CLAUDE_PLATFORM_BILLING_URL = f"{CLAUDE_PLATFORM_ORIGIN}/settings/billing"
+
+
+def _claude_platform_headers() -> dict | None:
+    """Browser headers for platform.claude.com, or ``None`` when never signed in.
+
+    The Claude Platform console keeps its own ``sessionKey`` on
+    ``.platform.claude.com``, separate from the claude.ai one, so an account
+    that only uses the chat app simply has no console session.
+    """
+    try:
+        import browser_cookie3
+    except ImportError as exc:
+        raise ClaudeWebError("browser_cookie3 not installed") from exc
+    errs = []
+    cookies = []
+    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+        try:
+            cookies = [(c.name, c.value) for c in loader(domain_name="platform.claude.com")]
+            if cookies:
+                break
+        except Exception as exc:
+            errs.append(f"{name}: {exc}")
+    if not cookies:
+        if _chrome_keychain_locked(errs):
+            raise _keychain_locked_error(ClaudeWebError)
+        return None
+    if not any(name == "sessionKey" for name, _ in cookies):
+        return None
+    return {
+        "Cookie": "; ".join(f"{name}={value}" for name, value in cookies),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": CLAUDE_PLATFORM_ORIGIN,
+        "Referer": CLAUDE_PLATFORM_BILLING_URL,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+def _claude_platform_get(path: str, headers: dict, timeout: int):
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(f"{CLAUDE_PLATFORM_ORIGIN}{path}", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise ClaudeWebError(
+            f"platform.claude.com HTTP {exc.code}: {exc.read()[:200].decode(errors='replace')}"
+        ) from exc
+    except Exception as exc:
+        raise ClaudeWebError(f"platform.claude.com: {exc}") from exc
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ClaudeWebError("platform.claude.com: non-JSON response") from exc
+
+
+def _claude_money(value) -> float | None:
+    """Read the console's ``{"amount_minor": 20000, "exponent": 2}`` amounts."""
+    if not isinstance(value, dict):
+        return None
+    minor = value.get("amount_minor")
+    exponent = value.get("exponent", 2)
+    try:
+        return float(minor) / (10 ** int(exponent))
+    except (TypeError, ValueError):
+        return None
+
+
+def _claude_balance_amount(balance) -> float | None:
+    if not isinstance(balance, dict):
+        return None
+    for key in ("money", "credits"):
+        amount = _claude_money(balance.get(key))
+        if amount is not None:
+            return amount
+    return None
+
+
+def _claude_tranche(raw: dict) -> dict:
+    remaining = _claude_balance_amount(raw.get("remaining"))
+    if remaining is None and raw.get("remaining_amount_minor_units") is not None:
+        remaining = float(raw["remaining_amount_minor_units"]) / 100
+    granted = _claude_balance_amount(raw.get("granted"))
+    if granted is None and raw.get("granted_amount_minor_units") is not None:
+        granted = float(raw["granted_amount_minor_units"]) / 100
+    return {
+        "name": raw.get("name"),
+        "program_id": raw.get("program_id"),
+        "remaining": remaining,
+        "granted": granted,
+        "expires_at": raw.get("expires_at"),
+        "granted_at": raw.get("granted_at"),
+    }
+
+
+def _normalize_claude_api_credits(org: dict, credits: dict) -> dict:
+    balance = _claude_balance_amount(credits.get("balance"))
+    if balance is None and credits.get("balance_credits") is not None:
+        balance = float(credits["balance_credits"])
+    if balance is None and credits.get("amount") is not None:
+        # Legacy shape: a bare integer amount in cents.
+        balance = float(credits["amount"]) / 100
+    tranches = [
+        _claude_tranche(raw)
+        for raw in (credits.get("tranches") or []) + (credits.get("promo_tranches") or [])
+        if isinstance(raw, dict)
+    ]
+    granted_values = [item["granted"] for item in tranches if item.get("granted") is not None]
+    granted = sum(granted_values) if granted_values else None
+    remaining_percent = None
+    if balance is not None and granted:
+        remaining_percent = max(0, min(100, int(round(balance / granted * 100))))
+    return {
+        "org_name": org.get("name"),
+        "currency": credits.get("currency") or "USD",
+        "balance": balance,
+        "granted": granted,
+        "remaining_percent": remaining_percent,
+        "expires_at": credits.get("next_expires_at")
+        or min((item["expires_at"] for item in tranches if item.get("expires_at")), default=None),
+        "tranches": tranches,
+        "auto_reload": bool(credits.get("auto_reload_settings")),
+        "source": "platform.claude.com",
+    }
+
+
+def live_claude_api_credits(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict | None:
+    """Return the Claude Platform API credit balance shown on settings/billing.
+
+    Returns ``None`` when there is no console session or no API organization,
+    so callers can treat "this user has no API account" as nothing to show
+    rather than as an error.
+    """
+    headers = _claude_platform_headers()
+    if headers is None:
+        return None
+    orgs = _claude_platform_get("/api/organizations", headers, timeout)
+    if not isinstance(orgs, list):
+        raise ClaudeWebError("platform.claude.com: unexpected organizations response")
+    # The same sign-in also lists the claude.ai subscription org; only the
+    # API org carries a prepaid credit balance.
+    api_orgs = [
+        org
+        for org in orgs
+        if isinstance(org, dict)
+        and (org.get("billing_type") == "prepaid" or "api" in (org.get("capabilities") or []))
+    ]
+    if not api_orgs:
+        return None
+    org = next((item for item in api_orgs if item.get("billing_type") == "prepaid"), api_orgs[0])
+    credits = _claude_platform_get(f"/api/organizations/{org['uuid']}/prepaid/credits", headers, timeout)
+    if not isinstance(credits, dict):
+        raise ClaudeWebError("platform.claude.com: unexpected credits response")
+    return _normalize_claude_api_credits(org, credits)
+
+
 def live_codex_rate_limits(timeout: int = REMOTE_TIMEOUT_SEC):
     if not shutil.which("codex"):
         raise CodexRemoteError("codex command not found")

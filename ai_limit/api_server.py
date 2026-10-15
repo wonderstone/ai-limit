@@ -39,6 +39,7 @@ from ai_limit.providers import (  # noqa: E402
     has_gemini_app_cookies,
     has_google_oauth_creds,
     live_claude_plan,
+    live_claude_api_credits,
     live_claude_usage,
     live_deepseek_balance,
     live_gemini_app_usage,
@@ -251,6 +252,10 @@ def _claude_payload() -> dict[str, Any]:
             plan = live_claude_plan(timeout=2)
         except Exception:  # noqa: BLE001
             plan = None
+        try:
+            api_credit = live_claude_api_credits(timeout=3)
+        except Exception:  # noqa: BLE001
+            api_credit = None
         return {
             "provider": "claude",
             "available": True,
@@ -261,6 +266,7 @@ def _claude_payload() -> dict[str, Any]:
             "7d_left": int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
+            "api_credit": api_credit,
         }
     except ClaudeWebError as exc:
         return {"provider": "claude", "available": False, "observed_at": _utc_now(), "error": str(exc)}

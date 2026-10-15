@@ -138,8 +138,11 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 |------|------|
 | token 消耗明细 | `~/.claude/projects/**/*.jsonl` |
 | 实时剩余额度 | 浏览器 Cookie → `claude.ai/api/organizations/{orgId}/usage` |
+| API 额度（platform.claude.com/settings/billing） | `platform.claude.com` 浏览器 Cookie → `/api/organizations`（prepaid 的 API 组织）→ `/api/organizations/{orgId}/prepaid/credits` |
 
 额度获取依赖 Chrome/Firefox 的 claude.ai 登录态。Cookie 失效时自动回退，显示失败原因和网页链接。
+
+只有登录了 platform.claude.com 且账号下有 API 组织时（比如 Max 订阅每月附送的 API 额度），才会出现 API 额度这一行。它是附加信息：控制台读不到时，聊天额度照常显示。
 
 ### CodeX
 

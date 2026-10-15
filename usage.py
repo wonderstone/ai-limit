@@ -30,6 +30,7 @@ from ai_limit.providers import (
     has_google_oauth_creds,
     live_gemini_app_usage,
     live_claude_plan,
+    live_claude_api_credits,
     live_claude_usage,
     live_deepseek_balance,
     live_google_quota,
@@ -389,6 +390,35 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
         print(f"\n  ⚠️  {t('Claude 周额度百分比本地不可得', 'Claude quota unavailable locally')}  →  {CLAUDE_USAGE_URL}  ({t('Cmd+双击打开', 'Cmd+double-click to open')})")
 
 
+def render_claude_api_credit():
+    """Print the Claude Platform API credit, if this account has an API org."""
+    try:
+        credit = live_claude_api_credits()
+    except ClaudeWebError as exc:
+        print(f"\n  ⚠️  {t('Claude API 额度读取失败', 'Claude API credit fetch failed')}: {exc}")
+        return
+    if not credit or credit.get("balance") is None:
+        return
+    balance = credit["balance"]
+    granted = credit.get("granted")
+    print(f"\n  {_BOLD}{t('API 额度', 'API credit')}{_RST}  {_DIM}platform.claude.com{_RST}")
+    pct = credit.get("remaining_percent")
+    amount = f"${balance:,.2f}" + (f" / ${granted:,.2f}" if granted else "")
+    if pct is not None:
+        print(f"  {_colored_bar(pct)}  {_bc(pct)}{_BOLD}{amount}{_RST}  ({t(f'剩余 {pct}%', f'{pct}% left')})")
+    else:
+        print(f"  {_BOLD}{amount}{_RST}")
+    for tranche in credit.get("tranches") or []:
+        expires = tranche.get("expires_at")
+        when = ""
+        if expires:
+            try:
+                when = f"  {t('到期', 'expires')} {fmt_reset_dt(datetime.datetime.fromisoformat(expires.replace('Z', '+00:00')).astimezone())}"
+            except ValueError:
+                when = f"  {t('到期', 'expires')} {expires}"
+        print(f"  {_DIM}{tranche.get('name') or t('额度', 'credit')}{when}{_RST}")
+
+
 def render_codex(since: datetime.datetime):
     title = "CodeX (OpenAI GPT-5)"
     print(f"\n{_DIM}{SEP}{_RST}")
@@ -739,6 +769,7 @@ def main():
         web_error = str(e)
 
     render_claude(claude_totals, since, days_count, web_data=web_data, web_error=web_error, detail=args.detail)
+    render_claude_api_credit()
     render_codex(since)
     if has_deepseek_api_key():
         render_deepseek()

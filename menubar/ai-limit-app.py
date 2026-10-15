@@ -43,11 +43,13 @@ from usage import (
     __version__,
     fmt_money,
     live_claude_plan,
+    live_claude_api_credits,
     live_claude_usage,
     latest_codex_rate_limits,
     epoch_to_local,
 )
 from ai_limit.providers import (
+    CLAUDE_PLATFORM_BILLING_URL,
     live_codex_web_usage,
     ClaudeWebError,
     CodexWebError,
@@ -613,12 +615,19 @@ def _fetch_claude(lang):
             plan = live_claude_plan()
         except Exception:
             plan = None
+        # The Platform console balance is optional extra detail: a missing
+        # console sign-in or a console outage must not hide the chat quota.
+        try:
+            api_credit = live_claude_api_credits()
+        except Exception:
+            api_credit = None
         return {
             "5h_left":  int(round(100 - float(five_h.get("utilization", 0)))),
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
             "plan":     plan,
+            "api_credit": api_credit,
             "source":   "browser",
         }
     except ClaudeWebError as e:
@@ -1141,6 +1150,22 @@ def _format_codex_credit_balance(value):
     return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
+def _claude_api_credit_text(credit):
+    """``$199.99 / $200`` for the Platform API credit, or ``None``."""
+    if not isinstance(credit, dict):
+        return None
+    balance = credit.get("balance")
+    if not isinstance(balance, (int, float)):
+        return None
+    symbol = "$" if (credit.get("currency") or "USD").upper() == "USD" else ""
+    text = f"{symbol}{balance:,.2f}"
+    granted = credit.get("granted")
+    if isinstance(granted, (int, float)) and granted > 0:
+        whole = f"{granted:,.0f}" if float(granted).is_integer() else f"{granted:,.2f}"
+        text += f" / {symbol}{whole}"
+    return text
+
+
 def _codex_credit_summary(data, lang="zh"):
     credits = data.get("credits") if isinstance(data, dict) else None
     if not isinstance(credits, dict):
@@ -1315,6 +1340,10 @@ class AiLimitApp(rumps.App):
             "打开 Claude 用量页" if lang == "zh" else "Open Claude usage",
             callback=lambda _: webbrowser.open("https://claude.ai/settings/usage"),
         )
+        self._claude_billing_dash = rumps.MenuItem(
+            "打开 Claude API 账单页" if lang == "zh" else "Open Claude API billing",
+            callback=lambda _: webbrowser.open(CLAUDE_PLATFORM_BILLING_URL),
+        )
         self._deepseek_dash = rumps.MenuItem(
             "打开 DeepSeek 用量页" if lang == "zh" else "Open DeepSeek usage",
             callback=lambda _: webbrowser.open(_DEEPSEEK_USAGE_URL),
@@ -1378,6 +1407,7 @@ class AiLimitApp(rumps.App):
             None,
             self._codex_dash,
             self._claude_dash,
+            self._claude_billing_dash,
             self._deepseek_dash,
             self._google_dash,
             self._gemini_dash,
@@ -2867,6 +2897,17 @@ class AiLimitApp(rumps.App):
             section("Claude", "#c4b5fd", self._claude)
             append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
+            api_credit = self._claude.get("api_credit")
+            api_text = _claude_api_credit_text(api_credit)
+            if api_text:
+                append(
+                    _tr(lang, "API 额度", "API credit"),
+                    api_credit.get("remaining_percent"),
+                    value=api_text,
+                    reset=api_credit.get("expires_at"),
+                    kind="credit",
+                    color="#c4b5fd",
+                )
         if "codex" in services:
             entries = self._widget_codex_entries()
             if entries:
@@ -3095,6 +3136,11 @@ class AiLimitApp(rumps.App):
                 lines.append(f"  Plan: {plan}")
             lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
             lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
+            api_text = _claude_api_credit_text(data.get("api_credit"))
+            if api_text:
+                expires = (data.get("api_credit") or {}).get("expires_at")
+                suffix = f"    {_tr(lang, '到期', 'expires')} {_fmt_widget_reset_epoch_or_iso(expires, lang)}" if expires else ""
+                lines.append(f"  {_tr(lang, 'API 额度', 'API credit')}: {api_text}{suffix}")
         lines.append("")
         return lines
 
@@ -3279,6 +3325,7 @@ class AiLimitApp(rumps.App):
         self._refresh_item.title = _tr(lang, "立即刷新", "Refresh now")
         self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
+        self._claude_billing_dash.title = _tr(lang, "打开 Claude API 账单页", "Open Claude API billing")
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")

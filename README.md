@@ -138,8 +138,11 @@ For the maintenance-level explanation of how ai-limit obtains quota data without
 |------|--------|
 | Token usage details | `~/.claude/projects/**/*.jsonl` |
 | Live quota | Browser cookie → `claude.ai/api/organizations/{orgId}/usage` |
+| API credit (platform.claude.com/settings/billing) | Browser cookie for `platform.claude.com` → `/api/organizations` (prepaid API org) → `/api/organizations/{orgId}/prepaid/credits` |
 
 Quota reading requires an active browser session on claude.ai. Falls back gracefully with an error message and a direct link if the cookie is missing or expired.
+
+The API credit row appears only when you are signed in to platform.claude.com and have an API organization — for example the monthly API credit included with Max plans. It is optional: if the console is unreachable, the chat quota still shows.
 
 ### Codex
 

@@ -13,6 +13,7 @@ It should not automate browser windows in the background. A browser may be opene
 | Provider | Local proof of identity | Request target | Primary payload | Background browser automation |
 | --- | --- | --- | --- | --- |
 | Claude | Browser cookie for `claude.ai` | `https://claude.ai/api/organizations/{orgId}/usage` | JSON | No |
+| Claude Platform API credit | Browser cookie for `platform.claude.com` (`sessionKey`) | `https://platform.claude.com/api/organizations/{orgId}/prepaid/credits` | JSON | No |
 | Codex / ChatGPT | Browser cookie for `chatgpt.com`, then web access token | `https://chatgpt.com/backend-api/codex/usage` | JSON | No |
 | Gemini App | Chrome Google cookies plus page request tokens | `https://gemini.google.com/_/BardChatUi/data/batchexecute` | batchexecute JSON frames | No |
 | Google Code Assist / Gemini CLI | `~/.gemini/oauth_creds.json` | `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` | JSON | No |
@@ -71,6 +72,23 @@ Risk profile:
 
 - Unofficial internal web endpoint.
 - Depends on `lastActiveOrg` and Claude's current response shape.
+- No background browser launch.
+
+### Claude Platform API credit
+
+The settings/billing page of the Claude Platform console shows a prepaid API credit balance; Max plans include a monthly scoped API credit there. The console keeps its own `sessionKey` on `.platform.claude.com`, separate from claude.ai.
+
+Flow:
+
+1. Read Chrome or Firefox cookies for `platform.claude.com`. No `sessionKey` means no console sign-in, which is treated as "nothing to show", not as an error.
+2. `GET https://platform.claude.com/api/organizations`. The same sign-in lists the claude.ai subscription org (`billing_type: stripe_subscription`) and the API org (`billing_type: prepaid`, capability `api`); only the API org carries a credit balance.
+3. `GET /api/organizations/{orgId}/prepaid/credits`.
+4. Normalize: `balance.money` or `balance.credits` (`{amount_minor, exponent}`) is the balance; the sum of `tranches[] + promo_tranches[]` `granted` amounts is the grant used for the percentage; `next_expires_at` is the expiry.
+
+Risk profile:
+
+- Unofficial internal console endpoint; the money shape has already moved from a bare `amount` in cents to `{amount_minor, exponent}`, and the legacy `amount` is still read as a fallback.
+- Optional: a failure leaves `api_credit` empty instead of hiding the chat quota.
 - No background browser launch.
 
 ## Codex / ChatGPT
