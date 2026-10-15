@@ -93,6 +93,49 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(credit["balance"], 200.0)
 
 
+class _Cookie:
+    def __init__(self, name, value="v"):
+        self.name = name
+        self.value = value
+
+
+class ProfileScanTest(unittest.TestCase):
+    """The console session may live in any Chrome profile."""
+
+    def _run(self, jars, firefox=()):
+        paths = [mock.MagicMock(name=name) for name in jars]
+        for path, name in zip(paths, jars):
+            path.parent.name = name
+            path.__str__ = mock.MagicMock(return_value=name)
+
+        def chrome(cookie_file=None, domain_name=None):
+            result = jars[cookie_file]
+            if isinstance(result, Exception):
+                raise result
+            return [_Cookie(name) for name in result]
+
+        cookie_module = mock.MagicMock(chrome=chrome, firefox=mock.MagicMock(return_value=[_Cookie(n) for n in firefox]))
+        with mock.patch.dict("sys.modules", {"browser_cookie3": cookie_module}), \
+                mock.patch.object(providers, "_chrome_profile_cookie_files", return_value=paths):
+            return providers._claude_platform_headers()
+
+    def test_session_in_a_second_profile_is_found(self):
+        # Default only carries analytics cookies from a past visit.
+        headers = self._run({"Default": ["_dd_s_v2", "anthropic-device-id"], "Profile 1": ["sessionKey", "__cf_bm"]})
+
+        self.assertIn("sessionKey=", headers["Cookie"])
+
+    def test_no_session_anywhere_means_nothing_to_show(self):
+        self.assertIsNone(self._run({"Default": ["_dd_s_v2"], "Profile 1": []}))
+
+    def test_locked_keychain_is_reported_not_hidden(self):
+        locked = Exception(providers.CHROME_KEYCHAIN_LOCKED_MARKER)
+        with self.assertRaises(providers.ClaudeWebError) as ctx:
+            self._run({"Default": locked, "Profile 1": locked})
+
+        self.assertTrue(getattr(ctx.exception, "keychain_locked", False))
+
+
 class MenubarTest(unittest.TestCase):
     def _app(self, claude):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)

@@ -334,18 +334,29 @@ def _claude_platform_headers() -> dict | None:
         raise ClaudeWebError("browser_cookie3 not installed") from exc
     errs = []
     cookies = []
-    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+    # The console may be signed in under any Chrome profile, and a profile
+    # that merely visited the site still holds analytics cookies, so keep
+    # looking until a jar actually carries the console sessionKey.
+    loaders = [
+        (
+            f"Chrome/{(path.parent.parent if path.parent.name == 'Network' else path.parent).name}",
+            lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="platform.claude.com"),
+        )
+        for path in _chrome_profile_cookie_files()
+    ]
+    loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="platform.claude.com")))
+    for name, loader in loaders:
         try:
-            cookies = [(c.name, c.value) for c in loader(domain_name="platform.claude.com")]
-            if cookies:
-                break
+            jar = [(c.name, c.value) for c in loader()]
         except Exception as exc:
             errs.append(f"{name}: {exc}")
+            continue
+        if any(cookie_name == "sessionKey" for cookie_name, _ in jar):
+            cookies = jar
+            break
     if not cookies:
         if _chrome_keychain_locked(errs):
             raise _keychain_locked_error(ClaudeWebError)
-        return None
-    if not any(name == "sessionKey" for name, _ in cookies):
         return None
     return {
         "Cookie": "; ".join(f"{name}={value}" for name, value in cookies),
