@@ -52,6 +52,7 @@ from ai_limit.providers import (
     ClaudeWebError,
     CodexWebError,
     CodexAuthError,
+    CodexSessionExpiredError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     codex_5h_remaining_percent,
     codex_window_remaining_percent,
@@ -639,6 +640,12 @@ def _fetch_codex(lang):
             latest_codex_rate_limits, allow_app_server_fallback=False
         )
         if not rl:
+            if source == "session_expired":
+                return {"error": _tr(
+                    lang,
+                    "ChatGPT 登录已过期：请在 Chrome 打开 chatgpt.com 重新登录",
+                    "ChatGPT sign-in expired: open chatgpt.com in Chrome and sign in again",
+                )}
             if source == "no_access":
                 return {"error": _tr(
                     lang,
@@ -676,6 +683,10 @@ def _fetch_codex(lang):
             "group_count": summary.get("group_count") or len(rl.get("groups") or []),
             "bucket_count": summary.get("bucket_count") or len(buckets),
         }
+    except CodexSessionExpiredError:
+        return {"error": _tr(lang,
+            "ChatGPT 登录已过期：请在 Chrome 打开 chatgpt.com 重新登录",
+            "ChatGPT sign-in expired: open chatgpt.com in Chrome and sign in again")}
     except CodexAuthError:
         return {"error": _tr(lang,
             "无 Codex 权限（可能未订阅或需重新登录）",

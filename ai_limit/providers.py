@@ -145,6 +145,16 @@ class CodexAuthError(CodexWebError):
     """401 / 403: unauthenticated or missing Codex access."""
 
 
+class CodexSessionExpiredError(CodexAuthError):
+    """The chatgpt.com browser session can no longer mint a valid access token.
+
+    The session cookie can outlive the token it refreshes: next-auth then keeps
+    returning the expired accessToken with ``error: RefreshAccessTokenError``,
+    and the usage endpoint answers 401 "token is expired". That is a sign-in
+    problem in the browser, not missing Codex access, so it gets its own type.
+    """
+
+
 class DeepSeekError(Exception):
     pass
 
@@ -590,6 +600,13 @@ def _chatgpt_headers(
     return headers
 
 
+def _chatgpt_session_expired_message() -> str:
+    return t(
+        "ChatGPT 登录已过期：请在 Chrome 打开 chatgpt.com 重新登录",
+        "ChatGPT sign-in expired: open chatgpt.com in Chrome and sign in again",
+    )
+
+
 def _get_chatgpt_access_token(cookie_header: str, timeout: int) -> str:
     import urllib.error
     import urllib.request
@@ -611,6 +628,8 @@ def _get_chatgpt_access_token(cookie_header: str, timeout: int) -> str:
     except json.JSONDecodeError as exc:
         raise CodexWebError("session: non-JSON response") from exc
 
+    if data.get("error") == "RefreshAccessTokenError":
+        raise CodexSessionExpiredError(_chatgpt_session_expired_message())
     token = data.get("accessToken")
     if not token:
         raise CodexWebError(
@@ -750,6 +769,13 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            try:
+                detail = exc.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            if "token is expired" in detail:
+                raise CodexSessionExpiredError(_chatgpt_session_expired_message()) from exc
         if exc.code in (401, 403):
             raise CodexAuthError(
                 t(
@@ -876,6 +902,8 @@ def current_codex_rate_limits(latest_codex_rate_limits_func, *, allow_app_server
         if resets_at:
             save_window_cache(float(resets_at))
         return ts, rate_limits, "web", None
+    except CodexSessionExpiredError as exc:
+        return None, None, "session_expired", str(exc)
     except CodexAuthError as exc:
         return None, None, "no_access", str(exc)
     except CodexWebError as exc:

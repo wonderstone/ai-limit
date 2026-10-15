@@ -30,6 +30,7 @@ from ai_limit.i18n import LANG, t
 from ai_limit.providers import (
     ClaudeWebError,
     CodexAuthError,
+    CodexSessionExpiredError,
     CodexWebError,
     DeepSeekAuthError,
     DeepSeekError,
@@ -187,6 +188,8 @@ def _fetch_codex():
             "7d_reset": codex_window_reset_time(rl, "weekly") or secondary.get("resets_at"),
             "plan": rl.get("plan_type") or "?",
         }
+    except CodexSessionExpiredError as e:
+        return {"error": str(e)}
     except CodexAuthError:
         return {"error": "no Codex access"}
     except CodexWebError as e:

@@ -397,8 +397,10 @@ def render_codex(since: datetime.datetime):
 
     ts, rl, source, fallback_reason = resolve_codex_rate_limits(latest_codex_rate_limits)
     if not rl:
-        if source == "no_access":
-            print(f"  {_WARN}{t('未检测到 Codex 权限', 'No Codex access detected')}{_RST}")
+        if source == "session_expired":
+            print(f"  {_WRN}{fallback_reason}{_RST}")
+        elif source == "no_access":
+            print(f"  {_WRN}{t('未检测到 Codex 权限', 'No Codex access detected')}{_RST}")
             print(f"  {_DIM}{fallback_reason}{_RST}")
         else:
             if fallback_reason:
