@@ -338,11 +338,8 @@ def _claude_platform_headers() -> dict | None:
     # that merely visited the site still holds analytics cookies, so keep
     # looking until a jar actually carries the console sessionKey.
     loaders = [
-        (
-            f"Chrome/{(path.parent.parent if path.parent.name == 'Network' else path.parent).name}",
-            lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="platform.claude.com"),
-        )
-        for path in _chrome_profile_cookie_files()
+        (label, lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="platform.claude.com"))
+        for label, path in _chromium_profile_cookie_files()
     ]
     loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="platform.claude.com")))
     for name, loader in loaders:
@@ -730,15 +727,44 @@ def _load_chatgpt_cookies():
                 "browser_cookie3 not installed, run: pip install browser-cookie3",
             )
         ) from exc
-    errs = []
-    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+    # Raises when no profile holds a session, so the list is never empty.
+    return _chatgpt_cookie_candidates(browser_cookie3)[0][1]
+
+
+def _chatgpt_session_cookie(name: str) -> bool:
+    # next-auth splits a long session token into .0/.1 chunks.
+    return name.startswith("__Secure-next-auth.session-token")
+
+
+def _chatgpt_cookie_candidates(browser_cookie3=None) -> list[tuple[str, list]]:
+    """Every browser profile that holds a chatgpt.com session, in search order.
+
+    More than one profile can carry a session, and a stale one keeps its
+    cookie long after OpenAI stops refreshing it, so callers try each in turn
+    instead of trusting the first.
+    """
+    if browser_cookie3 is None:
         try:
-            jar = loader(domain_name=".chatgpt.com")
-            cookies = [(c.name, c.value) for c in jar]
-            if cookies:
-                return cookies
+            import browser_cookie3
+        except ImportError as exc:
+            raise CodexWebError("browser_cookie3 not installed, run: pip install browser-cookie3") from exc
+    loaders = [
+        (label, lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name=".chatgpt.com"))
+        for label, path in _chromium_profile_cookie_files()
+    ]
+    loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name=".chatgpt.com")))
+    candidates = []
+    errs = []
+    for name, loader in loaders:
+        try:
+            cookies = [(c.name, c.value) for c in loader()]
         except Exception as exc:
             errs.append(f"{name}: {exc}")
+            continue
+        if any(_chatgpt_session_cookie(cookie_name) for cookie_name, _ in cookies):
+            candidates.append((name, cookies))
+    if candidates:
+        return candidates
     if _chrome_keychain_locked(errs):
         raise _keychain_locked_error(CodexWebError)
     detail = f" ({'; '.join(errs)})" if errs else ""
@@ -936,7 +962,25 @@ def live_codex_web_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     import urllib.error
     import urllib.request
 
-    cookies = _load_chatgpt_cookies()
+    candidates = _chatgpt_cookie_candidates()
+    auth_error = None
+    for source, cookies in candidates:
+        try:
+            ts, data = _codex_web_usage_with(cookies, timeout)
+        except CodexAuthError as exc:
+            # This profile's session is expired or lacks Codex; another
+            # profile may be the one the user signed in again with.
+            auth_error = auth_error or exc
+            continue
+        data["cookie_source"] = source
+        return ts, data
+    raise auth_error
+
+
+def _codex_web_usage_with(cookies, timeout: int):
+    import urllib.error
+    import urllib.request
+
     cookie_header = "; ".join(f"{name}={value}" for name, value in cookies)
     token = _get_chatgpt_access_token(cookie_header, timeout)
     req = urllib.request.Request(
@@ -3134,6 +3178,24 @@ def _chrome_profile_cookie_files() -> list[pathlib.Path]:
     return files
 
 
+def _chromium_profile_cookie_files() -> list[tuple[str, pathlib.Path]]:
+    """Cookie DBs of every Chrome profile, then every Chrome Canary profile.
+
+    Canary has no keychain item of its own on macOS: it encrypts with the
+    same "Chrome Safe Storage" key, so browser_cookie3.chrome() can open its
+    DB through ``cookie_file``. Labels look like ``Chrome Canary/Default``.
+    """
+    files = []
+    for browser in ("Chrome", "Chrome Canary"):
+        root = pathlib.Path.home() / "Library" / "Application Support" / "Google" / browser
+        for profile in [root / "Default"] + sorted(root.glob("Profile *")):
+            for candidate in (profile / "Network" / "Cookies", profile / "Cookies"):
+                if candidate.is_file():
+                    files.append((f"{browser}/{profile.name}", candidate))
+                    break
+    return files
+
+
 def _load_grok_cookies():
     try:
         import browser_cookie3
@@ -3165,6 +3227,12 @@ def _load_grok_cookies():
         for path in cookie_files
     ]
     if not selected_profile:
+        # Unpinned: Chrome Canary profiles come after Chrome's, then Firefox.
+        loaders.extend(
+            (label, lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="grok.com"))
+            for label, path in _chromium_profile_cookie_files()
+            if label.startswith("Chrome Canary/")
+        )
         loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="grok.com")))
     for name, loader in loaders:
         try:

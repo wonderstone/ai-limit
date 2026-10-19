@@ -103,10 +103,7 @@ class ProfileScanTest(unittest.TestCase):
     """The console session may live in any Chrome profile."""
 
     def _run(self, jars, firefox=()):
-        paths = [mock.MagicMock(name=name) for name in jars]
-        for path, name in zip(paths, jars):
-            path.parent.name = name
-            path.__str__ = mock.MagicMock(return_value=name)
+        sources = [(f"Chrome/{name}", name) for name in jars]
 
         def chrome(cookie_file=None, domain_name=None):
             result = jars[cookie_file]
@@ -116,7 +113,7 @@ class ProfileScanTest(unittest.TestCase):
 
         cookie_module = mock.MagicMock(chrome=chrome, firefox=mock.MagicMock(return_value=[_Cookie(n) for n in firefox]))
         with mock.patch.dict("sys.modules", {"browser_cookie3": cookie_module}), \
-                mock.patch.object(providers, "_chrome_profile_cookie_files", return_value=paths):
+                mock.patch.object(providers, "_chromium_profile_cookie_files", return_value=sources):
             return providers._claude_platform_headers()
 
     def test_session_in_a_second_profile_is_found(self):

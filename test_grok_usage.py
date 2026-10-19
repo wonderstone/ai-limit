@@ -118,6 +118,8 @@ class GrokProfileSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(providers, "GROK_CHROME_PROFILE_PATH", pathlib.Path(tmp) / "missing"), mock.patch.object(
                 providers, "_chrome_profile_cookie_files", return_value=[]
+            ), mock.patch.object(
+                providers, "_chromium_profile_cookie_files", return_value=[]
             ), mock.patch("browser_cookie3.firefox", return_value=[SimpleNamespace(name="sso", value="test")]) as firefox:
                 self.assertEqual(providers._load_grok_cookies(), [("sso", "test")])
                 firefox.assert_called_once()
