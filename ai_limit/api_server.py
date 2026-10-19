@@ -328,6 +328,7 @@ def _gemini_payload() -> dict[str, Any] | None:
             "available": bool(data.get("available", True)),
             "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
             "source": data.get("source") or "gemini.google.com/usage",
+            "subscription_status": data.get("subscription_status", "unknown"),
             "cached": bool(data.get("cached")),
             "cache_age_seconds": data.get("cache_age_seconds"),
             "cache_stale": bool(data.get("cache_stale")),

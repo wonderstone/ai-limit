@@ -66,6 +66,7 @@ from ai_limit.providers import (
     DeepSeekAuthError,
     DeepSeekError,
     GeminiAppUsageError,
+    gemini_has_verified_quota,
     GoogleQuotaAuthError,
     GoogleQuotaError,
     GROK_USAGE_URL,
@@ -784,6 +785,7 @@ def _fetch_gemini_app(lang):
             "bucket_count": summary.get("bucket_count", 0),
             "model_count": summary.get("model_count", 0),
             "available": data.get("available"),
+            "subscription_status": data.get("subscription_status", "unknown"),
             "unavailable_reason": data.get("unavailable_reason"),
             "buckets": data.get("buckets") or [],
             "models": data.get("models") or [],
@@ -1570,7 +1572,7 @@ class AiLimitApp(rumps.App):
         show_codex  = "codex"  in services
         show_deepseek = "deepseek" in services
         show_google = "google" in services
-        show_gemini = "gemini" in services
+        show_gemini = "gemini" in services and gemini_has_verified_quota(self._gemini or {})
         claude = self._claude or {}
         codex  = self._codex  or {}
         deepseek = self._deepseek or {}
@@ -2503,6 +2505,8 @@ class AiLimitApp(rumps.App):
         for service, title, symbol, accent, data in specs:
             if service not in services:
                 continue
+            if service == "gemini" and not gemini_has_verified_quota(data):
+                continue
             card = self._widget_card_for_service(service, title, symbol, accent, data)
             cards.append(card)
         return cards
@@ -3026,7 +3030,7 @@ class AiLimitApp(rumps.App):
 
     def _widget_gemini_entries(self):
         data = self._gemini or {}
-        if data.get("error"):
+        if data.get("error") or not gemini_has_verified_quota(data):
             return []
         entries = []
         buckets = data.get("buckets") or []
@@ -3217,6 +3221,8 @@ class AiLimitApp(rumps.App):
     def _widget_gemini_lines(self):
         lang = self._state["lang"]
         data = self._gemini or {}
+        if not gemini_has_verified_quota(data):
+            return []
         lines = self._widget_section("Gemini App", data, data.get("source") or "gemini.google.com/usage")
         if data and not data.get("error"):
             if data.get("unavailable_reason"):

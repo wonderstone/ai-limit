@@ -2420,6 +2420,32 @@ def _gemini_epoch_iso(value):
     return datetime.datetime.fromtimestamp(seconds, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def gemini_has_verified_quota(data: dict) -> bool:
+    """Usage counters alone do not establish a current paid entitlement."""
+    return data.get("subscription_status") == "active" and data.get("available") is True
+
+
+def _guard_gemini_entitlement(data: dict) -> dict:
+    """Suppress unverified remaining quota, including pre-upgrade caches.
+
+    The current undocumented usage RPC has no verified subscription field.
+    Do not interpret its positional booleans, zero usage, or model list as
+    proof of either payment or cancellation. Keep usage for diagnostics.
+    """
+    if gemini_has_verified_quota(data):
+        return data
+    guarded = dict(data)
+    guarded["subscription_status"] = data.get("subscription_status") or "unknown"
+    guarded["available"] = False
+    guarded["unavailable_reason"] = "Gemini subscription entitlement is not verified"
+    guarded["summary"] = {**(data.get("summary") or {}), "remaining_percent": None}
+    guarded["buckets"] = [
+        {**bucket, "remaining_percent": None} for bucket in data.get("buckets") or []
+    ]
+    guarded["primary"] = {**(data.get("primary") or {}), "remaining_percent": None}
+    return guarded
+
+
 def _parse_gemini_app_usage_rpc(payloads: list) -> dict:
     response = payloads[0] if payloads else None
     if not isinstance(response, list) or len(response) < 2 or not isinstance(response[1], list):
@@ -2533,11 +2559,11 @@ def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     if cached is not None:
         return (
             datetime.datetime.now(datetime.timezone.utc),
-            _mark_gemini_app_usage_cached(cached, age, stale=False),
+            _guard_gemini_entitlement(_mark_gemini_app_usage_cached(cached, age, stale=False)),
         )
 
     try:
-        return datetime.datetime.now(datetime.timezone.utc), _live_gemini_app_usage(timeout)
+        return datetime.datetime.now(datetime.timezone.utc), _guard_gemini_entitlement(_live_gemini_app_usage(timeout))
     except Exception:
         # Serving an older snapshot beats showing nothing, but it must be
         # labelled so the caller can tell it apart from a fresh reading.
@@ -2546,7 +2572,7 @@ def live_gemini_app_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
             raise
         return (
             datetime.datetime.now(datetime.timezone.utc),
-            _mark_gemini_app_usage_cached(stale, stale_age, stale=True),
+            _guard_gemini_entitlement(_mark_gemini_app_usage_cached(stale, stale_age, stale=True)),
         )
 
 
