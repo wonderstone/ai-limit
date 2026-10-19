@@ -2428,16 +2428,18 @@ def gemini_has_verified_quota(data: dict) -> bool:
 def _guard_gemini_entitlement(data: dict) -> dict:
     """Suppress unverified remaining quota, including pre-upgrade caches.
 
-    The current undocumented usage RPC has no verified subscription field.
-    Do not interpret its positional booleans, zero usage, or model list as
-    proof of either payment or cancellation. Keep usage for diagnostics.
+    Use the RPC plan tier, never its overage boolean, zero usage or model list.
+    Unknown/new tiers stay unknown until their meaning can be verified.
     """
     if gemini_has_verified_quota(data):
         return data
     guarded = dict(data)
     guarded["subscription_status"] = data.get("subscription_status") or "unknown"
     guarded["available"] = False
-    guarded["unavailable_reason"] = "Gemini subscription entitlement is not verified"
+    guarded["unavailable_reason"] = (
+        "Gemini account is on the free tier" if guarded["subscription_status"] == "inactive"
+        else "Gemini subscription entitlement is not verified"
+    )
     guarded["summary"] = {**(data.get("summary") or {}), "remaining_percent": None}
     guarded["buckets"] = [
         {**bucket, "remaining_percent": None} for bucket in data.get("buckets") or []
@@ -2451,9 +2453,18 @@ def _parse_gemini_app_usage_rpc(payloads: list) -> dict:
     if not isinstance(response, list) or len(response) < 2 or not isinstance(response[1], list):
         raise GeminiAppUsageError("Gemini usage RPC returned an unexpected payload")
 
+    # GetUsageInfo (jSf9Qc), field 0: plan tier. Field 2 is overage preference,
+    # not subscription status. Mapping: Gemini-API client._fetch_usage_info.
+    tier_id = response[0] if type(response[0]) is int else None
+    plan = {1: "Free", 2: "Pro", 3: "Ultra", 4: "Plus", 6: "Ultra"}.get(tier_id)
+    status = "inactive" if tier_id == 1 else "active" if plan else "unknown"
+
     buckets = []
     for raw_bucket in response[1]:
         if not isinstance(raw_bucket, list) or len(raw_bucket) < 4:
+            continue
+        # Type 3 is an AI-credit balance, not a time-window percentage.
+        if raw_bucket[2] not in (1, 2):
             continue
         usage_fraction = raw_bucket[1]
         bucket_kind = raw_bucket[2]
@@ -2483,16 +2494,21 @@ def _parse_gemini_app_usage_rpc(payloads: list) -> dict:
             }
         )
 
-    if not buckets:
+    if not buckets and status == "active":
         raise GeminiAppUsageError("Gemini usage RPC did not contain quota buckets")
     primary = min(
         buckets,
         key=lambda bucket: 101 if bucket.get("remaining_percent") is None else bucket["remaining_percent"],
+        default={},
     )
     return {
         "source": "gemini.google.com/usage RPC jSf9Qc",
         "final_url": GEMINI_APP_USAGE_URL,
         "available": True,
+        "subscription_status": status,
+        "plan": plan,
+        "plan_tier_id": tier_id,
+        "subscription_source": "jSf9Qc.plan_tier",
         "unavailable_reason": None,
         "summary": {
             "remaining_percent": primary.get("remaining_percent"),
@@ -2523,7 +2539,7 @@ def _load_gemini_app_usage_cache(max_age_sec: int = GEMINI_APP_USAGE_CACHE_TTL_S
         cached_at = float(data.get("cached_at", 0))
         age = time.time() - cached_at
         payload = data.get("data")
-        if payload is not None and 0 <= age <= max_age_sec:
+        if data.get("schema_version") == 2 and payload is not None and 0 <= age <= max_age_sec:
             return payload, int(age)
     except Exception:
         pass
@@ -2546,7 +2562,7 @@ def _save_gemini_app_usage_cache(data: dict):
     try:
         GEMINI_APP_USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         GEMINI_APP_USAGE_CACHE.write_text(
-            json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False),
+            json.dumps({"schema_version": 2, "cached_at": time.time(), "data": data}, ensure_ascii=False),
             encoding="utf-8",
         )
     except Exception:
@@ -2842,6 +2858,12 @@ def _copilot_int(value) -> int | None:
 
 
 def _normalize_copilot_quota(data: dict) -> dict:
+    plan = data.get("copilot_plan")
+    plan = plan.strip().lower() if isinstance(plan, str) else None
+    status = (
+        "inactive" if plan in {"free", "free_limited_copilot", "none"}
+        else "active" if plan in _COPILOT_PLAN_LABELS else "unknown"
+    )
     token_based_billing = bool(data.get("token_based_billing"))
     reset_time = data.get("quota_reset_date_utc") or data.get("quota_reset_date")
     snapshots = data.get("quota_snapshots") or {}
@@ -2889,11 +2911,18 @@ def _normalize_copilot_quota(data: dict) -> dict:
     if primary is None:
         metered = [bucket for bucket in buckets if not bucket["unlimited"] and bucket["remaining_percent"] is not None]
         primary = min(metered, key=lambda bucket: bucket["remaining_percent"]) if metered else (buckets[0] if buckets else None)
-    if primary is None:
+    if primary is None and status == "active":
         raise CopilotQuotaError("Copilot response did not include quota snapshots")
+    primary = primary or {}
+    if status != "active":
+        buckets = [{**bucket, "remaining_percent": None} for bucket in buckets]
+        primary = {**primary, "remaining_percent": None}
 
     return {
         "source": "api.github.com copilot_internal/user",
+        "available": status == "active",
+        "subscription_status": status,
+        "subscription_source": "copilot_plan",
         "login": data.get("login"),
         "plan": data.get("copilot_plan"),
         "plan_label": _copilot_plan_label(data.get("copilot_plan")),
@@ -2940,12 +2969,12 @@ def live_copilot_quota(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
                 )
             ) from exc
         if exc.code == 404:
-            raise CopilotAuthError(
-                t(
-                    "HTTP 404：该 GitHub 账号没有 Copilot 订阅",
-                    "HTTP 404: this GitHub account has no Copilot subscription",
-                )
-            ) from exc
+            # A successful sign-in with no entitlement is a normal state.
+            # Keep polling so resubscription restores the service automatically.
+            normalized = _normalize_copilot_quota({"copilot_plan": "none"})
+            normalized["subscription_source"] = "copilot_internal/user HTTP 404"
+            normalized["token_source"] = token_source
+            return datetime.datetime.now(datetime.timezone.utc), normalized
         raise CopilotQuotaError(f"HTTP {exc.code}") from exc
     except Exception as exc:
         raise CopilotQuotaError(str(exc)) from exc

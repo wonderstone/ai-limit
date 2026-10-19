@@ -116,6 +116,31 @@ Risk profile:
 
 ## Gemini App
 
+### Subscription visibility (0.3.41)
+
+The `jSf9Qc` GetUsageInfo response's first field identifies the current tier:
+`1=Free`, `2=Pro`, `3=Ultra`, `4=Plus`, `6=Ultra`. This mapping is corroborated
+by [Gemini-API's `_fetch_usage_info` implementation](https://github.com/HanaokaYuzu/Gemini-API/blob/master/src/gemini_webapi/client.py)
+and the local free-account response. It is an internal, version-sensitive
+contract, not a public Google billing API. Unrecognized tiers remain `unknown`.
+The overage-preference boolean and zero usage are not subscription evidence.
+
+Only an `active` entitlement is displayed. `inactive` (free tier) and `unknown`
+states hide the quota, but do not disable polling or change enabled services.
+Each fresh response re-evaluates entitlement, allowing automatic restoration
+after resubscription. Gemini cache schema 2 expires after the configured TTL
+(120 seconds by default); older cache schemas are rejected. Temporary failures
+may serve a labelled stale snapshot for up to 30 minutes, not a cancellation
+decision. AI-credit metrics are excluded from percentage windows.
+
+Copilot uses the named `copilot_plan` field: known paid/organization/student
+entitlements are active; `free`, `free_limited_copilot`, and no subscription
+(HTTP 404) are inactive. Unknown plans stay unknown; HTTP 401/403 and network
+failures remain errors. Both providers retain visibility while their current
+paid entitlement is active, even if renewal was cancelled. No future billing
+date is inferred. The UI checks subscription status on every refresh, and legacy
+unverified snapshots cannot restore a quota display.
+
 Gemini App quota uses the active Google browser session for `gemini.google.com`.
 
 Flow:

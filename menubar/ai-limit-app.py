@@ -786,6 +786,8 @@ def _fetch_gemini_app(lang):
             "model_count": summary.get("model_count", 0),
             "available": data.get("available"),
             "subscription_status": data.get("subscription_status", "unknown"),
+            "plan": data.get("plan"),
+            "subscription_source": data.get("subscription_source"),
             "unavailable_reason": data.get("unavailable_reason"),
             "buckets": data.get("buckets") or [],
             "models": data.get("models") or [],
@@ -808,6 +810,9 @@ def _fetch_copilot(lang):
         _ts, data = live_copilot_quota()
         summary = data.get("summary") or {}
         return {
+            "subscription_status": data.get("subscription_status", "unknown"),
+            "available": data.get("available", False),
+            "subscription_source": data.get("subscription_source"),
             "left": summary.get("remaining_percent"),
             "remaining": summary.get("remaining"),
             "used": summary.get("used"),
@@ -2507,6 +2512,8 @@ class AiLimitApp(rumps.App):
                 continue
             if service == "gemini" and not gemini_has_verified_quota(data):
                 continue
+            if service == "copilot" and data.get("subscription_status") != "active":
+                continue
             card = self._widget_card_for_service(service, title, symbol, accent, data)
             cards.append(card)
         return cards
@@ -3047,7 +3054,7 @@ class AiLimitApp(rumps.App):
 
     def _widget_copilot_entries(self):
         data = self._copilot or {}
-        if data.get("error"):
+        if data.get("error") or data.get("subscription_status") != "active":
             return []
         entries = []
         metered = [
@@ -3241,6 +3248,8 @@ class AiLimitApp(rumps.App):
     def _widget_copilot_lines(self):
         lang = self._state["lang"]
         data = self._copilot or {}
+        if data.get("subscription_status") != "active":
+            return []
         lines = self._widget_section("GitHub Copilot", data, data.get("source") or "api.github.com copilot_internal/user")
         if data and not data.get("error"):
             plan = data.get("plan")

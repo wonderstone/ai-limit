@@ -16,7 +16,7 @@ class GeminiEntitlementTests(unittest.TestCase):
 
     def test_zero_usage_is_not_subscription_evidence(self):
         guarded = providers._guard_gemini_entitlement(self.snapshot)
-        self.assertEqual(guarded["subscription_status"], "unknown")
+        self.assertEqual(guarded["subscription_status"], "inactive")
         self.assertFalse(guarded["available"])
         self.assertIsNone(guarded["summary"]["remaining_percent"])
         self.assertTrue(all(b["remaining_percent"] is None for b in guarded["buckets"]))
@@ -59,5 +59,5 @@ class GeminiEntitlementTests(unittest.TestCase):
         guarded = providers._guard_gemini_entitlement(self.snapshot)
         with mock.patch.object(menubar, "live_gemini_app_usage", return_value=(None, guarded)):
             result = menubar._fetch_gemini_app("en")
-        self.assertEqual(result["subscription_status"], "unknown")
+        self.assertEqual(result["subscription_status"], "inactive")
         self.assertIsNone(result["left"])
