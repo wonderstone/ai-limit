@@ -128,6 +128,17 @@ AI_LIMIT_LANG=zh ai-limit   # force Chinese
 
 ---
 
+### Local JSON API
+
+`ai_limit/api_server.py` serves read-only quota JSON on `127.0.0.1:17655`: `/health`, `/v1/quota` (all providers), and `/v1/quota/{codex,claude,copilot,grok}`. To start it at login as a user LaunchAgent (`com.zhuchenxi.ai-limit-api`, logs in `~/Library/Logs/ai-limit/`):
+
+```bash
+./install-api-agent.sh            # install / reinstall
+./install-api-agent.sh uninstall  # remove
+```
+
+It uses pyenv `3.13.9` by default; set `AI_LIMIT_PYTHON` to use another interpreter. Codex app-server fallback stays opt-in per request (`?allow_app_server=1`).
+
 ## Data Sources
 
 For the maintenance-level explanation of how ai-limit obtains quota data without background browser automation, see [docs/data-source-architecture.md](docs/data-source-architecture.md).

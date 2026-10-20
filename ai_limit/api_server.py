@@ -26,11 +26,15 @@ from ai_limit.providers import (  # noqa: E402
     ClaudeWebError,
     CodexAuthError,
     CodexWebError,
+    CopilotAuthError,
+    CopilotQuotaError,
     DeepSeekAuthError,
     DeepSeekError,
     GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
+    GrokAuthError,
+    GrokUsageError,
     codex_5h_remaining_percent,
     codex_window_remaining_percent,
     codex_window_reset_time,
@@ -42,8 +46,10 @@ from ai_limit.providers import (  # noqa: E402
     live_claude_api_credits,
     live_claude_usage,
     live_deepseek_balance,
+    live_copilot_quota,
     live_gemini_app_usage,
     live_google_quota,
+    live_grok_usage,
 )
 from ai_limit.llm_api import has_llm_api_provider_config, live_llm_api_balances  # noqa: E402
 
@@ -361,6 +367,58 @@ def _llm_api_payload() -> dict[str, Any] | None:
         return {"provider": "llm_api", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
 
 
+def _copilot_payload() -> dict[str, Any]:
+    try:
+        observed_at, data = live_copilot_quota(timeout=5)
+        summary = data.get("summary") or {}
+        return {
+            "provider": "copilot",
+            "available": bool(data.get("available")),
+            "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "source": data.get("source") or "api.github.com copilot_internal/user",
+            "subscription_status": data.get("subscription_status", "unknown"),
+            "plan": data.get("plan"),
+            "plan_label": data.get("plan_label"),
+            "unit": data.get("unit"),
+            "window": "monthly",
+            "remaining_percent": summary.get("remaining_percent"),
+            "remaining": summary.get("remaining"),
+            "entitlement": summary.get("entitlement"),
+            "used": summary.get("used"),
+            "overage_permitted": summary.get("overage_permitted"),
+            "overage_count": summary.get("overage_count"),
+            "reset_time": data.get("reset_time"),
+            "summary": summary,
+            "buckets": data.get("buckets") or [],
+        }
+    except (CopilotAuthError, CopilotQuotaError) as exc:
+        return {"provider": "copilot", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"provider": "copilot", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
+
+
+def _grok_payload() -> dict[str, Any]:
+    try:
+        observed_at, data = live_grok_usage(timeout=5)
+        summary = data.get("summary") or {}
+        return {
+            "provider": "grok",
+            "available": True,
+            "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "source": data.get("source") or "grok.com",
+            "window": summary.get("window") or data.get("period_type"),
+            "remaining_percent": summary.get("remaining_percent"),
+            "used_percent": summary.get("used_percent"),
+            "reset_time": data.get("reset_time"),
+            "summary": summary,
+            "products": data.get("products") or [],
+        }
+    except (GrokAuthError, GrokUsageError) as exc:
+        return {"provider": "grok", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"provider": "grok", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
+
+
 def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
     # Provider probes are independent remote operations. Running them serially
     # made one slow source hold the entire aggregate endpoint for up to a
@@ -373,6 +431,8 @@ def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
         "google": _google_payload,
         "gemini": _gemini_payload,
         "llm_api": _llm_api_payload,
+        "copilot": _copilot_payload,
+        "grok": _grok_payload,
     }
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="ai-limit-provider")
     futures = {executor.submit(probe): name for name, probe in probes.items()}
@@ -424,6 +484,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/quota/claude", "/v1/quota/claude"}:
             self._write_json(_claude_payload())
+            return
+        if parsed.path in {"/quota/copilot", "/v1/quota/copilot"}:
+            self._write_json(_copilot_payload())
+            return
+        if parsed.path in {"/quota/grok", "/v1/quota/grok"}:
+            self._write_json(_grok_payload())
             return
         self._write_json({"error": "not_found", "path": parsed.path}, status=404)
 

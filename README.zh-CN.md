@@ -128,6 +128,17 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 ---
 
+### 本地 JSON API
+
+`ai_limit/api_server.py` 在 `127.0.0.1:17655` 提供只读额度 JSON：`/health`、`/v1/quota`（全部 provider）、`/v1/quota/{codex,claude,copilot,grok}`。登录时自动启动（用户 LaunchAgent `com.zhuchenxi.ai-limit-api`，日志在 `~/Library/Logs/ai-limit/`）：
+
+```bash
+./install-api-agent.sh            # 安装 / 重装
+./install-api-agent.sh uninstall  # 卸载
+```
+
+默认使用 pyenv `3.13.9`，可用 `AI_LIMIT_PYTHON` 指定其他解释器。Codex app-server 兜底仍需按请求显式开启（`?allow_app_server=1`）。
+
 ## 数据来源
 
 关于 ai-limit 如何在不做后台浏览器自动化的前提下获取额度数据，见维护者文档：[docs/data-source-architecture.md](docs/data-source-architecture.md)。

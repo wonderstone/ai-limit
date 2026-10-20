@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import time
 import unittest
 from unittest import mock
@@ -22,6 +23,8 @@ class AggregateIsolationTests(unittest.TestCase):
             mock.patch.object(api_server, "_google_payload", side_effect=slow),
             mock.patch.object(api_server, "_gemini_payload", return_value=None),
             mock.patch.object(api_server, "_llm_api_payload", return_value=None),
+            mock.patch.object(api_server, "_copilot_payload", return_value=None),
+            mock.patch.object(api_server, "_grok_payload", return_value=None),
         ):
             started = time.monotonic()
             payload = api_server.quota_payload()
@@ -89,6 +92,107 @@ class AggregateIsolationTests(unittest.TestCase):
 
         self.assertEqual(payload, fresh_disk)
         current.assert_not_called()
+
+
+class CopilotGrokPayloadTests(unittest.TestCase):
+    NOW = dt.datetime(2026, 10, 20, 8, 0, tzinfo=dt.timezone.utc)
+
+    def test_copilot_payload_normalizes_monthly_credits(self):
+        data = {
+            "source": "api.github.com copilot_internal/user",
+            "available": True,
+            "subscription_status": "active",
+            "plan": "individual_pro",
+            "plan_label": "Pro",
+            "unit": "AI credits",
+            "reset_time": "2026-11-01T00:00:00Z",
+            "buckets": [{"bucket_id": "premium_interactions"}],
+            "summary": {
+                "remaining_percent": 72,
+                "remaining": 216,
+                "used": 84,
+                "entitlement": 300,
+                "overage_permitted": True,
+                "overage_count": 0,
+            },
+        }
+        with mock.patch.object(api_server, "live_copilot_quota", return_value=(self.NOW, data)):
+            payload = api_server._copilot_payload()
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["provider"], "copilot")
+        self.assertEqual(payload["remaining_percent"], 72)
+        self.assertEqual((payload["remaining"], payload["entitlement"]), (216, 300))
+        self.assertTrue(payload["overage_permitted"])
+        self.assertEqual(payload["reset_time"], "2026-11-01T00:00:00Z")
+        self.assertEqual(payload["observed_at"], "2026-10-20T08:00:00Z")
+
+    def test_grok_payload_normalizes_weekly_pool(self):
+        data = {
+            "source": "grok.com GrokBuildBilling/GetGrokCreditsConfig",
+            "period_type": "weekly",
+            "reset_time": "2026-10-25T00:00:00Z",
+            "products": [],
+            "summary": {"used_percent": 31, "remaining_percent": 69, "window": "weekly"},
+        }
+        with mock.patch.object(api_server, "live_grok_usage", return_value=(self.NOW, data)):
+            payload = api_server._grok_payload()
+        self.assertTrue(payload["available"])
+        self.assertEqual(payload["window"], "weekly")
+        self.assertEqual(payload["remaining_percent"], 69)
+        self.assertEqual(payload["reset_time"], "2026-10-25T00:00:00Z")
+
+    def test_errors_degrade_to_unavailable_entries(self):
+        cases = [
+            ("live_copilot_quota", api_server.CopilotAuthError("expired"), api_server._copilot_payload),
+            ("live_copilot_quota", RuntimeError("boom"), api_server._copilot_payload),
+            ("live_grok_usage", api_server.GrokUsageError("not on pool"), api_server._grok_payload),
+            ("live_grok_usage", OSError("no cookies"), api_server._grok_payload),
+        ]
+        for target, exc, probe in cases:
+            with self.subTest(target=target, exc=type(exc).__name__):
+                with mock.patch.object(api_server, target, side_effect=exc):
+                    payload = probe()
+                self.assertFalse(payload["available"])
+                self.assertIn("error", payload)
+
+    def test_aggregate_includes_copilot_and_grok_and_survives_failures(self):
+        with (
+            mock.patch.object(api_server, "_claude_payload", return_value=None),
+            mock.patch.object(api_server, "_codex_payload", return_value=None),
+            mock.patch.object(api_server, "_deepseek_payload", return_value=None),
+            mock.patch.object(api_server, "_google_payload", return_value=None),
+            mock.patch.object(api_server, "_gemini_payload", return_value=None),
+            mock.patch.object(api_server, "_llm_api_payload", return_value=None),
+            mock.patch.object(api_server, "live_copilot_quota", side_effect=RuntimeError("down")),
+            mock.patch.object(
+                api_server,
+                "live_grok_usage",
+                return_value=(self.NOW, {"summary": {"remaining_percent": 50, "window": "weekly"}}),
+            ),
+        ):
+            payload = api_server.quota_payload()
+        self.assertFalse(payload["providers"]["copilot"]["available"])
+        self.assertEqual(payload["providers"]["grok"]["remaining_percent"], 50)
+
+    def test_slow_grok_is_cut_by_aggregate_deadline(self):
+        def slow():
+            time.sleep(0.2)
+            return {"provider": "grok", "available": True}
+
+        with (
+            mock.patch.object(api_server, "AGGREGATE_DEADLINE_SECONDS", 0.03),
+            mock.patch.object(api_server, "_claude_payload", return_value=None),
+            mock.patch.object(api_server, "_codex_payload", return_value=None),
+            mock.patch.object(api_server, "_deepseek_payload", return_value=None),
+            mock.patch.object(api_server, "_google_payload", return_value=None),
+            mock.patch.object(api_server, "_gemini_payload", return_value=None),
+            mock.patch.object(api_server, "_llm_api_payload", return_value=None),
+            mock.patch.object(api_server, "_copilot_payload", return_value={"provider": "copilot", "available": True}),
+            mock.patch.object(api_server, "_grok_payload", side_effect=slow),
+        ):
+            payload = api_server.quota_payload()
+        self.assertTrue(payload["providers"]["copilot"]["available"])
+        self.assertIn("deadline", payload["providers"]["grok"]["error"])
 
 
 if __name__ == "__main__":
