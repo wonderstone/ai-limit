@@ -186,6 +186,26 @@ class MenubarTest(unittest.TestCase):
         self.assertEqual(data["5h_left"], 34)
         self.assertIsNone(data["api_credit"])
 
+    def test_fable_weekly_limit_is_fetched_and_listed(self):
+        usage = {
+            "five_hour": {"utilization": 32},
+            "seven_day": {"utilization": 50},
+            "limits": [{
+                "kind": "weekly_scoped", "percent": 69, "resets_at": "2026-10-28T08:59:59Z",
+                "scope": {"model": {"id": None, "display_name": "Fable"}}, "is_active": True,
+            }],
+        }
+        with mock.patch.object(menubar, "live_claude_usage", return_value=usage), \
+                mock.patch.object(menubar, "live_claude_plan", return_value="Max"), \
+                mock.patch.object(menubar, "live_claude_api_credits", return_value=None):
+            data = menubar._fetch_claude("zh")
+        self.assertEqual(data["weekly_models"][0]["remaining_percent"], 31)
+        app = self._app(data)
+        fable = [row for row in app._widget_detail_rows() if row.get("name") == "Fable weekly"]
+        self.assertEqual(len(fable), 1)
+        self.assertEqual(fable[0]["pct"], 31)
+        self.assertIn("Fable weekly", "\n".join(app._widget_claude_lines()))
+
 
 if __name__ == "__main__":
     unittest.main()

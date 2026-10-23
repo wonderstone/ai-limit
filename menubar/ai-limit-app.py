@@ -48,6 +48,7 @@ from usage import (
     latest_codex_rate_limits,
     epoch_to_local,
 )
+from ai_limit.claude_limits import claude_weekly_model_limits
 from ai_limit.providers import (
     CLAUDE_PLATFORM_BILLING_URL,
     live_codex_web_usage,
@@ -627,6 +628,8 @@ def _fetch_claude(lang):
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
+            # Model-scoped weekly caps (e.g. Fable), separate from the account-wide week.
+            "weekly_models": claude_weekly_model_limits(data),
             "plan":     plan,
             "api_credit": api_credit,
             "source":   "browser",
@@ -2916,6 +2919,8 @@ class AiLimitApp(rumps.App):
             section("Claude", "#c4b5fd", self._claude)
             append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
+            for item in self._claude.get("weekly_models") or []:
+                append(f"{item['model']} weekly", item.get("remaining_percent"), reset=item.get("reset_time"))
             api_credit = self._claude.get("api_credit")
             api_text = _claude_api_credit_text(api_credit)
             if api_text:
@@ -3155,6 +3160,8 @@ class AiLimitApp(rumps.App):
                 lines.append(f"  Plan: {plan}")
             lines.append(self._widget_quota_row("5h", data.get("5h_left"), reset=data.get("5h_reset")))
             lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
+            for item in data.get("weekly_models") or []:
+                lines.append(self._widget_quota_row(f"{item['model']} weekly", item.get("remaining_percent"), reset=item.get("reset_time")))
             api_text = _claude_api_credit_text(data.get("api_credit"))
             if api_text:
                 expires = (data.get("api_credit") or {}).get("expires_at")
