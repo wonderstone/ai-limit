@@ -195,5 +195,43 @@ class CopilotGrokPayloadTests(unittest.TestCase):
         self.assertIn("deadline", payload["providers"]["grok"]["error"])
 
 
+class ClaudeWeeklyModelTests(unittest.TestCase):
+    def test_fable_weekly_scoped_limit_is_exposed(self):
+        usage = {
+            "five_hour": {"utilization": 32.0, "resets_at": "2026-10-23T04:39:59Z"},
+            "seven_day": {"utilization": 50.0, "resets_at": "2026-10-28T08:59:59Z"},
+            "limits": [
+                {"kind": "weekly_all", "percent": 50, "scope": None},
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 69,
+                    "severity": "normal",
+                    "resets_at": "2026-10-28T08:59:59Z",
+                    "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+                    "is_active": True,
+                },
+            ],
+        }
+        with (
+            mock.patch.object(api_server, "live_claude_usage", return_value=usage),
+            mock.patch.object(api_server, "live_claude_plan", return_value="Max"),
+            mock.patch.object(api_server, "live_claude_api_credits", return_value=None),
+        ):
+            payload = api_server._claude_payload()
+        self.assertEqual(payload["7d_left"], 50)
+        self.assertEqual(payload["7d_left_by_model"], {"Fable": 31})
+        self.assertEqual(payload["weekly_models"][0]["reset_time"], "2026-10-28T08:59:59Z")
+
+    def test_missing_or_malformed_limits_yield_empty(self):
+        from ai_limit.claude_limits import claude_weekly_model_limits
+
+        self.assertEqual(claude_weekly_model_limits(None), [])
+        self.assertEqual(claude_weekly_model_limits({"limits": None}), [])
+        self.assertEqual(
+            claude_weekly_model_limits({"limits": [{"kind": "weekly_scoped", "percent": "x", "scope": {"model": {"display_name": "Fable"}}}]}),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

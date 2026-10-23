@@ -14,6 +14,7 @@ import pathlib
 import sys
 from ai_limit.i18n import LANG, t
 from ai_limit.version import __version__
+from ai_limit.claude_limits import claude_weekly_model_limits
 from ai_limit.providers import (
     CLAUDE_USAGE_URL,
     CODEX_USAGE_URL,
@@ -378,6 +379,16 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
                             print(f"\n  📊 {_DIM}{t(f'按当前速率 ({rate:.1f}%/小时)，剩余 {remaining:.0f}% 约可用', f'At current rate ({rate:.1f}%/hr), {remaining:.0f}% left ≈')}{_RST} {_BOLD}{hours_left:.0f} {t('小时', 'hrs')}{_RST}")
                             printed_estimate = True
                 if not printed_estimate:
+                    print()
+            for scoped in claude_weekly_model_limits(web_data):
+                remaining, used = scoped["remaining_percent"], scoped["used_percent"]
+                r_str = f"{_bc(remaining)}{_BOLD}{remaining}%{_RST}"
+                label = t(f"{scoped['model']} 本周", f"{scoped['model']} weekly")
+                print(f"  {label}  {_colored_bar(remaining)}  {t(f'剩余 {r_str}  {_DIM}(已用 {used}%){_RST}', f'left {r_str}  {_DIM}(used {used}%){_RST}')}")
+                try:
+                    reset_dt = datetime.datetime.fromisoformat(scoped["reset_time"]).astimezone()
+                    print(f"  {_DIM}{t('重置时间', 'Resets at')}: {fmt_reset_dt(reset_dt)}{_RST}\n")
+                except Exception:
                     print()
         else:
             print(f"\n  {t('claude.ai usage 原始响应', 'claude.ai usage raw response')}: {json.dumps(web_data, ensure_ascii=False)[:400]}")

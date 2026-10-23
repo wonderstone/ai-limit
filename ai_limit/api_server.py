@@ -51,6 +51,7 @@ from ai_limit.providers import (  # noqa: E402
     live_google_quota,
     live_grok_usage,
 )
+from ai_limit.claude_limits import claude_weekly_model_limits  # noqa: E402
 from ai_limit.llm_api import has_llm_api_provider_config, live_llm_api_balances  # noqa: E402
 
 try:  # usage.py is the CLI module at repo root.
@@ -254,6 +255,7 @@ def _claude_payload() -> dict[str, Any]:
         data = live_claude_usage(timeout=5)
         five_h = data.get("five_hour") or {}
         seven_d = data.get("seven_day") or {}
+        weekly_models = claude_weekly_model_limits(data)
         try:
             plan = live_claude_plan(timeout=2)
         except Exception:  # noqa: BLE001
@@ -272,6 +274,9 @@ def _claude_payload() -> dict[str, Any]:
             "7d_left": int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
+            # Model-scoped weekly caps (e.g. Fable) on top of the account-wide 7d window.
+            "weekly_models": weekly_models,
+            "7d_left_by_model": {item["model"]: item["remaining_percent"] for item in weekly_models},
             "api_credit": api_credit,
         }
     except ClaudeWebError as exc:
