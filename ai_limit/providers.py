@@ -17,6 +17,7 @@ import urllib.request
 
 from ai_limit.i18n import t
 from ai_limit.version import __version__
+from ai_limit.keychain_status import default_keychain_locked
 
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
@@ -108,9 +109,9 @@ ANSI_RE = re.compile(
 )
 
 
-# browser_cookie3 falls back to a dummy key when `security` cannot read
-# "Chrome Safe Storage" (login keychain locked), and every cookie then fails to
-# decrypt with this message. Cookies are present; only the key is unreachable.
+# browser_cookie3 uses this marker for key-access/decryption failure. It does
+# not identify the cause: lock state, item permissions and format failures
+# must not be conflated. Keep the legacy helper names for existing callers.
 CHROME_KEYCHAIN_LOCKED_MARKER = "Unable to get key for cookie decryption"
 
 
@@ -119,13 +120,21 @@ def _chrome_keychain_locked(errors) -> bool:
 
 
 def _keychain_locked_error(error_cls):
-    err = error_cls(
-        t(
-            "macOS 钥匙串已锁定，读不到 Chrome 登录态；解锁后点立即刷新",
-            "macOS keychain is locked, so Chrome sign-ins can't be read; unlock it and refresh",
+    locked = default_keychain_locked()
+    if locked is True:
+        message = t(
+            "已确认默认钥匙串锁定，暂时无法读取浏览器登录态；用密码解锁钥匙串后刷新，无需先退出网站登录",
+            "The default keychain is confirmed locked; unlock it with your password and refresh. Website sign-out is not required.",
         )
-    )
-    err.keychain_locked = True
+    else:
+        message = t(
+            "无法读取浏览器登录密钥，未确认钥匙串锁定；浏览器登录可能仍有效，请检查钥匙串访问权限后刷新",
+            "Browser sign-in key is unavailable; a locked keychain is not confirmed. Your browser session may still work; check keychain access and refresh.",
+        )
+    err = error_cls(message)
+    err.keychain_locked = locked is True
+    err.browser_key_unavailable = True
+    err.error_code = "keychain_locked" if locked is True else "browser_key_unavailable"
     return err
 
 

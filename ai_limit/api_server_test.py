@@ -9,6 +9,23 @@ from ai_limit import api_server
 
 
 class AggregateIsolationTests(unittest.TestCase):
+    def test_browser_key_failure_is_typed_and_next_request_can_recover(self):
+        from ai_limit import providers
+        with mock.patch.object(providers, "default_keychain_locked", return_value=False):
+            error = providers._keychain_locked_error(providers.ClaudeWebError)
+        fresh = {"five_hour": {"utilization": 10}, "seven_day": {"utilization": 20}}
+        with mock.patch.object(api_server, "live_claude_usage", side_effect=[error, fresh]), \
+                mock.patch.object(api_server, "live_claude_plan", return_value=None), \
+                mock.patch.object(api_server, "live_claude_api_credits", return_value=None):
+            failed = api_server._claude_payload()
+            recovered = api_server._claude_payload()
+        self.assertFalse(failed["available"])
+        self.assertFalse(failed["keychain_locked"])
+        self.assertEqual(failed["error_code"], "browser_key_unavailable")
+        self.assertTrue(recovered["available"])
+        self.assertEqual(recovered["5h_left"], 90)
+        self.assertNotIn("error_code", recovered)
+
     def test_slow_provider_does_not_hide_fast_provider(self):
         def slow():
             time.sleep(0.2)

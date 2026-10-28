@@ -26,6 +26,22 @@ def _cookie_module(chrome_error=None, chrome_cookies=()):
 
 
 class ProviderKeychainLockTests(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(providers, "default_keychain_locked", return_value=True)
+        self.lock_probe = patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_unlocked_or_unknown_is_not_misreported_as_locked(self):
+        for state in (False, None):
+            with self.subTest(state=state):
+                self.lock_probe.return_value = state
+                with mock.patch.dict("sys.modules", {"browser_cookie3": _cookie_module(LOCKED)}):
+                    with self.assertRaises(ClaudeWebError) as ctx:
+                        providers._claude_web_context("https://claude.ai/settings/usage")
+                self.assertFalse(ctx.exception.keychain_locked)
+                self.assertTrue(ctx.exception.browser_key_unavailable)
+                self.assertEqual(ctx.exception.error_code, "browser_key_unavailable")
+
     def test_claude_reports_locked_keychain_not_missing_login(self):
         with mock.patch.dict("sys.modules", {"browser_cookie3": _cookie_module(LOCKED)}):
             with self.assertRaises(ClaudeWebError) as ctx:
@@ -90,6 +106,16 @@ class KeepThroughKeychainLockTests(unittest.TestCase):
         other = {"error": "HTTP 500"}
 
         self.assertIs(menubar._keep_through_keychain_lock(self.good, other), other)
+
+    def test_unknown_key_access_keeps_stale_data_without_claiming_lock(self):
+        error = providers._keychain_locked_error
+        with mock.patch.object(providers, "default_keychain_locked", return_value=False):
+            candidate = menubar._error_result(error(ClaudeWebError))
+        kept = menubar._keep_through_keychain_lock(self.good, candidate)
+        self.assertEqual(kept["stale_reason"], "browser_key_unavailable")
+        self.assertEqual(kept["7d_left"], 16)
+        self.assertIn("lock not confirmed", menubar._stale_access_reason(kept, "en"))
+        self.assertIsNotNone(menubar._stale_note(kept, "en"))
 
 
 class StaleDisplayTests(unittest.TestCase):

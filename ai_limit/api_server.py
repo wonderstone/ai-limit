@@ -53,6 +53,7 @@ from ai_limit.providers import (  # noqa: E402
 )
 from ai_limit.claude_limits import claude_weekly_model_limits  # noqa: E402
 from ai_limit.llm_api import has_llm_api_provider_config, live_llm_api_balances  # noqa: E402
+from ai_limit.version import __version__, __build_version__  # noqa: E402
 
 try:  # usage.py is the CLI module at repo root.
     from usage import latest_codex_rate_limits
@@ -280,7 +281,11 @@ def _claude_payload() -> dict[str, Any]:
             "api_credit": api_credit,
         }
     except ClaudeWebError as exc:
-        return {"provider": "claude", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+        payload = {"provider": "claude", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+        if getattr(exc, "browser_key_unavailable", False):
+            payload.update(error_code=exc.error_code, keychain_locked=exc.keychain_locked,
+                           browser_key_unavailable=True)
+        return payload
     except Exception as exc:  # noqa: BLE001
         return {"provider": "claude", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
 
@@ -479,7 +484,8 @@ class Handler(BaseHTTPRequestHandler):
         allow_app_server = _as_bool((params.get("allow_app_server") or [None])[0])
 
         if parsed.path == "/health":
-            self._write_json({"module": "ai-limit-local-api", "status": "ready", "observed_at": _utc_now()})
+            self._write_json({"module": "ai-limit-local-api", "status": "ready", "observed_at": _utc_now(),
+                              "version": __version__, "build": __build_version__})
             return
         if parsed.path in {"/quota", "/v1/quota"}:
             self._write_json(quota_payload(allow_app_server=allow_app_server))

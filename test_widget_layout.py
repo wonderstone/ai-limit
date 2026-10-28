@@ -342,6 +342,20 @@ class DashboardLayoutTests(unittest.TestCase):
         self.assertEqual(panel.frame().size.width, 640)
         self.assertEqual(panel.frame().size.height, 500)
 
+    def test_short_content_shrinks_below_old_minimum(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        panel = _ResizablePanel(height=600)
+        app._widget_panel = panel
+        with mock.patch.object(menubar.AppKit.NSScreen, "mainScreen", return_value=None), \
+                mock.patch.object(menubar.AppKit, "NSMakeRect", side_effect=lambda x, y, w, h: _Frame(x, y, w, h)), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_frame_chrome_height", return_value=28):
+            for natural_height in (276, 114, 500, 200):
+                app._widget_resize_panel(natural_height)
+                self.assertEqual(panel.frame().size.height, natural_height + 28)
+                self.assertEqual(panel.frame().origin.y + panel.frame().size.height, 700)
+            app._widget_resize_panel(1500)
+            self.assertEqual(panel.frame().size.height, app._WIDGET_MAX_HEIGHT)
+
     def test_rows_with_a_reset_line_reserve_more_height(self):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
         with_reset = {"name": "x", "reset": "10月01日 12:00"}

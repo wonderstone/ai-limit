@@ -527,34 +527,43 @@ def _error_result(exc, message=None):
     result = {"error": message or str(exc)}
     if getattr(exc, "keychain_locked", False):
         result["keychain_locked"] = True
+    if getattr(exc, "browser_key_unavailable", False):
+        result["browser_key_unavailable"] = True
+        result["error_code"] = exc.error_code
     return result
 
 
 def _keep_through_keychain_lock(previous, candidate):
-    """Hold the last good reading while the login keychain is locked.
+    """Keep explicitly stale values during credential access failures.
 
-    A locked keychain only hides the Chrome cookie key; the quota itself has
-    not changed, so blanking the card would be less truthful than showing the
-    previous numbers marked as stale. Real errors still replace the data.
+    Current quota is unknown and may have changed. These retained numbers
+    must never be presented as a fresh observation.
     """
-    if not (isinstance(candidate, dict) and candidate.get("keychain_locked")):
+    if not (isinstance(candidate, dict) and
+            (candidate.get("keychain_locked") or candidate.get("browser_key_unavailable"))):
         return candidate
     if not isinstance(previous, dict) or not previous or previous.get("error"):
         return candidate
     kept = dict(previous)
-    kept["stale_reason"] = "keychain_locked"
+    kept["stale_reason"] = "keychain_locked" if candidate.get("keychain_locked") else "browser_key_unavailable"
     kept.setdefault("stale_since", datetime.datetime.now().timestamp())
     return kept
 
 
 def _stale_note(data, lang):
-    if not isinstance(data, dict) or data.get("stale_reason") != "keychain_locked":
+    if not isinstance(data, dict) or data.get("stale_reason") not in ("keychain_locked", "browser_key_unavailable"):
         return None
     try:
         since = datetime.datetime.fromtimestamp(float(data.get("stale_since"))).strftime("%H:%M")
     except (TypeError, ValueError, OSError):
         since = "?"
     return _tr(lang, f"旧数据({since})", f"stale ({since})")
+
+
+def _stale_access_reason(data, lang):
+    if data.get("stale_reason") == "keychain_locked":
+        return _tr(lang, "钥匙串已锁定", "keychain locked")
+    return _tr(lang, "浏览器密钥读取失败，锁定状态未确认", "browser key unavailable; lock not confirmed")
 
 
 def _codex_window_jump(previous, candidate, value_key, reset_key):
@@ -1606,7 +1615,8 @@ class AiLimitApp(rumps.App):
                 self._claude_header.title = f"Claude Code{plan}"
                 note = _stale_note(claude, lang)
                 if note:
-                    self._claude_source.title = _tr(lang, f"  来源：{note}，钥匙串已锁定", f"  Source: {note}, keychain locked")
+                    reason = _stale_access_reason(claude, lang)
+                    self._claude_source.title = _tr(lang, f"  来源：{note}，{reason}", f"  Source: {note}, {reason}")
                 else:
                     self._claude_source.title = _tr(lang, "  来源：browser live", "  Source: browser live")
                 c5_reset = _fmt_reset_iso(claude["5h_reset"], lang)
@@ -2076,7 +2086,9 @@ class AiLimitApp(rumps.App):
     # that is shorter than the content.
     _WIDGET_DEFAULT_WIDTH = 640
     _WIDGET_MIN_WIDTH = 420
-    _WIDGET_MIN_HEIGHT = 360
+    # The empty dashboard itself exceeds this floor (header + margins + chrome).
+    # A taller minimum leaves a short, non-flipped document bottom-aligned.
+    _WIDGET_MIN_HEIGHT = 120
     _WIDGET_MAX_HEIGHT = 760
     _WIDGET_TOP_MARGIN = 18
     _WIDGET_BOTTOM_MARGIN = 18
@@ -2210,7 +2222,8 @@ class AiLimitApp(rumps.App):
 
         new_frame = AppKit.NSMakeRect(origin_x, origin_y, current_width, height)
         if hasattr(panel, "setFrame_display_animate_"):
-            panel.setFrame_display_animate_(new_frame, True, True)
+            # Layout reads the clip bounds immediately after this call.
+            panel.setFrame_display_animate_(new_frame, True, False)
         else:
             panel.setFrame_display_(new_frame, True)
 
@@ -3126,7 +3139,8 @@ class AiLimitApp(rumps.App):
         lines = [title]
         note = _stale_note(data, self._state["lang"])
         if note:
-            lines.append(_tr(self._state["lang"], f"  ! {note}：macOS 钥匙串已锁定，解锁后自动更新", f"  ! {note}: macOS keychain is locked; updates resume after unlock"))
+            reason = _stale_access_reason(data, self._state["lang"])
+            lines.append(f"  ! {note}: {reason}")
         if data.get("error"):
             lines.append(f"  ! {_short_widget_error(data.get('error'))}")
         elif source:

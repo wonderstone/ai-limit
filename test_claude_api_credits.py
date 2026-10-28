@@ -127,7 +127,7 @@ class ProfileScanTest(unittest.TestCase):
 
     def test_locked_keychain_is_reported_not_hidden(self):
         locked = Exception(providers.CHROME_KEYCHAIN_LOCKED_MARKER)
-        with self.assertRaises(providers.ClaudeWebError) as ctx:
+        with mock.patch.object(providers, "default_keychain_locked", return_value=True), self.assertRaises(providers.ClaudeWebError) as ctx:
             self._run({"Default": locked, "Profile 1": locked})
 
         self.assertTrue(getattr(ctx.exception, "keychain_locked", False))
