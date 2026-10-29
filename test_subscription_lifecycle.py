@@ -46,12 +46,12 @@ class SubscriptionLifecycleTests(unittest.TestCase):
     def test_copilot_plans(self):
         for plan, expected in [("individual_max", "active"), ("business", "active"),
                                ("enterprise", "active"), ("student", "active"),
-                               ("free", "inactive"), ("free_limited_copilot", "inactive"),
+                               ("free", "free"), ("free_limited_copilot", "free"),
                                (None, "unknown"), ("future_plan", "unknown")]:
             with self.subTest(plan=plan):
                 result = copilot(plan)
                 self.assertEqual(result["subscription_status"], expected)
-                self.assertEqual(result["available"], expected == "active")
+                self.assertEqual(result["available"], expected in {"active", "free"})
 
     def test_expiry_and_resubscription_reach_ui_for_both_providers(self):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
@@ -65,7 +65,7 @@ class SubscriptionLifecycleTests(unittest.TestCase):
                     app._gemini = menubar._fetch_gemini_app("en")
                     app._copilot = menubar._fetch_copilot("en")
                 self.assertEqual(bool(app._widget_gemini_entries()), paid)
-                self.assertEqual(bool(app._widget_copilot_entries()), paid)
+                self.assertTrue(app._widget_copilot_entries())
                 self.assertEqual(app._state["services"], ["gemini", "copilot"])
 
     def test_copilot_404_inactive_but_auth_failure_is_error(self):
@@ -83,7 +83,9 @@ class SubscriptionLifecycleTests(unittest.TestCase):
                         providers.live_copilot_quota()
 
     def test_free_with_no_quota_is_not_an_error(self):
-        self.assertFalse(providers._normalize_copilot_quota({"copilot_plan": "free"})["available"])
+        result = providers._normalize_copilot_quota({"copilot_plan": "free"})
+        self.assertTrue(result["available"])
+        self.assertIsNone(result["summary"]["remaining_percent"])
         result = providers._guard_gemini_entitlement(providers._parse_gemini_app_usage_rpc([[1, []]]))
         self.assertEqual(result["subscription_status"], "inactive")
 

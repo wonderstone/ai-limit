@@ -1,0 +1,4 @@
+CCL Forensics, MIT license (included in each source header).
+LevelDB: https://github.com/cclgroupltd/ccl_chromium_reader @ ad37443541dd91dac3ac1fb2eecaeb8693f36815
+Snappy: https://github.com/cclgroupltd/ccl_simplesnappy @ 3d085230baa8c46cf2090ebba29bf6e8eab31087
+Local changes: relative import, 8 MiB block/output limits; no database writes.

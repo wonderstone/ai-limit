@@ -328,9 +328,16 @@ def live_claude_plan(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> str | None:
 
 CLAUDE_PLATFORM_ORIGIN = "https://platform.claude.com"
 CLAUDE_PLATFORM_BILLING_URL = f"{CLAUDE_PLATFORM_ORIGIN}/settings/billing"
+CLAUDE_PLATFORM_RESPONSE_MAX_BYTES = 1024 * 1024
 
 
-def _claude_platform_headers() -> dict | None:
+class ClaudeOrgBindingError(ClaudeWebError):
+    """The authenticated console does not contain the explicitly bound org."""
+
+    error_code = "account_mismatch"
+
+
+def _claude_platform_headers(profile: str | None = None) -> dict | None:
     """Browser headers for platform.claude.com, or ``None`` when never signed in.
 
     The Claude Platform console keeps its own ``sessionKey`` on
@@ -343,14 +350,20 @@ def _claude_platform_headers() -> dict | None:
         raise ClaudeWebError("browser_cookie3 not installed") from exc
     errs = []
     cookies = []
-    # The console may be signed in under any Chrome profile, and a profile
-    # that merely visited the site still holds analytics cookies, so keep
-    # looking until a jar actually carries the console sessionKey.
+    # Unpinned callers may search profiles until one carries the console
+    # sessionKey. API-credit bindings filter this list to one exact label.
+    cookie_files = _chromium_profile_cookie_files()
+    if profile:
+        # API-credit bindings name the full browser/profile label (for example
+        # Chrome/Default). Never inspect another profile or Firefox for an
+        # explicitly bound account, even when its session is unavailable.
+        cookie_files = [(label, path) for label, path in cookie_files if label == profile]
     loaders = [
         (label, lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="platform.claude.com"))
-        for label, path in _chromium_profile_cookie_files()
+        for label, path in cookie_files
     ]
-    loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="platform.claude.com")))
+    if not profile:
+        loaders.append(("Firefox", lambda: browser_cookie3.firefox(domain_name="platform.claude.com")))
     for name, loader in loaders:
         try:
             jar = [(c.name, c.value) for c in loader()]
@@ -388,10 +401,13 @@ def _claude_platform_get(path: str, headers: dict, timeout: int):
     req = urllib.request.Request(f"{CLAUDE_PLATFORM_ORIGIN}{path}", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            body = response.read()
+            body = response.read(CLAUDE_PLATFORM_RESPONSE_MAX_BYTES + 1)
+            if len(body) > CLAUDE_PLATFORM_RESPONSE_MAX_BYTES:
+                raise ClaudeWebError("platform.claude.com: response exceeded the 1 MiB limit")
     except urllib.error.HTTPError as exc:
+        error_body = exc.read(201)[:200].decode(errors="replace")
         raise ClaudeWebError(
-            f"platform.claude.com HTTP {exc.code}: {exc.read()[:200].decode(errors='replace')}"
+            f"platform.claude.com HTTP {exc.code}: {error_body}"
         ) from exc
     except Exception as exc:
         raise ClaudeWebError(f"platform.claude.com: {exc}") from exc
@@ -440,6 +456,55 @@ def _claude_tranche(raw: dict) -> dict:
     }
 
 
+def _claude_console_purchased_balance(credits: dict) -> float | None:
+    """Mirror Console's purchased-only figure, including tranche rounding.
+
+    Verified against platform.claude.com chunk 0ceool7nuv-pz.js (2026-10-30).
+    The API has no purchased_balance field. Console separates active paid and
+    promotional tranches; it tolerates one minor unit of rounding per tranche.
+    Missing/malformed inputs stay unknown, rather than becoming zero.
+    """
+    amount = credits.get("amount")
+    paid, promo = credits.get("tranches"), credits.get("promo_tranches")
+    if (type(amount) is not int or amount < 0
+            or str(credits.get("currency", "")).upper() != "USD"
+            or not isinstance(paid, list) or not isinstance(promo, list)):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    groups = []
+    for entries in (paid, promo):
+        active = []
+        for item in entries:
+            if not isinstance(item, dict):
+                return None
+            if not isinstance(item.get("currency"), str) or not item["currency"]:
+                return None
+            if str(item.get("currency", "")).upper() != "USD":
+                continue
+            remaining = item.get("remaining_amount_minor_units")
+            if type(remaining) is not int or remaining < 0:
+                return None
+            expiry = item.get("expires_at")
+            if expiry:
+                try:
+                    end = datetime.datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                    if end.tzinfo is None:
+                        return None
+                except ValueError:
+                    return None
+                if end <= now:
+                    continue
+            active.append(remaining)
+        groups.append(active)
+    paid_cents, promotional_cents = sum(groups[0]), sum(groups[1])
+    if promotional_cents > 0:
+        tolerance = len(groups[0]) + len(groups[1])
+        figure = min(paid_cents, amount) if amount - paid_cents - promotional_cents <= tolerance else max(0, amount - promotional_cents)
+    else:
+        figure = amount
+    return figure / 100
+
+
 def _normalize_claude_api_credits(org: dict, credits: dict) -> dict:
     balance = _claude_balance_amount(credits.get("balance"))
     if balance is None and credits.get("balance_credits") is not None:
@@ -447,17 +512,24 @@ def _normalize_claude_api_credits(org: dict, credits: dict) -> dict:
     if balance is None and credits.get("amount") is not None:
         # Legacy shape: a bare integer amount in cents.
         balance = float(credits["amount"]) / 100
+    raw_tranches = [raw for raw in (credits.get("tranches") or []) if isinstance(raw, dict)]
+    raw_promo_value = credits.get("promo_tranches")
+    promo_list_complete = isinstance(raw_promo_value, list) and all(
+        isinstance(raw, dict) for raw in raw_promo_value
+    )
+    raw_promo_tranches = raw_promo_value if promo_list_complete else []
     tranches = [
         _claude_tranche(raw)
-        for raw in (credits.get("tranches") or []) + (credits.get("promo_tranches") or [])
-        if isinstance(raw, dict)
+        for raw in raw_tranches + raw_promo_tranches
     ]
+    promo_tranches = [_claude_tranche(raw) for raw in raw_promo_tranches]
     granted_values = [item["granted"] for item in tranches if item.get("granted") is not None]
     granted = sum(granted_values) if granted_values else None
     remaining_percent = None
     if balance is not None and granted:
         remaining_percent = max(0, min(100, int(round(balance / granted * 100))))
     return {
+        "org_id": org.get("uuid"),
         "org_name": org.get("name"),
         "currency": credits.get("currency") or "USD",
         "balance": balance,
@@ -466,19 +538,39 @@ def _normalize_claude_api_credits(org: dict, credits: dict) -> dict:
         "expires_at": credits.get("next_expires_at")
         or min((item["expires_at"] for item in tranches if item.get("expires_at")), default=None),
         "tranches": tranches,
+        # Keep source categories separate for the additive API-credit contract.
+        # An absent source field remains absent/unknown; callers must not infer
+        # a purchased amount by subtracting one category from another.
+        "promo_tranches": promo_tranches if promo_list_complete else None,
+        "purchased_balance": _claude_balance_amount(credits.get("purchased_balance"))
+        if "purchased_balance" in credits
+        else _claude_console_purchased_balance(credits),
+        "source_currency": credits.get("currency"),
+        "source_updated_at": credits.get("source_updated_at"),
+        "next_grant_at": credits.get("next_grant_at"),
+        "usage_restrictions": credits.get("usage_restrictions"),
         "auto_reload": bool(credits.get("auto_reload_settings")),
         "source": "platform.claude.com",
     }
 
 
-def live_claude_api_credits(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict | None:
+def live_claude_api_credits(
+    timeout: int = CLAUDE_WEB_TIMEOUT_SEC,
+    *,
+    organization_id: str | None = None,
+    profile: str | None = None,
+) -> dict | None:
     """Return the Claude Platform API credit balance shown on settings/billing.
 
-    Returns ``None`` when there is no console session or no API organization,
-    so callers can treat "this user has no API account" as nothing to show
-    rather than as an error.
+    An explicit organization binding is required. Returns ``None`` when the
+    binding is absent or there is no console session. A configured organization
+    that is not present in the authenticated account raises
+    ``ClaudeOrgBindingError``; no other prepaid organization is substituted.
     """
-    headers = _claude_platform_headers()
+    organization_id = str(organization_id or "").strip()
+    if not organization_id:
+        return None
+    headers = _claude_platform_headers(profile=profile)
     if headers is None:
         return None
     orgs = _claude_platform_get("/api/organizations", headers, timeout)
@@ -492,10 +584,16 @@ def live_claude_api_credits(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict | Non
         if isinstance(org, dict)
         and (org.get("billing_type") == "prepaid" or "api" in (org.get("capabilities") or []))
     ]
-    if not api_orgs:
-        return None
-    org = next((item for item in api_orgs if item.get("billing_type") == "prepaid"), api_orgs[0])
-    credits = _claude_platform_get(f"/api/organizations/{org['uuid']}/prepaid/credits", headers, timeout)
+    org = next((item for item in api_orgs if str(item.get("uuid") or "") == organization_id), None)
+    if org is None:
+        raise ClaudeOrgBindingError("Configured Claude API organization is not available in the authenticated account")
+    from urllib.parse import quote
+
+    credits = _claude_platform_get(
+        f"/api/organizations/{quote(organization_id, safe='')}/prepaid/credits",
+        headers,
+        timeout,
+    )
     if not isinstance(credits, dict):
         raise ClaudeWebError("platform.claude.com: unexpected credits response")
     return _normalize_claude_api_credits(org, credits)
@@ -2867,10 +2965,18 @@ def _copilot_int(value) -> int | None:
 
 
 def _normalize_copilot_quota(data: dict) -> dict:
-    plan = data.get("copilot_plan")
+    reported_plan = data.get("copilot_plan")
+    raw_sku = data.get("access_type_sku")
+    sku = raw_sku.strip().lower() if isinstance(raw_sku, str) else None
+    sku_supplied = raw_sku is not None and (not isinstance(raw_sku, str) or bool(sku))
+    # The broad account category can remain "individual" after cancellation.
+    # A supplied entitlement SKU takes precedence; an unfamiliar SKU must not
+    # silently inherit Pro from that legacy category.
+    plan = sku if sku_supplied else reported_plan
     plan = plan.strip().lower() if isinstance(plan, str) else None
     status = (
-        "inactive" if plan in {"free", "free_limited_copilot", "none"}
+        "free" if plan in {"free", "free_limited_copilot"}
+        else "inactive" if plan == "none"
         else "active" if plan in _COPILOT_PLAN_LABELS else "unknown"
     )
     token_based_billing = bool(data.get("token_based_billing"))
@@ -2914,27 +3020,29 @@ def _normalize_copilot_quota(data: dict) -> dict:
             }
         )
 
-    # premium_interactions is the only metered bucket on every plan; chat and
-    # completions report `unlimited` for paid plans and would drown it out.
-    primary = next((bucket for bucket in buckets if bucket["bucket_id"] == "premium_interactions"), None)
+    # Free can retain chat/completion allowances with no premium entitlement.
+    eligible = [bucket for bucket in buckets if bucket["has_quota"]] if status == "free" else buckets
+    primary = next((bucket for bucket in eligible if bucket["bucket_id"] == "premium_interactions"), None)
     if primary is None:
-        metered = [bucket for bucket in buckets if not bucket["unlimited"] and bucket["remaining_percent"] is not None]
-        primary = min(metered, key=lambda bucket: bucket["remaining_percent"]) if metered else (buckets[0] if buckets else None)
+        metered = [bucket for bucket in eligible if not bucket["unlimited"] and bucket["remaining_percent"] is not None]
+        primary = min(metered, key=lambda bucket: bucket["remaining_percent"]) if metered else (eligible[0] if eligible else None)
     if primary is None and status == "active":
         raise CopilotQuotaError("Copilot response did not include quota snapshots")
     primary = primary or {}
-    if status != "active":
+    if status not in {"active", "free"}:
         buckets = [{**bucket, "remaining_percent": None} for bucket in buckets]
         primary = {**primary, "remaining_percent": None}
 
     return {
         "source": "api.github.com copilot_internal/user",
-        "available": status == "active",
+        "available": status in {"active", "free"},
         "subscription_status": status,
-        "subscription_source": "copilot_plan",
+        "subscription_source": "access_type_sku" if sku_supplied else "copilot_plan",
+        "access_type_sku": sku,
+        "reported_plan": reported_plan,
         "login": data.get("login"),
-        "plan": data.get("copilot_plan"),
-        "plan_label": _copilot_plan_label(data.get("copilot_plan")),
+        "plan": plan,
+        "plan_label": _copilot_plan_label(plan) if status != "unknown" else None,
         "token_based_billing": token_based_billing,
         "unit": "AI credits" if token_based_billing else "premium requests",
         "reset_time": reset_time,

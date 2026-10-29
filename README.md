@@ -143,6 +143,8 @@ It uses pyenv `3.13.9` by default; set `AI_LIMIT_PYTHON` to use another interpre
 
 For the maintenance-level explanation of how ai-limit obtains quota data without background browser automation, see [docs/data-source-architecture.md](docs/data-source-architecture.md).
 
+The compact API-credit display separates promotional and purchased balances, keeps subscription usage separate, and requires explicit local account bindings. See [API credit setup and privacy](docs/API_CREDITS.md). Copilot entitlement SKUs take priority over legacy plan labels; free allowances are labeled **Copilot Free**.
+
 ### Claude Code
 
 | Data | Source |

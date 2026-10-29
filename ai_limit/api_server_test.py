@@ -9,6 +9,32 @@ from ai_limit import api_server
 
 
 class AggregateIsolationTests(unittest.TestCase):
+    def test_api_credit_failure_does_not_change_subscription_availability(self):
+        claude = {"provider": "claude", "available": True, "5h_left": 80}
+        api_credit = {
+            "contract": "api-credit/v1",
+            "providers": {
+                "openai": {"provider": "openai", "status": "unknown", "total": None},
+                "claude": {"provider": "claude", "status": "error", "error_code": "auth_unavailable", "total": None},
+            },
+        }
+        with (
+            mock.patch.object(api_server, "_claude_payload", return_value=claude),
+            mock.patch.object(api_server, "_codex_payload", return_value=None),
+            mock.patch.object(api_server, "_deepseek_payload", return_value=None),
+            mock.patch.object(api_server, "_google_payload", return_value=None),
+            mock.patch.object(api_server, "_gemini_payload", return_value=None),
+            mock.patch.object(api_server, "_llm_api_payload", return_value=None),
+            mock.patch.object(api_server, "_copilot_payload", return_value=None),
+            mock.patch.object(api_server, "_grok_payload", return_value=None),
+            mock.patch.object(api_server, "_api_credits_payload", return_value=api_credit),
+        ):
+            payload = api_server.quota_payload()
+        self.assertTrue(payload["providers"]["claude"]["available"])
+        self.assertEqual(payload["providers"]["claude"]["api_credit_v1"]["status"], "error")
+        self.assertIsNone(payload["providers"]["claude"]["api_credit"])
+        self.assertEqual(payload["api_credits"]["providers"]["claude"]["error_code"], "auth_unavailable")
+
     def test_browser_key_failure_is_typed_and_next_request_can_recover(self):
         from ai_limit import providers
         with mock.patch.object(providers, "default_keychain_locked", return_value=False):
@@ -42,6 +68,7 @@ class AggregateIsolationTests(unittest.TestCase):
             mock.patch.object(api_server, "_llm_api_payload", return_value=None),
             mock.patch.object(api_server, "_copilot_payload", return_value=None),
             mock.patch.object(api_server, "_grok_payload", return_value=None),
+            mock.patch.object(api_server, "live_api_credit_balances", return_value={}),
         ):
             started = time.monotonic()
             payload = api_server.quota_payload()
@@ -181,6 +208,7 @@ class CopilotGrokPayloadTests(unittest.TestCase):
             mock.patch.object(api_server, "_gemini_payload", return_value=None),
             mock.patch.object(api_server, "_llm_api_payload", return_value=None),
             mock.patch.object(api_server, "live_copilot_quota", side_effect=RuntimeError("down")),
+            mock.patch.object(api_server, "live_api_credit_balances", return_value={}),
             mock.patch.object(
                 api_server,
                 "live_grok_usage",
@@ -206,6 +234,7 @@ class CopilotGrokPayloadTests(unittest.TestCase):
             mock.patch.object(api_server, "_llm_api_payload", return_value=None),
             mock.patch.object(api_server, "_copilot_payload", return_value={"provider": "copilot", "available": True}),
             mock.patch.object(api_server, "_grok_payload", side_effect=slow),
+            mock.patch.object(api_server, "live_api_credit_balances", return_value={}),
         ):
             payload = api_server.quota_payload()
         self.assertTrue(payload["providers"]["copilot"]["available"])

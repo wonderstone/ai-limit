@@ -43,7 +43,7 @@ from ai_limit.providers import (  # noqa: E402
     has_gemini_app_cookies,
     has_google_oauth_creds,
     live_claude_plan,
-    live_claude_api_credits,
+    live_claude_api_credits,  # legacy import retained for downstream patchers
     live_claude_usage,
     live_deepseek_balance,
     live_copilot_quota,
@@ -52,6 +52,11 @@ from ai_limit.providers import (  # noqa: E402
     live_grok_usage,
 )
 from ai_limit.claude_limits import claude_weekly_model_limits  # noqa: E402
+from ai_limit.api_credits import (  # noqa: E402
+    API_CREDIT_CONTRACT,
+    claude_api_credit_legacy,
+    live_api_credit_balances,
+)
 from ai_limit.llm_api import has_llm_api_provider_config, live_llm_api_balances  # noqa: E402
 from ai_limit.version import __version__, __build_version__  # noqa: E402
 
@@ -261,10 +266,6 @@ def _claude_payload() -> dict[str, Any]:
             plan = live_claude_plan(timeout=2)
         except Exception:  # noqa: BLE001
             plan = None
-        try:
-            api_credit = live_claude_api_credits(timeout=3)
-        except Exception:  # noqa: BLE001
-            api_credit = None
         return {
             "provider": "claude",
             "available": True,
@@ -278,7 +279,9 @@ def _claude_payload() -> dict[str, Any]:
             # Model-scoped weekly caps (e.g. Fable) on top of the account-wide 7d window.
             "weekly_models": weekly_models,
             "7d_left_by_model": {item["model"]: item["remaining_percent"] for item in weekly_models},
-            "api_credit": api_credit,
+            # Populated from the independent api-credit/v1 probe by
+            # quota_payload; kept here for legacy consumers.
+            "api_credit": None,
         }
     except ClaudeWebError as exc:
         payload = {"provider": "claude", "available": False, "observed_at": _utc_now(), "error": str(exc)}
@@ -387,6 +390,8 @@ def _copilot_payload() -> dict[str, Any]:
             "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
             "source": data.get("source") or "api.github.com copilot_internal/user",
             "subscription_status": data.get("subscription_status", "unknown"),
+            "subscription_source": data.get("subscription_source"),
+            "access_type_sku": data.get("access_type_sku"),
             "plan": data.get("plan"),
             "plan_label": data.get("plan_label"),
             "unit": data.get("unit"),
@@ -429,6 +434,44 @@ def _grok_payload() -> dict[str, Any]:
         return {"provider": "grok", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
 
 
+def _api_credits_payload() -> dict[str, Any]:
+    return {
+        "contract": API_CREDIT_CONTRACT,
+        "providers": live_api_credit_balances(timeout=3),
+    }
+
+
+def _api_credits_timeout_payload() -> dict[str, Any]:
+    checked_at = _utc_now()
+    providers = {}
+    for provider, billing_url in (
+        ("openai", "https://platform.openai.com/settings/organization/billing/overview"),
+        ("claude", "https://platform.claude.com/settings/billing"),
+    ):
+        providers[provider] = {
+            "contract": API_CREDIT_CONTRACT,
+            "provider": provider,
+            "status": "error",
+            "account_identity": {"profile": None, "label": None},
+            "organization_identity": {"id": None, "name": None},
+            "binding_status": "unknown",
+            "currency": None,
+            "promotional_balance": None,
+            "purchased_balance": None,
+            "total": None,
+            "grants": None,
+            "observed_at": None,
+            "checked_at": checked_at,
+            "source_updated_at": None,
+            "source": "unavailable",
+            "error_code": "aggregate_timeout",
+            "next_grant_at": None,
+            "usage_restrictions": None,
+            "billing_url": billing_url,
+        }
+    return {"contract": API_CREDIT_CONTRACT, "providers": providers}
+
+
 def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
     # Provider probes are independent remote operations. Running them serially
     # made one slow source hold the entire aggregate endpoint for up to a
@@ -443,6 +486,7 @@ def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
         "llm_api": _llm_api_payload,
         "copilot": _copilot_payload,
         "grok": _grok_payload,
+        "api_credits": _api_credits_payload,
     }
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="ai-limit-provider")
     futures = {executor.submit(probe): name for name, probe in probes.items()}
@@ -459,19 +503,32 @@ def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
     for future in pending:
         name = futures[future]
         future.cancel()
-        providers[name] = {
-            "provider": name,
-            "available": False,
-            "observed_at": _utc_now(),
-            "error": f"aggregate probe exceeded {AGGREGATE_DEADLINE_SECONDS:g}s deadline",
-        }
+        if name == "api_credits":
+            providers[name] = _api_credits_timeout_payload()
+        else:
+            providers[name] = {
+                "provider": name,
+                "available": False,
+                "observed_at": _utc_now(),
+                "error": f"aggregate probe exceeded {AGGREGATE_DEADLINE_SECONDS:g}s deadline",
+            }
     # Do not wait for a provider's own bounded network timeout after the
     # aggregate response is already complete.
     executor.shutdown(wait=False, cancel_futures=True)
+    api_credits = providers.pop("api_credits", None)
+    if not isinstance(api_credits, dict) or api_credits.get("contract") != API_CREDIT_CONTRACT:
+        api_credits = _api_credits_timeout_payload()
+    if api_credits.get("contract") == API_CREDIT_CONTRACT:
+        claude_credit = (api_credits.get("providers") or {}).get("claude")
+        claude_payload = providers.get("claude")
+        if isinstance(claude_credit, dict) and isinstance(claude_payload, dict):
+            claude_payload["api_credit_v1"] = claude_credit
+            claude_payload["api_credit"] = claude_api_credit_legacy(claude_credit)
     return {
         "module": "ai-limit-local-api",
         "observed_at": _utc_now(),
         "providers": providers,
+        "api_credits": api_credits,
     }
 
 

@@ -366,6 +366,86 @@ class DashboardLayoutTests(unittest.TestCase):
             app._widget_detail_row_advance(without_reset),
         )
 
+    def test_wrapped_metadata_reserves_height_for_its_actual_column_width(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        row = {"kind": "metadata", "name": "Account / organization", "value": "Profile · " + "Organization name and id " * 4}
+
+        narrow_advance = app._widget_detail_row_advance(row, detail_width=150)
+        wide_advance = app._widget_detail_row_advance(row, detail_width=300)
+
+        self.assertGreater(narrow_advance, wide_advance)
+        self.assertGreater(wide_advance, menubar.AiLimitApp._WIDGET_QUOTA_ROW_ADVANCE)
+
+    def test_natural_height_includes_wrapped_metadata_rows(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        details = [
+            {"type": "section", "name": "Claude API", "color": "#fff"},
+            {"kind": "metadata", "name": "Account / organization", "value": "Profile · " + "Organization name and id " * 4},
+            {"kind": "metadata", "name": "Grant expires", "value": "2026-11-11 00:00 UTC"},
+        ]
+
+        natural_narrow = app._widget_layout_height(
+            0, 62, [], details, detail_columns=1, detail_width=150
+        )
+        natural_wide = app._widget_layout_height(
+            0, 62, [], details, detail_columns=1, detail_width=300
+        )
+
+        self.assertGreater(natural_narrow, natural_wide)
+
+    def test_long_org_uuid_metadata_uses_measured_height_at_420_and_640(self):
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        identity = (
+            "Sample Researcher's Individual Org "
+            "(7a4d1290-62bc-4f31-8b72-2fa6a9c4d805)"
+        )
+        row = {"kind": "metadata", "name": "Account / organization", "value": identity, "color": "#fff"}
+        section = {"type": "section", "name": "Claude API", "color": "#fff"}
+
+        for content_width, detail_width, columns in ((420, 384, 1), (640, 295, 2)):
+            with self.subTest(width=content_width):
+                app._state = {"lang": "en"}
+                app._widget_panel = _Panel(width=content_width)
+                app._widget_content = mock.MagicMock()
+                app._widget_last_layout_size = None
+                details = [section, row]
+                rendered = []
+                natural_heights = []
+
+                def capture_label(_self, text, _x, _y, _w, height, **_kwargs):
+                    if text == identity:
+                        rendered.append(height)
+
+                with mock.patch.object(menubar.AiLimitApp, "_widget_summary_cards", return_value=[]), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_alert_rows", return_value=[]), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_detail_rows", return_value=details), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_add_label", capture_label), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_add_box"), \
+                        mock.patch.object(menubar.AiLimitApp, "_clear_widget_content"), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_resize_panel", new=lambda _self, height: natural_heights.append(height)), \
+                        mock.patch.object(menubar.AiLimitApp, "_widget_keep_top_visible"):
+                    app._render_widget_dashboard()
+
+                row_height = app._widget_detail_row_height(row, detail_width)
+                self.assertEqual(rendered, [row_height - 16])
+                self.assertEqual(
+                    natural_heights,
+                    [app._widget_layout_height(
+                        0,
+                        app._WIDGET_CARD_HEIGHT,
+                        [],
+                        details,
+                        alert_columns=columns,
+                        detail_columns=columns,
+                        detail_width=detail_width,
+                        header_height=app._widget_header_height(content_width, None),
+                    )],
+                )
+                self.assertGreaterEqual(
+                    rendered[0],
+                    app._widget_metadata_text_height(identity, detail_width - 8),
+                )
+
 
 class _TitledPanel(_ResizablePanel):
     """A panel whose frame carries a 28pt title bar above the content."""

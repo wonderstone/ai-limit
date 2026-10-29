@@ -143,6 +143,8 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 关于 ai-limit 如何在不做后台浏览器自动化的前提下获取额度数据，见维护者文档：[docs/data-source-architecture.md](docs/data-source-architecture.md)。
 
+紧凑型 API 余额展示分别显示赠送余额与购买余额，保留独立的订阅用量，并要求明确的本机账户绑定。配置与隐私说明见 [API 余额文档](docs/API_CREDITS.md)。Copilot 优先按实际权益 SKU 判断，免费额度明确标注为 **Copilot Free**。
+
 ### Claude Code
 
 | 数据 | 来源 |

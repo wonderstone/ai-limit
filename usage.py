@@ -31,11 +31,11 @@ from ai_limit.providers import (
     has_google_oauth_creds,
     live_gemini_app_usage,
     live_claude_plan,
-    live_claude_api_credits,
     live_claude_usage,
     live_deepseek_balance,
     live_google_quota,
 )
+from ai_limit.api_credits import live_api_credit_balances
 
 CLAUDE_BASE = pathlib.Path.home() / ".claude" / "projects"
 CODEX_BASE = pathlib.Path.home() / ".codex" / "sessions"
@@ -402,32 +402,48 @@ def render_claude(totals: dict, since: datetime.datetime, days_count: int,
 
 
 def render_claude_api_credit():
-    """Print the Claude Platform API credit, if this account has an API org."""
+    """Print the separate API-credit/v1 accounts and their source links."""
     try:
-        credit = live_claude_api_credits()
-    except ClaudeWebError as exc:
-        print(f"\n  ⚠️  {t('Claude API 额度读取失败', 'Claude API credit fetch failed')}: {exc}")
-        return
-    if not credit or credit.get("balance") is None:
-        return
-    balance = credit["balance"]
-    granted = credit.get("granted")
-    print(f"\n  {_BOLD}{t('API 额度', 'API credit')}{_RST}  {_DIM}platform.claude.com{_RST}")
-    pct = credit.get("remaining_percent")
-    amount = f"${balance:,.2f}" + (f" / ${granted:,.2f}" if granted else "")
-    if pct is not None:
-        print(f"  {_colored_bar(pct)}  {_bc(pct)}{_BOLD}{amount}{_RST}  ({t(f'剩余 {pct}%', f'{pct}% left')})")
-    else:
-        print(f"  {_BOLD}{amount}{_RST}")
-    for tranche in credit.get("tranches") or []:
-        expires = tranche.get("expires_at")
-        when = ""
-        if expires:
-            try:
-                when = f"  {t('到期', 'expires')} {fmt_reset_dt(datetime.datetime.fromisoformat(expires.replace('Z', '+00:00')).astimezone())}"
-            except ValueError:
-                when = f"  {t('到期', 'expires')} {expires}"
-        print(f"  {_DIM}{tranche.get('name') or t('额度', 'credit')}{when}{_RST}")
+        credits = live_api_credit_balances()
+    except Exception:
+        credits = {}
+    print(f"\n  {_BOLD}{t('API 余额', 'API credits')}{_RST}")
+    for provider, label in (("openai", "OpenAI API"), ("claude", "Claude API")):
+        credit = credits.get(provider) if isinstance(credits, dict) else None
+        if not isinstance(credit, dict):
+            continue
+        identity = credit.get("account_identity") or {}
+        organization = credit.get("organization_identity") or {}
+        identity_text = " · ".join(
+            str(part) for part in (identity.get("label"), organization.get("name") or organization.get("id")) if part
+        ) or t("未知账号", "Unknown account")
+        print(f"  {_BOLD}{label}{_RST}  {_DIM}{identity_text}{_RST}")
+        print(f"    {t('状态', 'Status')}: {credit.get('status', 'unknown')} / {credit.get('error_code') or credit.get('binding_status')}")
+        currency = str(credit.get("currency") or "").upper()
+        for field, name_zh, name_en in (
+            ("promotional_balance", "赠金", "Promotional"),
+            ("purchased_balance", "购买余额", "Purchased"),
+            ("total", "总额", "Total"),
+        ):
+            amount = credit.get(field)
+            if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+                amount_text = f"${amount:,.2f}" if currency == "USD" else f"{amount:,.2f} {currency}" if currency else t("币种未知", "Unknown currency")
+            else:
+                amount_text = t("未知", "Unknown")
+            print(f"    {t(name_zh, name_en)}: {amount_text}")
+        source_updated = credit.get("source_updated_at") or t("未知", "Unknown")
+        print(f"    {t('来源更新时间', 'Source updated')}: {source_updated}")
+        print(f"    {credit.get('billing_url') or ''}")
+        for grant in credit.get("grants") or []:
+            if not isinstance(grant, dict):
+                continue
+            remaining = grant.get("remaining")
+            if isinstance(remaining, (int, float)) and not isinstance(remaining, bool):
+                value = f"${remaining:,.2f}" if currency == "USD" else f"{remaining:,.2f} {currency}" if currency else t("币种未知", "Unknown currency")
+            else:
+                value = t("未知", "Unknown")
+            expiry = grant.get("expires_at") or t("未知", "Unknown")
+            print(f"      {grant.get('name') or t('赠金', 'Grant')}: {value} · {t('到期', 'expires')} {expiry}")
 
 
 def render_codex(since: datetime.datetime):

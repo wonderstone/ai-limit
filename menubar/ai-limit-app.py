@@ -6,6 +6,7 @@ py2app 打包：cd menubar && python3 setup.py py2app
 """
 import datetime
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -43,14 +44,17 @@ from usage import (
     __version__,
     fmt_money,
     live_claude_plan,
-    live_claude_api_credits,
     live_claude_usage,
     latest_codex_rate_limits,
     epoch_to_local,
 )
 from ai_limit.claude_limits import claude_weekly_model_limits
+from ai_limit.api_credits import (
+    CLAUDE_BILLING_URL,
+    OPENAI_BILLING_URL,
+    live_api_credit_balances,
+)
 from ai_limit.providers import (
-    CLAUDE_PLATFORM_BILLING_URL,
     live_codex_web_usage,
     ClaudeWebError,
     CodexWebError,
@@ -465,6 +469,10 @@ def _load_cache():
                 "copilot": raw.get("copilot"),
                 "grok": raw.get("grok"),
             }
+            # Do not briefly resurrect an old Pro classification at startup.
+            copilot = cached.get("copilot")
+            if isinstance(copilot, dict) and "access_type_sku" not in copilot:
+                cached["copilot"] = None
             # Older builds stored only claude/codex. Keep accepting that shape
             # so users do not need to delete their cache after upgrading.
             if all(value is None for value in cached.values()):
@@ -626,12 +634,6 @@ def _fetch_claude(lang):
             plan = live_claude_plan()
         except Exception:
             plan = None
-        # The Platform console balance is optional extra detail: a missing
-        # console sign-in or a console outage must not hide the chat quota.
-        try:
-            api_credit = live_claude_api_credits()
-        except Exception:
-            api_credit = None
         return {
             "5h_left":  int(round(100 - float(five_h.get("utilization", 0)))),
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
@@ -640,7 +642,9 @@ def _fetch_claude(lang):
             # Model-scoped weekly caps (e.g. Fable), separate from the account-wide week.
             "weekly_models": claude_weekly_model_limits(data),
             "plan":     plan,
-            "api_credit": api_credit,
+            # Keep the legacy field for downstream consumers. API credits are
+            # fetched independently and rendered in their own section.
+            "api_credit": None,
             "source":   "browser",
         }
     except ClaudeWebError as e:
@@ -654,6 +658,14 @@ def _fetch_claude(lang):
         return {"error": _tr(lang, "网络不可用", "Network unavailable")}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fetch_api_credit_balances(*, force=False):
+    """Fetch API balances independently from subscription quota snapshots."""
+    try:
+        return live_api_credit_balances(force=force)
+    except Exception:
+        return None
 
 def _fetch_codex(lang):
     import socket, urllib.error
@@ -825,6 +837,8 @@ def _fetch_copilot(lang):
             "subscription_status": data.get("subscription_status", "unknown"),
             "available": data.get("available", False),
             "subscription_source": data.get("subscription_source"),
+            "access_type_sku": data.get("access_type_sku"),
+            "reported_plan": data.get("reported_plan"),
             "left": summary.get("remaining_percent"),
             "remaining": summary.get("remaining"),
             "used": summary.get("used"),
@@ -1185,6 +1199,95 @@ def _claude_api_credit_text(credit):
     return text
 
 
+def _api_credit_money(value, currency, lang="en"):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _tr(lang, "未知", "Unknown")
+    code = str(currency or "").upper()
+    amount = f"{float(value):,.2f}"
+    if code == "USD":
+        return f"${amount}"
+    if code:
+        return f"{amount} {code}"
+    return _tr(lang, f"{amount}（币种未知）", f"{amount} (currency unknown)")
+
+
+def _api_credit_timestamp(value, lang="en"):
+    """Show API-credit dates compactly while retaining the year and timezone."""
+    if not value:
+        return _tr(lang, "未知", "Unknown")
+    text = str(value).strip()
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(datetime.timezone.utc)
+        return parsed.strftime("%Y-%m-%d %H:%M UTC")
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _api_credit_status_text(record, lang="en"):
+    status = str((record or {}).get("status") or "unknown")
+    code = str((record or {}).get("error_code") or "")
+    if status == "stale":
+        stale_reason = {
+            "auth_unavailable": ("最近读取失败 · Claude Platform 登录不可用", "Stale · Claude Platform sign-in unavailable"),
+            "fetch_failed": ("最近读取失败", "Stale · latest read failed"),
+            "singleflight_timeout": ("等待读取超时", "Stale · waiting for read timed out"),
+        }.get(code)
+        if stale_reason:
+            return stale_reason[0 if lang == "zh" else 1]
+        return _tr(lang, "过期数据", "Stale data")
+    labels = {
+        "binding_required": ("未知 · 需要账号绑定", "Unknown · account binding required"),
+        "source_unverified": ("未知 · 账单数据源未验证", "Unknown · billing source unverified"),
+        "balance_unreported": ("未知 · 来源未报告余额", "Unknown · source reported no balance"),
+        "account_mismatch": ("错误 · 账号不匹配", "Error · account mismatch"),
+        "auth_unavailable": ("错误 · Claude Platform 登录不可用", "Error · Claude Platform sign-in unavailable"),
+    }
+    if code in labels:
+        label = labels[code][0 if lang == "zh" else 1]
+        refresh_error = str((record or {}).get("refresh_error_code") or "")
+        if status == "unknown" and refresh_error:
+            refresh_labels = {
+                "fetch_failed": ("最近刷新失败", "latest refresh failed"),
+                "auth_unavailable": ("最近刷新时登录不可用", "sign-in unavailable on latest refresh"),
+                "singleflight_timeout": ("最近刷新等待超时", "latest refresh wait timed out"),
+                "singleflight_capacity": ("最近刷新繁忙", "latest refresh was busy"),
+            }
+            refresh_label = refresh_labels.get(refresh_error, ("最近刷新失败", "latest refresh failed"))
+            label += " · " + refresh_label[0 if lang == "zh" else 1]
+        return label
+    if status == "ok":
+        return _tr(lang, "正常", "OK")
+    if status == "error":
+        return _tr(lang, "读取失败", "Read failed")
+    return _tr(lang, "未知", "Unknown")
+
+
+def _api_credit_identity(record, lang="en"):
+    account = (record or {}).get("account_identity") or {}
+    organization = (record or {}).get("organization_identity") or {}
+    account_parts = []
+    account_label = account.get("label")
+    profile = account.get("profile")
+    if account_label:
+        account_parts.append(str(account_label))
+    if profile and profile != account_label:
+        account_parts.append(str(profile))
+    organization_name = organization.get("name")
+    organization_id = organization.get("id")
+    organization_label = organization_name or organization_id
+    if organization_name and organization_id:
+        organization_label = f"{organization_name} ({organization_id})"
+    parts = []
+    if account_parts:
+        parts.append(" · ".join(account_parts))
+    if organization_label:
+        parts.append(str(organization_label))
+    return "\n".join(parts) if parts else _tr(lang, "未知", "Unknown")
+
+
 def _codex_credit_summary(data, lang="zh"):
     credits = data.get("credits") if isinstance(data, dict) else None
     if not isinstance(credits, dict):
@@ -1253,6 +1356,10 @@ class AiLimitApp(rumps.App):
         # 后台线程把抓取结果放这里，由主线程的 _apply_pending 定时器接力
         self._pending = None
         self._pending_lock = threading.Lock()
+        self._api_credits_v1 = None
+        self._background_refresh_state_lock = threading.Lock()
+        self._background_refresh_inflight = False
+        self._background_refresh_force_pending = False
         self._build_menu()
 
     # ── 菜单构建 ──────────────────────────────────────────────────────────────
@@ -1361,7 +1468,11 @@ class AiLimitApp(rumps.App):
         )
         self._claude_billing_dash = rumps.MenuItem(
             "打开 Claude API 账单页" if lang == "zh" else "Open Claude API billing",
-            callback=lambda _: webbrowser.open(CLAUDE_PLATFORM_BILLING_URL),
+            callback=lambda _: webbrowser.open(CLAUDE_BILLING_URL),
+        )
+        self._openai_billing_dash = rumps.MenuItem(
+            "打开 OpenAI API 账单页" if lang == "zh" else "Open OpenAI API billing",
+            callback=lambda _: webbrowser.open(OPENAI_BILLING_URL),
         )
         self._deepseek_dash = rumps.MenuItem(
             "打开 DeepSeek 用量页" if lang == "zh" else "Open DeepSeek usage",
@@ -1427,6 +1538,7 @@ class AiLimitApp(rumps.App):
             self._codex_dash,
             self._claude_dash,
             self._claude_billing_dash,
+            self._openai_billing_dash,
             self._deepseek_dash,
             self._google_dash,
             self._gemini_dash,
@@ -1491,7 +1603,8 @@ class AiLimitApp(rumps.App):
             self._pending = None
         if pending is None:
             return
-        claude, codex, deepseek, google, gemini, copilot, grok = pending
+        claude, codex, deepseek, google, gemini, copilot, grok = pending[:7]
+        api_credits_v1 = pending[7] if len(pending) > 7 else None
         if claude is not None:
             self._claude = _keep_through_keychain_lock(self._claude, claude)
         if codex is not None:
@@ -1511,6 +1624,8 @@ class AiLimitApp(rumps.App):
             self._copilot = copilot
         if grok is not None:
             self._grok = _keep_through_keychain_lock(self._grok, grok)
+        if api_credits_v1 is not None:
+            self._api_credits_v1 = api_credits_v1
         _save_cache(
             self._claude,
             {
@@ -1564,14 +1679,45 @@ class AiLimitApp(rumps.App):
 
     def _kick_background_fetch(self):
         """启动后台线程抓数据；线程内不要碰任何 UI 对象。"""
-        t = threading.Thread(target=self._async_refresh, daemon=True)
-        t.start()
+        self._start_background_refresh(force_api_refresh=False)
 
-    def _async_refresh(self):
+    def _start_background_refresh(self, *, force_api_refresh: bool):
+        """Admit one refresh worker and retain at most one pending manual refresh."""
+        with self._background_refresh_state_lock:
+            if self._background_refresh_inflight:
+                self._background_refresh_force_pending |= force_api_refresh
+                return
+            self._background_refresh_inflight = True
+
+        def run():
+            force = force_api_refresh
+            while True:
+                try:
+                    self._async_refresh(force_api_refresh=force)
+                finally:
+                    with self._background_refresh_state_lock:
+                        rerun = self._background_refresh_force_pending
+                        self._background_refresh_force_pending = False
+                        if not rerun:
+                            self._background_refresh_inflight = False
+                if not rerun:
+                    return
+                force = True
+
+        worker = threading.Thread(target=run, daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            with self._background_refresh_state_lock:
+                self._background_refresh_inflight = False
+            raise
+
+    def _async_refresh(self, *, force_api_refresh=False):
         """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
         lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
         claude = _fetch_claude(lang) if "claude" in services else None
+        api_credits_v1 = _fetch_api_credit_balances(force=force_api_refresh)
         codex  = _fetch_codex(lang)  if "codex"  in services else None
         deepseek = _fetch_deepseek(lang) if "deepseek" in services else None
         google = _fetch_google(lang) if "google" in services else None
@@ -1579,7 +1725,7 @@ class AiLimitApp(rumps.App):
         copilot = _fetch_copilot(lang) if "copilot" in services else None
         grok = _fetch_grok(lang) if "grok" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok)
+            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok, api_credits_v1)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -2009,7 +2155,7 @@ class AiLimitApp(rumps.App):
         self._widget_content.addSubview_(view)
         return view
 
-    def _widget_add_label(self, text, x, y, w, h, size=12, weight="regular", color="#f4f4f5", align="left"):
+    def _widget_add_label(self, text, x, y, w, h, size=12, weight="regular", color="#f4f4f5", align="left", wrap=False):
         label = AppKit.NSTextField.labelWithString_(str(text))
         label.setFrame_(AppKit.NSMakeRect(x, y, w, h))
         label.setTextColor_(_appkit_color(color))
@@ -2019,13 +2165,29 @@ class AiLimitApp(rumps.App):
         elif weight == "medium":
             font_weight = AppKit.NSFontWeightMedium
         label.setFont_(AppKit.NSFont.systemFontOfSize_weight_(size, font_weight))
-        label.setLineBreakMode_(getattr(AppKit, "NSLineBreakByTruncatingTail", 4))
+        if wrap:
+            self._widget_configure_wrapping(label)
+        else:
+            label.setLineBreakMode_(getattr(AppKit, "NSLineBreakByTruncatingTail", 4))
         if align == "right":
             label.setAlignment_(getattr(AppKit, "NSTextAlignmentRight", 2))
         elif align == "center":
             label.setAlignment_(getattr(AppKit, "NSTextAlignmentCenter", 1))
         self._widget_content.addSubview_(label)
         return label
+
+    @staticmethod
+    def _widget_configure_wrapping(label):
+        line_break = getattr(AppKit, "NSLineBreakByWordWrapping", 0)
+        label.setUsesSingleLineMode_(False)
+        label.setLineBreakMode_(line_break)
+        if hasattr(label, "setMaximumNumberOfLines_"):
+            label.setMaximumNumberOfLines_(0)
+        cell = label.cell() if hasattr(label, "cell") else None
+        if cell is not None:
+            cell.setWraps_(True)
+            cell.setScrollable_(False)
+            cell.setLineBreakMode_(line_break)
 
     def _widget_add_symbol(self, name, x, y, size=18, color="#ffffff"):
         image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
@@ -2112,15 +2274,41 @@ class AiLimitApp(rumps.App):
         return 58 if credit_summary else self._WIDGET_HEADER_ADVANCE
 
     @staticmethod
-    def _widget_detail_row_height(row):
-        # Reset information is rendered inline with the quota name, so every
-        # quota row can use the same compact height.
-        return 26
+    def _widget_metadata_text_height(value, detail_width):
+        text = str(value or "?")
+        width = max(1, int(detail_width))
+        try:
+            label = AppKit.NSTextField.labelWithString_(text)
+            label.setFont_(AppKit.NSFont.systemFontOfSize_weight_(10, AppKit.NSFontWeightMedium))
+            AiLimitApp._widget_configure_wrapping(label)
+            cell = label.cell()
+            size = cell.cellSizeForBounds_(AppKit.NSMakeRect(0, 0, width, 10000))
+            measured = float(size.height)
+            if math.isfinite(measured) and measured >= 10:
+                # Keep a small guard for fractional native line metrics. The
+                # same resulting height sizes the label during the draw pass.
+                return max(14, int(math.ceil(measured)) + 2)
+        except Exception:
+            pass
 
-    def _widget_detail_row_advance(self, row):
+        # Headless tests have no AppKit text metrics. Treat every code point as
+        # up to two em wide so the portable estimate safely over-reserves for
+        # wide glyphs and unbroken UUID-like tokens.
+        chars_per_line = max(1, int(max(1, width - 4) / 20))
+        lines = text.split("\n")
+        return max(14, sum(max(1, (len(line) + chars_per_line - 1) // chars_per_line) for line in lines) * 14)
+
+    def _widget_detail_row_height(self, row, detail_width=None):
+        if row.get("kind") == "metadata":
+            width = detail_width or self._WIDGET_DEFAULT_WIDTH
+            value_height = self._widget_metadata_text_height(row.get("value"), width - 8)
+            return 16 + value_height
+        return self._WIDGET_QUOTA_ROW_ADVANCE
+
+    def _widget_detail_row_advance(self, row, detail_width=None):
         if row.get("type") == "section":
             return self._WIDGET_SECTION_ADVANCE
-        return self._WIDGET_QUOTA_ROW_ADVANCE
+        return self._widget_detail_row_height(row, detail_width)
 
     @staticmethod
     def _widget_detail_blocks(details):
@@ -2138,10 +2326,10 @@ class AiLimitApp(rumps.App):
                 current.append(row)
         return blocks
 
-    def _widget_detail_block_height(self, block):
-        return sum(self._widget_detail_row_advance(row) for row in block)
+    def _widget_detail_block_height(self, block, detail_width=None):
+        return sum(self._widget_detail_row_advance(row, detail_width) for row in block)
 
-    def _widget_detail_columns(self, details, columns):
+    def _widget_detail_columns(self, details, columns, detail_width=None):
         blocks = self._widget_detail_blocks(details)
         columns = max(1, min(columns, len(blocks) or 1))
         grouped = [[] for _ in range(columns)]
@@ -2151,7 +2339,7 @@ class AiLimitApp(rumps.App):
             if grouped[index]:
                 heights[index] += self._WIDGET_BLOCK_GAP
             grouped[index].append(block)
-            heights[index] += self._widget_detail_block_height(block)
+            heights[index] += self._widget_detail_block_height(block, detail_width)
         return grouped, heights
 
     def _widget_grid_height(self, items, columns, item_height):
@@ -2169,6 +2357,7 @@ class AiLimitApp(rumps.App):
         *,
         alert_columns=1,
         detail_columns=1,
+        detail_width=None,
         header_height=None,
     ):
         height = self._WIDGET_TOP_MARGIN + (
@@ -2185,7 +2374,7 @@ class AiLimitApp(rumps.App):
                 + self._WIDGET_ALERT_BLOCK_EXTRA
             )
         height += self._WIDGET_DETAIL_HEADING_ADVANCE
-        _, column_heights = self._widget_detail_columns(details, detail_columns)
+        _, column_heights = self._widget_detail_columns(details, detail_columns, detail_width)
         height += max(column_heights, default=0)
         return height + self._WIDGET_BOTTOM_MARGIN
 
@@ -2281,6 +2470,8 @@ class AiLimitApp(rumps.App):
         margin = 18
         credit_summary = None
         columns = 2 if content_w >= 470 else 1
+        detail_gap = self._WIDGET_BLOCK_GAP
+        detail_w = max(1, int((content_w - margin * 2 - detail_gap * (columns - 1)) / columns))
         card_h = self._WIDGET_CARD_HEIGHT
         card_rows = 0
         header_height = self._widget_header_height(content_w, credit_summary)
@@ -2291,6 +2482,7 @@ class AiLimitApp(rumps.App):
             details,
             alert_columns=columns,
             detail_columns=columns,
+            detail_width=detail_w,
             header_height=header_height,
         )
         self._widget_resize_panel(natural_height)
@@ -2317,15 +2509,6 @@ class AiLimitApp(rumps.App):
         inner_w = max(1, content_w - margin * 2)
         if content_w < 470:
             self._widget_add_label("AI Limit", margin, y(top, 24), inner_w, 24, size=21, weight="bold")
-            self._widget_add_label(
-                _tr(lang, f"更新 {datetime.datetime.now().astimezone():%H:%M:%S}", f"Updated {datetime.datetime.now().astimezone():%H:%M:%S}"),
-                margin,
-                y(top + 27, 18),
-                inner_w,
-                18,
-                size=11,
-                color="#a1a1aa",
-            )
             if credit_summary:
                 self._widget_add_label(
                     credit_summary,
@@ -2341,16 +2524,6 @@ class AiLimitApp(rumps.App):
             self._widget_add_label("AI Limit", margin, y(top, 26), 170, 26, size=22, weight="bold")
             right_x = max(margin + 180, content_w - margin - 220)
             right_w = max(120, content_w - margin - right_x)
-            self._widget_add_label(
-                _tr(lang, f"更新 {datetime.datetime.now().astimezone():%H:%M:%S}", f"Updated {datetime.datetime.now().astimezone():%H:%M:%S}"),
-                right_x,
-                y(top + 1, 18),
-                right_w,
-                18,
-                size=11,
-                color="#a1a1aa",
-                align="right",
-            )
             if credit_summary:
                 self._widget_add_label(
                     credit_summary,
@@ -2367,9 +2540,7 @@ class AiLimitApp(rumps.App):
 
         self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
         top += self._WIDGET_DETAIL_HEADING_ADVANCE
-        detail_gap = self._WIDGET_BLOCK_GAP
-        detail_w = max(1, int((content_w - margin * 2 - detail_gap * (columns - 1)) / columns))
-        detail_groups, detail_heights = self._widget_detail_columns(details, columns)
+        detail_groups, detail_heights = self._widget_detail_columns(details, columns, detail_w)
         for col, blocks in enumerate(detail_groups):
             bx = margin + col * (detail_w + detail_gap)
             block_top = top
@@ -2384,10 +2555,23 @@ class AiLimitApp(rumps.App):
                     if item.get("type") == "section":
                         cy = y(block_top, 20)
                         label = f"{item['name']} · {item['note']}" if item.get("note") else item["name"]
-                        self._widget_add_label(label, name_x, cy + 2, 150, 16, size=12, weight="bold", color=item["color"])
+                        label_w = max(150, bx + detail_w - name_x - 8) if str(item.get("name", "")).startswith("API credits") else 150
+                        self._widget_add_label(label, name_x, cy + 2, label_w, 16, size=12, weight="bold", color=item["color"])
                         self._widget_add_box(ring_x, cy + 8, max(30, bx + detail_w - ring_x), 1, "#323238", radius=0)
+                    elif item.get("kind") == "metadata":
+                        row_h = self._widget_detail_row_height(item, detail_w)
+                        cy = y(block_top, row_h)
+                        metadata_w = max(1, bx + detail_w - name_x - 4)
+                        self._widget_add_label(
+                            item["name"], name_x, cy + row_h - 13, metadata_w, 12,
+                            size=9, color="#a1a1aa",
+                        )
+                        self._widget_add_label(
+                            item["value"], name_x, cy + 1, metadata_w, max(14, row_h - 16),
+                            size=10, weight="medium", color=item["color"], wrap=True,
+                        )
                     else:
-                        row_h = self._widget_detail_row_height(item)
+                        row_h = self._widget_detail_row_height(item, detail_w)
                         cy = y(block_top, row_h)
                         name = item["name"]
                         if item.get("reset"):
@@ -2403,7 +2587,7 @@ class AiLimitApp(rumps.App):
                         if is_percent:
                             self._widget_add_ring(ring_x, cy + 5, ring_size, item["pct"])
                         self._widget_add_label(item["value"], row_value_x, cy + 4, row_value_w, 18, size=11, weight="bold", color=item["color"], align="right")
-                    block_top += self._widget_detail_row_advance(item)
+                    block_top += self._widget_detail_row_advance(item, detail_w)
                 block_top += detail_gap
         top += max(detail_heights, default=0)
 
@@ -2528,8 +2712,10 @@ class AiLimitApp(rumps.App):
                 continue
             if service == "gemini" and not gemini_has_verified_quota(data):
                 continue
-            if service == "copilot" and data.get("subscription_status") != "active":
+            if service == "copilot" and data.get("subscription_status") not in {"active", "free"}:
                 continue
+            if service == "copilot" and data.get("subscription_status") == "free":
+                title = "Copilot Free"
             card = self._widget_card_for_service(service, title, symbol, accent, data)
             cards.append(card)
         return cards
@@ -2928,23 +3114,65 @@ class AiLimitApp(rumps.App):
                 "kind": kind,
             })
 
+        def append_metadata(name, value, color="#a1a1aa"):
+            if value is None:
+                value = _tr(lang, "未知", "Unknown")
+            rows.append({
+                "name": str(name),
+                "value": str(value),
+                "reset": None,
+                "color": color,
+                "disabled": False,
+                "kind": "metadata",
+            })
+
         if "claude" in services and self._claude and not self._claude.get("error"):
             section("Claude", "#c4b5fd", self._claude)
             append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
             for item in self._claude.get("weekly_models") or []:
                 append(f"{item['model']} weekly", item.get("remaining_percent"), reset=item.get("reset_time"))
-            api_credit = self._claude.get("api_credit")
-            api_text = _claude_api_credit_text(api_credit)
-            if api_text:
-                append(
-                    _tr(lang, "API 额度", "API credit"),
-                    api_credit.get("remaining_percent"),
-                    value=api_text,
-                    reset=api_credit.get("expires_at"),
-                    kind="credit",
-                    color="#c4b5fd",
-                )
+        api_credits = getattr(self, "_api_credits_v1", None)
+        if isinstance(api_credits, dict):
+            preview_label = getattr(self, "_api_credit_preview_label", None)
+            if preview_label:
+                marker = "SYNTHETIC" if "SYNTHETIC" in str(preview_label).upper() else "PREVIEW"
+                section(_tr(lang, "API 额度", "API credits") + " · " + marker, "#93c5fd")
+            for provider, label, color in (
+                ("openai", "OpenAI API", "#93c5fd"),
+                ("claude", "Claude API", "#c4b5fd"),
+            ):
+                record = api_credits.get(provider)
+                if not isinstance(record, dict):
+                    continue
+                # Account bindings and collection diagnostics remain in the
+                # snapshot/API, not the compact main window.
+                cached = record.get("status") == "stale"
+                section(label + (_tr(lang, " · 缓存", " · cached") if cached else ""), color)
+                for key, zh_name, en_name in (
+                    ("promotional_balance", "赠送余额", "Promotional"),
+                    ("purchased_balance", "购买余额", "Purchased"),
+                ):
+                    append(_tr(lang, zh_name, en_name),
+                           value=_api_credit_money(record.get(key), record.get("currency"), lang),
+                           kind="credit", color=color)
+                dates = []
+                unknown_expiry = False
+                for grant in record.get("grants") or []:
+                    if not isinstance(grant, dict) or grant.get("expired"):
+                        continue
+                    remaining = grant.get("remaining")
+                    if isinstance(remaining, (int, float)) and remaining <= 0:
+                        continue
+                    try:
+                        date = datetime.datetime.fromisoformat(str(grant.get("expires_at") or "").replace("Z", "+00:00"))
+                        if date.tzinfo is None:
+                            raise ValueError("timezone missing")
+                        dates.append(date.astimezone(datetime.timezone.utc))
+                    except (ValueError, TypeError):
+                        unknown_expiry = True
+                expiry = min(dates).astimezone().strftime("%Y-%m-%d") if dates and not unknown_expiry else _tr(lang, "未知", "Unknown")
+                append(_tr(lang, "到期（本地）", "Expires (local)"), value=expiry, kind="credit", color=color)
         if "codex" in services:
             entries = self._widget_codex_entries()
             if entries:
@@ -2979,7 +3207,7 @@ class AiLimitApp(rumps.App):
         if "copilot" in services:
             entries = self._widget_copilot_entries()
             if entries:
-                section("Copilot", "#5eead4")
+                section("Copilot Free" if (self._copilot or {}).get("subscription_status") == "free" else "Copilot", "#5eead4")
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
         if "grok" in services and self._grok and not self._grok.get("error"):
@@ -3072,7 +3300,7 @@ class AiLimitApp(rumps.App):
 
     def _widget_copilot_entries(self):
         data = self._copilot or {}
-        if data.get("error") or data.get("subscription_status") != "active":
+        if data.get("error") or data.get("subscription_status") not in {"active", "free"}:
             return []
         entries = []
         metered = [
@@ -3176,11 +3404,6 @@ class AiLimitApp(rumps.App):
             lines.append(self._widget_quota_row(_tr(lang, "weekly", "weekly"), data.get("7d_left"), reset=data.get("7d_reset")))
             for item in data.get("weekly_models") or []:
                 lines.append(self._widget_quota_row(f"{item['model']} weekly", item.get("remaining_percent"), reset=item.get("reset_time")))
-            api_text = _claude_api_credit_text(data.get("api_credit"))
-            if api_text:
-                expires = (data.get("api_credit") or {}).get("expires_at")
-                suffix = f"    {_tr(lang, '到期', 'expires')} {_fmt_widget_reset_epoch_or_iso(expires, lang)}" if expires else ""
-                lines.append(f"  {_tr(lang, 'API 额度', 'API credit')}: {api_text}{suffix}")
         lines.append("")
         return lines
 
@@ -3269,9 +3492,9 @@ class AiLimitApp(rumps.App):
     def _widget_copilot_lines(self):
         lang = self._state["lang"]
         data = self._copilot or {}
-        if data.get("subscription_status") != "active":
+        if data.get("subscription_status") not in {"active", "free"}:
             return []
-        lines = self._widget_section("GitHub Copilot", data, data.get("source") or "api.github.com copilot_internal/user")
+        lines = self._widget_section("Copilot Free" if data.get("subscription_status") == "free" else "GitHub Copilot", data, data.get("source") or "api.github.com copilot_internal/user")
         if data and not data.get("error"):
             plan = data.get("plan")
             if plan:
@@ -3370,6 +3593,7 @@ class AiLimitApp(rumps.App):
         self._codex_dash.title  = _tr(lang, "打开 CodeX 分析页", "Open CodeX analytics")
         self._claude_dash.title = _tr(lang, "打开 Claude 用量页", "Open Claude usage")
         self._claude_billing_dash.title = _tr(lang, "打开 Claude API 账单页", "Open Claude API billing")
+        self._openai_billing_dash.title = _tr(lang, "打开 OpenAI API 账单页", "Open OpenAI API billing")
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")
@@ -3493,7 +3717,7 @@ class AiLimitApp(rumps.App):
     def _force_refresh(self, _):
         _clear_all_caches()
         # 后台拉，不卡 UI；新数据 ≤几秒内通过 _apply_pending 落到菜单上
-        self._kick_background_fetch()
+        self._start_background_refresh(force_api_refresh=True)
 
 
 if __name__ == "__main__":
