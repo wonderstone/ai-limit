@@ -91,6 +91,15 @@ Risk profile:
 - Optional: a failure leaves `api_credit` empty instead of hiding the chat quota.
 - No background browser launch.
 
+#### `claude.api_credit` in the menu bar cache (consumer contract)
+
+Since 0.3.48 the balance is fetched by the account-bound api-credit/v1 path (`ai_limit/api_credits.py`), separately from Claude quota. Other tools still read the legacy field from `~/.ai-limit-menubar-cache.json` — InfoWeave's Anthropic budget sums the `subscription_api_credit` tranches there — so the cache must keep carrying it:
+
+- The menu bar writes `claude.api_credit` through `claude_api_credit_legacy()`, the same adapter the local API uses for its own `api_credit` field.
+- Shape: `org_id`, `org_name`, `currency`, `balance`, `granted`, `remaining_percent`, `expires_at`, `tranches[]` (`name`, `program_id`, `granted`, `remaining`, `expires_at`, `granted_at`, …), `auto_reload`, `source`, plus `observed_at` (when the balance was read) and `status` (added in 0.3.51).
+- Only a fresh `ok` read is written. A stale or unbound record writes `null`, because consumers that date the reading by the file's `cached_at` would otherwise treat a retained balance as newly observed. `observed_at` can trail `cached_at` by up to the five-minute api-credit cache TTL.
+- 0.3.48 – 0.3.50 wrote `null` here unconditionally while the widget still showed the balance; `test_menubar_cache_api_credit.py` guards against that regression.
+
 ## Codex / ChatGPT
 
 Codex web quota uses the active `chatgpt.com` browser session.

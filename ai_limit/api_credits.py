@@ -743,4 +743,8 @@ def claude_api_credit_legacy(record: dict[str, Any] | None) -> dict[str, Any] | 
         "tranches": grants,
         "auto_reload": None,
         "source": record.get("source"),
+        # When the balance was actually read, and whether that read is fresh
+        # ("ok") or a retained value after a failed refresh ("stale").
+        "observed_at": record.get("observed_at"),
+        "status": record.get("status"),
     }

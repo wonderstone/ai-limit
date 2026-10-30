@@ -52,6 +52,7 @@ from ai_limit.claude_limits import claude_weekly_model_limits, claude_cloud_sess
 from ai_limit.api_credits import (
     CLAUDE_BILLING_URL,
     OPENAI_BILLING_URL,
+    claude_api_credit_legacy,
     live_api_credit_balances,
 )
 from ai_limit.providers import (
@@ -482,6 +483,25 @@ def _load_cache():
         pass
     return None, None
 
+def _claude_cache_entry(claude, api_credits_v1):
+    """Return the Claude cache entry with the legacy ``api_credit`` filled in.
+
+    Other tools (InfoWeave's Anthropic budget) read ``claude.api_credit`` from
+    this file. Since API credits moved to their own api-credit/v1 fetch the
+    field stayed ``None`` here while the widget kept showing the balance, so
+    project the v1 Claude record back with the same adapter the local API
+    uses. Only a fresh ``ok`` read is written: consumers date the reading by
+    the file's ``cached_at``, so a stale balance would look newly observed.
+    """
+    if not isinstance(claude, dict):
+        return claude
+    record = api_credits_v1.get("claude") if isinstance(api_credits_v1, dict) else None
+    legacy = None
+    if isinstance(record, dict) and record.get("status") == "ok":
+        legacy = claude_api_credit_legacy(record)
+    return {**claude, "api_credit": legacy}
+
+
 def _save_cache(claude, cached):
     try:
         if isinstance(cached, dict) and (
@@ -643,8 +663,9 @@ def _fetch_claude(lang):
             "weekly_models": claude_weekly_model_limits(data),
             "cloud_session_credits": claude_cloud_session_credits(data),
             "plan":     plan,
-            # Keep the legacy field for downstream consumers. API credits are
-            # fetched independently and rendered in their own section.
+            # API credits are fetched independently (api-credit/v1) and
+            # rendered in their own section; _claude_cache_entry projects them
+            # back into this legacy field when the cache is written.
             "api_credit": None,
             "source":   "browser",
         }
@@ -1628,7 +1649,7 @@ class AiLimitApp(rumps.App):
         if api_credits_v1 is not None:
             self._api_credits_v1 = api_credits_v1
         _save_cache(
-            self._claude,
+            _claude_cache_entry(self._claude, self._api_credits_v1),
             {
                 "codex": self._codex,
                 "deepseek": self._deepseek,
