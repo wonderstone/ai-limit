@@ -88,3 +88,20 @@ see `ai_limit/_vendor/NOTICE.txt` for pinned sources and local modifications.
 `.venv/bin/python preview_api_credit_widget.py` exports the actual widget rows
 with explicitly synthetic data and no provider refresh. It does not prove a
 live installed app's behavior.
+
+## Claude cloud-session promotion
+
+Claude cloud-session credits are displayed separately beneath Claude's
+subscription windows, with their own remaining/granted amount and local expiry.
+They are not API promotional credits or usage-credit spending balance. The
+existing claude.ai usage response supplies the observed `iguana_necktie` bucket
+(`remaining_dollars`, `limit_dollars`, `resets_at`); this field/amount/expiry was
+matched to the cloud-session panel on 2026-10-30. No additional endpoint or poll
+is added. Absent grants add no row; malformed values stay unknown; expired or
+locked grants are not shown as spendable. The JSON API exposes the normalized
+value as `cloud_session_credits` under Claude.
+
+Cloud-credit JSON is a snapshot: consumers caching it must re-evaluate
+`expires_at`. `spendable` is false for locked/expired/unknown or exhausted
+credit. Locked credit has `remaining: null`; `reported_remaining` preserves
+the provider's raw amount for diagnostics without claiming it is usable.

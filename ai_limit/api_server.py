@@ -51,7 +51,7 @@ from ai_limit.providers import (  # noqa: E402
     live_google_quota,
     live_grok_usage,
 )
-from ai_limit.claude_limits import claude_weekly_model_limits  # noqa: E402
+from ai_limit.claude_limits import claude_weekly_model_limits, claude_cloud_session_credits  # noqa: E402
 from ai_limit.api_credits import (  # noqa: E402
     API_CREDIT_CONTRACT,
     claude_api_credit_legacy,
@@ -278,6 +278,7 @@ def _claude_payload() -> dict[str, Any]:
             "7d_reset": seven_d.get("resets_at"),
             # Model-scoped weekly caps (e.g. Fable) on top of the account-wide 7d window.
             "weekly_models": weekly_models,
+            "cloud_session_credits": claude_cloud_session_credits(data),
             "7d_left_by_model": {item["model"]: item["remaining_percent"] for item in weekly_models},
             # Populated from the independent api-credit/v1 probe by
             # quota_payload; kept here for legacy consumers.

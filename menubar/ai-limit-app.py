@@ -48,7 +48,7 @@ from usage import (
     latest_codex_rate_limits,
     epoch_to_local,
 )
-from ai_limit.claude_limits import claude_weekly_model_limits
+from ai_limit.claude_limits import claude_weekly_model_limits, claude_cloud_session_credits
 from ai_limit.api_credits import (
     CLAUDE_BILLING_URL,
     OPENAI_BILLING_URL,
@@ -641,6 +641,7 @@ def _fetch_claude(lang):
             "7d_reset": seven_d.get("resets_at"),
             # Model-scoped weekly caps (e.g. Fable), separate from the account-wide week.
             "weekly_models": claude_weekly_model_limits(data),
+            "cloud_session_credits": claude_cloud_session_credits(data),
             "plan":     plan,
             # Keep the legacy field for downstream consumers. API credits are
             # fetched independently and rendered in their own section.
@@ -3132,6 +3133,32 @@ class AiLimitApp(rumps.App):
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
             for item in self._claude.get("weekly_models") or []:
                 append(f"{item['model']} weekly", item.get("remaining_percent"), reset=item.get("reset_time"))
+            cloud = self._claude.get("cloud_session_credits")
+            if isinstance(cloud, dict):
+                expires = None
+                try:
+                    expires = datetime.datetime.fromisoformat(str(cloud.get("expires_at") or "").replace("Z", "+00:00"))
+                    if expires.tzinfo is None:
+                        expires = None
+                except (ValueError, TypeError):
+                    pass
+                now = datetime.datetime.now().astimezone()
+                expired = expires is not None and expires <= now
+                remaining, limit = cloud.get("remaining"), cloud.get("limit")
+                value = _tr(lang, "未知", "Unknown")
+                if expired:
+                    value = _tr(lang, "已到期", "Expired")
+                elif cloud.get("locked_reason"):
+                    value = _tr(lang, "不可用", "Unavailable")
+                elif isinstance(remaining, (int, float)) and isinstance(limit, (int, float)):
+                    cap = f"{limit:,.0f}" if float(limit).is_integer() else f"{limit:,.2f}"
+                    value = f"${remaining:,.2f} / ${cap}"
+                append(_tr(lang, "云端会话额度", "Cloud credits"), value=value, kind="credit", color="#c4b5fd")
+                expiry_label = _tr(lang, "未知", "Unknown")
+                if expires is not None:
+                    local_expiry = expires.astimezone()
+                    expiry_label = local_expiry.strftime("%m-%d %H:%M" if local_expiry.year == now.year else "%Y-%m-%d")
+                append(_tr(lang, "云端到期（本地）", "Cloud expiry (local)"), value=expiry_label, kind="credit", color="#c4b5fd")
         api_credits = getattr(self, "_api_credits_v1", None)
         if isinstance(api_credits, dict):
             preview_label = getattr(self, "_api_credit_preview_label", None)
