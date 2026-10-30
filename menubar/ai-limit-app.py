@@ -2263,7 +2263,7 @@ class AiLimitApp(rumps.App):
     _WIDGET_ALERT_ROW_ADVANCE = 34
     _WIDGET_ALERT_BLOCK_EXTRA = 10
     _WIDGET_MAX_ALERTS = 5
-    _WIDGET_DETAIL_HEADING_ADVANCE = 32
+    _WIDGET_DETAIL_HEADING_ADVANCE = 0
     _WIDGET_SECTION_ADVANCE = 22
     _WIDGET_QUOTA_ROW_ADVANCE = 26
     _WIDGET_BLOCK_GAP = 14
@@ -2307,7 +2307,9 @@ class AiLimitApp(rumps.App):
         return self._WIDGET_QUOTA_ROW_ADVANCE
 
     def _widget_detail_row_advance(self, row, detail_width=None):
-        if row.get("type") == "section":
+        if row.get("type") == "provider":
+            return 28
+        if row.get("type") in {"section", "subsection"}:
             return self._WIDGET_SECTION_ADVANCE
         return self._widget_detail_row_height(row, detail_width)
 
@@ -2325,10 +2327,31 @@ class AiLimitApp(rumps.App):
                 current.append(row)
             else:
                 current.append(row)
-        return blocks
+        # A provider is one indivisible layout block, even if its sections
+        # arrived far apart in the source rows. Preserve source rows unchanged.
+        result, families = [], {}
+        for block in blocks:
+            family = block[0].get("family") if block else None
+            if not family:
+                result.append(block)
+                continue
+            if family not in families:
+                header = block[0]
+                grouped = [{"type": "provider", "name": header["family_label"],
+                            "family": family, "color": header["color"]}]
+                families[family] = {"block": grouped, "parts": []}
+                result.append(grouped)
+            families[family]["parts"].append(block)
+        for family in families.values():
+            for part in sorted(family["parts"], key=lambda rows: rows[0].get("subsection_order", 0)):
+                header = {**part[0], "type": "subsection", "name": part[0]["subsection_label"]}
+                family["block"].extend([header, *part[1:]])
+        return result
 
     def _widget_detail_block_height(self, block, detail_width=None):
-        return sum(self._widget_detail_row_advance(row, detail_width) for row in block)
+        framed = bool(block and block[0].get("type") == "provider")
+        inner_width = max(1, detail_width - 20) if framed and detail_width is not None else detail_width
+        return (16 if framed else 0) + sum(self._widget_detail_row_advance(row, inner_width) for row in block)
 
     def _widget_detail_columns(self, details, columns, detail_width=None):
         blocks = self._widget_detail_blocks(details)
@@ -2539,30 +2562,50 @@ class AiLimitApp(rumps.App):
                 )
         top += header_height
 
-        self._widget_add_label(_tr(lang, "分组额度", "Quota groups"), margin, y(top, 22), 180, 22, size=15, weight="bold")
         top += self._WIDGET_DETAIL_HEADING_ADVANCE
         detail_groups, detail_heights = self._widget_detail_columns(details, columns, detail_w)
         for col, blocks in enumerate(detail_groups):
             bx = margin + col * (detail_w + detail_gap)
             block_top = top
             for block in blocks:
+                framed = bool(block and block[0].get("type") == "provider")
+                inset = 10 if framed else 0
+                row_x = bx + inset
+                row_width = detail_w - inset * 2
+                if framed:
+                    block_h = self._widget_detail_block_height(block, detail_w)
+                    border = "#44384f" if block[0]["family"] == "claude" else "#344352"
+                    self._widget_add_box(bx, y(block_top, block_h), detail_w, block_h,
+                                         "#242426", radius=10, border=border)
+                    block_top += 8
                 value_w = 58
                 ring_size = 16
-                name_x = bx + 4
-                value_x = bx + detail_w - value_w
+                name_x = row_x + 4
+                value_x = row_x + row_width - value_w
                 ring_x = max(name_x + 24, value_x - ring_size - 10)
                 name_w = max(40, ring_x - name_x - 12)
                 for item in block:
-                    if item.get("type") == "section":
+                    if item.get("type") == "provider":
+                        cy = y(block_top, 24)
+                        self._widget_add_label(item["name"], name_x, cy + 3, row_width - 8, 20,
+                                               size=14, weight="bold", color=item["color"])
+                    elif item.get("type") == "subsection":
+                        cy = y(block_top, 20)
+                        if item.get("subsection_order", 0) > 0:
+                            self._widget_add_box(name_x, cy + 20, row_width - 8, 1, "#3a3a40", radius=0)
+                        label = f"{item['name']} · {item['note']}" if item.get("note") else item["name"]
+                        self._widget_add_label(label, name_x, cy + 2, row_width - 8, 16,
+                                               size=10, weight="medium", color="#a1a1aa")
+                    elif item.get("type") == "section":
                         cy = y(block_top, 20)
                         label = f"{item['name']} · {item['note']}" if item.get("note") else item["name"]
-                        label_w = max(150, bx + detail_w - name_x - 8) if str(item.get("name", "")).startswith("API credits") else 150
+                        label_w = max(150, row_x + row_width - name_x - 8) if str(item.get("name", "")).startswith("API credits") else 150
                         self._widget_add_label(label, name_x, cy + 2, label_w, 16, size=12, weight="bold", color=item["color"])
-                        self._widget_add_box(ring_x, cy + 8, max(30, bx + detail_w - ring_x), 1, "#323238", radius=0)
+                        self._widget_add_box(ring_x, cy + 8, max(30, row_x + row_width - ring_x), 1, "#323238", radius=0)
                     elif item.get("kind") == "metadata":
-                        row_h = self._widget_detail_row_height(item, detail_w)
+                        row_h = self._widget_detail_row_height(item, row_width)
                         cy = y(block_top, row_h)
-                        metadata_w = max(1, bx + detail_w - name_x - 4)
+                        metadata_w = max(1, row_x + row_width - name_x - 4)
                         self._widget_add_label(
                             item["name"], name_x, cy + row_h - 13, metadata_w, 12,
                             size=9, color="#a1a1aa",
@@ -2572,7 +2615,7 @@ class AiLimitApp(rumps.App):
                             size=10, weight="medium", color=item["color"], wrap=True,
                         )
                     else:
-                        row_h = self._widget_detail_row_height(item, detail_w)
+                        row_h = self._widget_detail_row_height(item, row_width)
                         cy = y(block_top, row_h)
                         name = item["name"]
                         if item.get("reset"):
@@ -2582,13 +2625,15 @@ class AiLimitApp(rumps.App):
                         # cut "$200.00 / $200" or "45,244.69" to an ellipsis.
                         is_percent = item.get("kind") == "percent"
                         row_value_w = value_w if is_percent else self._WIDGET_WIDE_VALUE_WIDTH
-                        row_value_x = bx + detail_w - row_value_w
+                        row_value_x = row_x + row_width - row_value_w
                         row_name_w = name_w if is_percent else max(40, row_value_x - name_x - 8)
                         self._widget_add_label(name, name_x, cy + 5, row_name_w, 16, size=10, color="#d4d4d8")
                         if is_percent:
                             self._widget_add_ring(ring_x, cy + 5, ring_size, item["pct"])
                         self._widget_add_label(item["value"], row_value_x, cy + 4, row_value_w, 18, size=11, weight="bold", color=item["color"], align="right")
-                    block_top += self._widget_detail_row_advance(item, detail_w)
+                    block_top += self._widget_detail_row_advance(item, row_width)
+                if framed:
+                    block_top += 8
                 block_top += detail_gap
         top += max(detail_heights, default=0)
 
@@ -3085,11 +3130,14 @@ class AiLimitApp(rumps.App):
         lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
 
-        def section(name, color, data=None):
+        def section(name, color, data=None, *, family=None, subsection=None, order=0):
             row = {"type": "section", "name": name, "color": color}
+            if family:
+                row.update(family=family, family_label={"claude": "Claude", "openai": "OpenAI"}[family],
+                           subsection_label=subsection, subsection_order=order)
             note = _stale_note(data, lang)
             if note:
-                row["note"] = note
+                row["note"] = _tr(lang, "旧数据", "Stale")
             rows.append(row)
 
         def append(name, pct=None, disabled=False, value=None, reset=None, unknown=False, kind="percent", color=None):
@@ -3128,7 +3176,8 @@ class AiLimitApp(rumps.App):
             })
 
         if "claude" in services and self._claude and not self._claude.get("error"):
-            section("Claude", "#c4b5fd", self._claude)
+            section("Claude", "#c4b5fd", self._claude, family="claude",
+                    subsection=_tr(lang, "订阅与云端额度", "Subscription & cloud"))
             append("5h", self._claude.get("5h_left"), reset=self._claude.get("5h_reset"))
             append("weekly", self._claude.get("7d_left"), reset=self._claude.get("7d_reset"))
             for item in self._claude.get("weekly_models") or []:
@@ -3175,7 +3224,9 @@ class AiLimitApp(rumps.App):
                 # Account bindings and collection diagnostics remain in the
                 # snapshot/API, not the compact main window.
                 cached = record.get("status") == "stale"
-                section(label + (_tr(lang, " · 缓存", " · cached") if cached else ""), color)
+                section(label + (_tr(lang, " · 缓存", " · cached") if cached else ""), color,
+                        family=provider, subsection=_tr(lang, "API 额度", "API credits")
+                        + (_tr(lang, " · 缓存", " · cached") if cached else ""), order=1)
                 for key, zh_name, en_name in (
                     ("promotional_balance", "赠送余额", "Promotional"),
                     ("purchased_balance", "购买余额", "Purchased"),
@@ -3203,7 +3254,8 @@ class AiLimitApp(rumps.App):
         if "codex" in services:
             entries = self._widget_codex_entries()
             if entries:
-                section("CodeX", "#93c5fd")
+                section("CodeX", "#93c5fd", family="openai",
+                        subsection=_tr(lang, "Codex 用量与积分", "Codex usage & credits"))
                 for item in entries:
                     append(item["name"], item["pct"], item.get("disabled", False), reset=item.get("reset"), unknown=item.get("unknown", False))
                 credit_text = _codex_credit_summary(self._codex or {}, lang)

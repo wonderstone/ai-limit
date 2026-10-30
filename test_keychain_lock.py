@@ -143,7 +143,7 @@ class StaleDisplayTests(unittest.TestCase):
         sections = [row for row in rows if row.get("type") == "section"]
 
         self.assertEqual([row["name"] for row in sections], ["Claude", "Grok"])
-        self.assertTrue(all(row["note"] == "stale (14:17)" for row in sections))
+        self.assertTrue(all(row["note"] == "Stale" for row in sections))
 
     def test_text_export_explains_the_lock(self):
         text = self._app()._widget_text_body()
