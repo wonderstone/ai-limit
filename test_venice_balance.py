@@ -97,11 +97,19 @@ class LiveVeniceTests(unittest.TestCase):
         self.assertEqual(data["total_usd"], 25.0)
         self.assertEqual(urlopen.call_args.args[0].full_url, providers.VENICE_RATE_LIMITS_URL)
 
-    def test_auth_error_is_not_retried(self):
-        with mock.patch("urllib.request.urlopen", side_effect=_http_error(401)) as urlopen:
+    def test_inference_key_401_on_billing_uses_rate_limits(self):
+        import json
+
+        responses = [_http_error(401), _Response(json.dumps(RATE_LIMITS).encode())]
+        with mock.patch("urllib.request.urlopen", side_effect=responses):
+            _ts, data = live_venice_balance()
+        self.assertEqual(data["source"], "api.venice.ai api_keys/rate_limits")
+
+    def test_key_rejected_by_both_endpoints_is_an_auth_error(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[_http_error(401), _http_error(401)]) as urlopen:
             with self.assertRaises(VeniceAuthError):
                 live_venice_balance()
-        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_count, 2)
 
 
 class LoadVeniceKeyTests(unittest.TestCase):

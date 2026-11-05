@@ -2857,8 +2857,9 @@ def live_deepseek_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
 #
 # `GET /api/v1/billing/balance` (Beta) reports the account's USD balance net of
 # holds, bundled/earned credits, and the staked DIEM left this epoch. Older keys
-# may only reach `GET /api/v1/api_keys/rate_limits`, which carries the same
-# balances under upper-case names, so it is the fallback.
+# Inference-only keys get 401 there and only reach
+# `GET /api/v1/api_keys/rate_limits`, which carries the same balances under
+# upper-case names, so it is the fallback.
 
 def load_venice_api_key() -> str:
     env_key = os.environ.get("VENICE_API_KEY", "").strip()
@@ -2984,10 +2985,10 @@ def live_venice_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
     try:
         payload = _venice_get(VENICE_BALANCE_URL, api_key, timeout)
         normalized = _normalize_venice_balance(payload, "billing/balance")
-    except VeniceAuthError:
-        raise
     except VeniceError:
-        # billing/balance is Beta; the rate-limits view carries the same balances.
+        # billing/balance is Beta and answers 401 to inference-only keys; the
+        # rate-limits view takes those keys and carries the same balances.
+        # A key it rejects too raises VeniceAuthError from here.
         payload = _venice_get(VENICE_RATE_LIMITS_URL, api_key, timeout)
         normalized = _normalize_venice_balance(payload, "api_keys/rate_limits")
     return datetime.datetime.now(datetime.timezone.utc), normalized
