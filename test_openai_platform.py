@@ -46,6 +46,32 @@ class PlatformBalanceTests(unittest.TestCase):
             with mock.patch.object(p.providers, '_chromium_profile_cookie_files', return_value=[('Chosen', root/'Cookies')]):
                 with self.assertRaises(p.PlatformBalanceError):p.read_platform_session('Chosen')
 
+    def test_manifest_above_old_limit_is_parsed_but_new_hard_limit_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp); store = root/'Local Storage'/'leveldb'; store.mkdir(parents=True)
+            (store/'CURRENT').write_text('MANIFEST-000001')
+            manifest = store/'MANIFEST-000001'
+            for size, admitted in [(2 * 1024 * 1024 + 1, True), (p.MAX_MANIFEST_BYTES, True), (p.MAX_MANIFEST_BYTES + 1, False)]:
+                with self.subTest(size=size):
+                    with manifest.open('wb') as f:f.truncate(size)
+                    reader = mock.MagicMock(); reader.__iter__.return_value = iter([]); reader.damage = False
+                    with mock.patch.object(p.providers, '_chromium_profile_cookie_files', return_value=[('Chosen', root/'Cookies')]), mock.patch.object(p.ccl_leveldb, 'ManifestFile', return_value=reader) as parse:
+                        with self.assertRaises(p.PlatformBalanceError) as error:p.read_platform_session('Chosen')
+                        self.assertEqual(parse.called, admitted)
+                        self.assertEqual(error.exception.code, 'browser_storage_manifest' if admitted else 'browser_storage_limit')
+                        self.assertEqual(reader.close.called, admitted)
+
+    def test_manifest_edit_and_time_limits_close_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp); store = root/'Local Storage'/'leveldb'; store.mkdir(parents=True)
+            (store/'CURRENT').write_text('MANIFEST-000001'); (store/'MANIFEST-000001').touch()
+            edit = types.SimpleNamespace(deleted_files=[], new_files=[], log_number=1, prev_log_number=0)
+            for ticks in ([0, 0, 0], [0, p.MAX_MANIFEST_SECONDS + 1]):
+                reader = mock.MagicMock(); reader.__iter__.return_value = iter([edit, edit])
+                with mock.patch.object(p.providers, '_chromium_profile_cookie_files', return_value=[('Chosen', root/'Cookies')]), mock.patch.object(p.ccl_leveldb, 'ManifestFile', return_value=reader), mock.patch.object(p, 'MAX_MANIFEST_EDITS', 1), mock.patch.object(p.time, 'monotonic', side_effect=ticks):
+                    with self.assertRaises(p.PlatformBalanceError) as error:p.read_platform_session('Chosen')
+                    self.assertEqual(error.exception.code, 'browser_storage_limit'); reader.close.assert_called_once()
+
     def test_active_org_mismatch_never_exchanges_credentials(self):
         with mock.patch.object(p, 'read_platform_session', return_value=('fake-token', 'other-org')), mock.patch.object(p, '_request') as request:
             with self.assertRaises(p.PlatformBalanceError) as error:p.fetch_credit_grants('Chosen', 'target-org')

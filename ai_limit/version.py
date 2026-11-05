@@ -1,4 +1,4 @@
 """Authoritative ai-limit release identity."""
 
-__version__ = "0.3.52"
-__build_version__ = "355"
+__version__ = "0.3.53"
+__build_version__ = "357"

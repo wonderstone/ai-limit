@@ -23,6 +23,9 @@ MAX_BYTES = 64 * 1024 * 1024
 MAX_FILES = 64
 MAX_RECORDS = 250_000
 MAX_VALUE = 64 * 1024
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_MANIFEST_EDITS = 100_000
+MAX_MANIFEST_SECONDS = 8
 
 
 class PlatformBalanceError(Exception):
@@ -73,13 +76,16 @@ def read_platform_session(profile):
     if not re.fullmatch(r"MANIFEST-[0-9]{6,}", manifest_name):
         raise PlatformBalanceError("browser_storage_manifest")
     manifest = directory / manifest_name
-    if manifest.is_symlink() or manifest.stat().st_size > 2 * 1024 * 1024:
+    if manifest.is_symlink() or manifest.stat().st_size > MAX_MANIFEST_BYTES:
         raise PlatformBalanceError("browser_storage_limit")
     tables, log_number, previous_log = set(), None, 0
     before = {current: _stamp(current), manifest: _stamp(manifest)}
     reader = ccl_leveldb.ManifestFile(manifest)
+    started = time.monotonic()
     try:
-        for edit in reader:
+        for index, edit in enumerate(reader):
+            if index >= MAX_MANIFEST_EDITS or time.monotonic() - started > MAX_MANIFEST_SECONDS:
+                raise PlatformBalanceError("browser_storage_limit")
             for item in edit.deleted_files:
                 tables.discard(item.file_no)
             tables.update(item.file_no for item in edit.new_files)
