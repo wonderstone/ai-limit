@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
 import time
 import unittest
 from unittest import mock
 
 from ai_limit import api_server
+
+
+_widget_cache_patch = None
+
+
+def setUpModule():
+    # Never let these tests read the developer's real widget cache.
+    global _widget_cache_patch
+    _widget_cache_patch = mock.patch.object(
+        api_server, "_CLAUDE_WIDGET_CACHE_PATH", pathlib.Path("/nonexistent/ai-limit-widget-cache.json"))
+    _widget_cache_patch.start()
+
+
+def tearDownModule():
+    _widget_cache_patch.stop()
 
 
 class AggregateIsolationTests(unittest.TestCase):

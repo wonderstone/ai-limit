@@ -672,6 +672,10 @@ def _fetch_claude(lang):
             "7d_left":  int(round(100 - float(seven_d.get("utilization", 0)))),
             "5h_reset": five_h.get("resets_at"),
             "7d_reset": seven_d.get("resets_at"),
+            # Provider-specific observation time of this successful fetch. The
+            # file-level cached_at moves on every save, so only this stamp can
+            # date the Claude numbers (retained unchanged when they go stale).
+            "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
             # Model-scoped weekly caps (e.g. Fable), separate from the account-wide week.
             "weekly_models": claude_weekly_model_limits(data),
             "cloud_session_credits": claude_cloud_session_credits(data),

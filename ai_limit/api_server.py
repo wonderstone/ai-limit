@@ -12,8 +12,10 @@ import concurrent.futures
 import datetime as dt
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 import pathlib
+import stat
 import sys
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -81,6 +83,11 @@ _CODEX_DISK_CACHE_PATH = pathlib.Path.home() / ".cache" / "ai-limit" / "codex-qu
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+_CLAUDE_WIDGET_CACHE_PATH = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
+_CLAUDE_WIDGET_MAX_BYTES = 1024 * 1024
+_CLAUDE_WIDGET_MAX_AGE_SECONDS = 900
 
 
 def _as_bool(value: str | None) -> bool:
@@ -260,7 +267,106 @@ def _codex_rate_limits_payload(
     }
 
 
+def _widget_percent(value: Any) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if 0 <= value <= 100 and math.isfinite(value) else None
+
+
+def _widget_time(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _widget_reset_ok(value: Any, now: dt.datetime) -> bool:
+    """A missing reset is not applicable; a present one must be valid and still ahead."""
+    if value is None:
+        return True
+    parsed = _widget_time(value)
+    return parsed is not None and parsed > now
+
+
+def _claude_widget_snapshot() -> dict[str, Any] | None:
+    """Return the menu bar widget's Claude numbers when provably fresh, else None.
+
+    Freshness comes only from the provider-specific ``claude.observed_at``; the
+    file-level ``cached_at`` moves on every save and proves nothing here.
+    """
+    try:
+        path = _CLAUDE_WIDGET_CACHE_PATH
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _CLAUDE_WIDGET_MAX_BYTES:
+            return None
+        with path.open("rb") as handle:
+            blob = handle.read(_CLAUDE_WIDGET_MAX_BYTES + 1)
+        if len(blob) > _CLAUDE_WIDGET_MAX_BYTES:
+            return None
+        raw = json.loads(blob.decode("utf-8"))
+        claude = raw.get("claude") if isinstance(raw, dict) else None
+        if not isinstance(claude, dict) or claude.get("source") != "browser":
+            return None
+        if any(claude.get(key) for key in ("error", "stale_reason", "keychain_locked", "browser_key_unavailable")):
+            return None
+        now = dt.datetime.now(dt.timezone.utc)
+        observed = _widget_time(claude.get("observed_at"))
+        if observed is None or not 0 <= (now - observed).total_seconds() <= _CLAUDE_WIDGET_MAX_AGE_SECONDS:
+            return None
+        five_left, seven_left = _widget_percent(claude.get("5h_left")), _widget_percent(claude.get("7d_left"))
+        if five_left is None or seven_left is None:
+            return None
+        if not (_widget_reset_ok(claude.get("5h_reset"), now) and _widget_reset_ok(claude.get("7d_reset"), now)):
+            return None
+        models = []
+        for item in claude.get("weekly_models") or []:
+            remaining = _widget_percent(item.get("remaining_percent")) if isinstance(item, dict) else None
+            if remaining is None or not isinstance(item.get("model"), str):
+                return None
+            if not _widget_reset_ok(item.get("reset_time"), now):
+                return None
+            models.append({key: item.get(key) for key in (
+                "model", "window", "used_percent", "remaining_percent", "reset_time", "severity", "is_active")})
+        credits = claude.get("cloud_session_credits")
+        if credits is not None:
+            if not isinstance(credits, dict):
+                return None
+            credits = {key: credits.get(key) for key in (
+                "remaining", "reported_remaining", "limit", "used", "expires_at", "expired",
+                "locked_reason", "spendable", "amount_unit", "source_field")}
+        plan = claude.get("plan")
+        return {
+            "provider": "claude",
+            "available": True,
+            "observed_at": claude["observed_at"],
+            "source": "browser",
+            "plan": plan if isinstance(plan, str) else None,
+            "5h_left": five_left,
+            "7d_left": seven_left,
+            "5h_reset": claude.get("5h_reset"),
+            "7d_reset": claude.get("7d_reset"),
+            "weekly_models": models,
+            "cloud_session_credits": credits,
+            "7d_left_by_model": {item["model"]: item["remaining_percent"] for item in models},
+            "api_credit": None,
+            "cache": {
+                "status": "widget-hit",
+                "observed_at": claude["observed_at"],
+                "age_seconds": round((now - observed).total_seconds(), 3),
+                "ttl_seconds": _CLAUDE_WIDGET_MAX_AGE_SECONDS,
+            },
+        }
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
 def _claude_payload() -> dict[str, Any]:
+    snapshot = _claude_widget_snapshot()
+    if snapshot is not None:
+        return snapshot
     try:
         data = live_claude_usage(timeout=5)
         five_h = data.get("five_hour") or {}
