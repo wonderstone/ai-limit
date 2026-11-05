@@ -35,17 +35,21 @@ from ai_limit.providers import (  # noqa: E402
     GoogleQuotaError,
     GrokAuthError,
     GrokUsageError,
+    VeniceAuthError,
+    VeniceError,
     codex_5h_remaining_percent,
     codex_window_remaining_percent,
     codex_window_reset_time,
     current_codex_rate_limits,
     has_deepseek_api_key,
+    has_venice_api_key,
     has_gemini_app_cookies,
     has_google_oauth_creds,
     live_claude_plan,
     live_claude_api_credits,  # legacy import retained for downstream patchers
     live_claude_usage,
     live_deepseek_balance,
+    live_venice_balance,
     live_copilot_quota,
     live_gemini_app_usage,
     live_google_quota,
@@ -311,6 +315,33 @@ def _deepseek_payload() -> dict[str, Any] | None:
         return {"provider": "deepseek", "available": False, "observed_at": _utc_now(), "error": str(exc)}
 
 
+def _venice_payload(*, require_key: bool = False) -> dict[str, Any] | None:
+    if not has_venice_api_key() and not require_key:
+        return None
+    try:
+        observed_at, data = live_venice_balance(timeout=5)
+        return {
+            "provider": "venice",
+            "available": bool(data.get("available")),
+            "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "source": data.get("source") or "api.venice.ai",
+            "currency": "USD",
+            "total_usd": data.get("total_usd"),
+            "usd": data.get("usd"),
+            "bundled_credits": data.get("bundled_credits"),
+            "earned_credits": data.get("earned_credits"),
+            "diem": data.get("diem"),
+            "diem_epoch_allocation": data.get("diem_epoch_allocation"),
+            "diem_remaining_percent": data.get("diem_remaining_percent"),
+            "consumption_currency": data.get("consumption_currency"),
+            "api_tier": data.get("api_tier"),
+        }
+    except (VeniceAuthError, VeniceError) as exc:
+        return {"provider": "venice", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"provider": "venice", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
+
+
 def _google_payload() -> dict[str, Any] | None:
     if not has_google_oauth_creds():
         return None
@@ -482,6 +513,7 @@ def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
         "claude": _claude_payload,
         "codex": lambda: _codex_payload(allow_app_server=allow_app_server),
         "deepseek": _deepseek_payload,
+        "venice": _venice_payload,
         "google": _google_payload,
         "gemini": _gemini_payload,
         "llm_api": _llm_api_payload,
@@ -559,6 +591,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/quota/grok", "/v1/quota/grok"}:
             self._write_json(_grok_payload())
+            return
+        if parsed.path in {"/quota/venice", "/v1/quota/venice"}:
+            self._write_json(_venice_payload(require_key=True))
             return
         self._write_json({"error": "not_found", "path": parsed.path}, status=404)
 

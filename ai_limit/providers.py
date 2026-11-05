@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -22,6 +23,8 @@ from ai_limit.keychain_status import default_keychain_locked
 CLAUDE_USAGE_URL = "https://claude.ai/settings/usage"
 CODEX_USAGE_URL = "https://chatgpt.com/codex/cloud/settings/analytics"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+VENICE_BALANCE_URL = "https://api.venice.ai/api/v1/billing/balance"
+VENICE_RATE_LIMITS_URL = "https://api.venice.ai/api/v1/api_keys/rate_limits"
 GOOGLE_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
 GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
 GEMINI_APP_BATCHEXECUTE_URL = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
@@ -73,6 +76,10 @@ ANTIGRAVITY_TUI_PROMPT_RE = re.compile(r"(?:^|\n)>\s*(?:\n|$)")
 DEEPSEEK_KEY_PATHS = (
     pathlib.Path.home() / ".deepseek_api_key",
     pathlib.Path.home() / ".config" / "ai-limit" / "deepseek_api_key",
+)
+VENICE_KEY_PATHS = (
+    pathlib.Path.home() / ".venice_api_key",
+    pathlib.Path.home() / ".config" / "ai-limit" / "venice_api_key",
 )
 GOOGLE_MODEL_PRIORITY = (
     "gemini-2.5-pro",
@@ -169,6 +176,14 @@ class DeepSeekError(Exception):
 
 
 class DeepSeekAuthError(DeepSeekError):
+    pass
+
+
+class VeniceError(Exception):
+    pass
+
+
+class VeniceAuthError(VeniceError):
     pass
 
 
@@ -2836,6 +2851,146 @@ def live_deepseek_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         raise DeepSeekError("non-JSON response") from exc
 
     return datetime.datetime.now(datetime.timezone.utc), data
+
+
+# ── Venice (prepaid API balance) ──────────────────────────────────────────────
+#
+# `GET /api/v1/billing/balance` (Beta) reports the account's USD balance net of
+# holds, bundled/earned credits, and the staked DIEM left this epoch. Older keys
+# may only reach `GET /api/v1/api_keys/rate_limits`, which carries the same
+# balances under upper-case names, so it is the fallback.
+
+def load_venice_api_key() -> str:
+    env_key = os.environ.get("VENICE_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    for path in VENICE_KEY_PATHS:
+        try:
+            key = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if key:
+            return key
+    raise VeniceAuthError(
+        t(
+            "未找到 Venice API Key，请设置 VENICE_API_KEY 或 ~/.venice_api_key",
+            "Venice API key not found. Set VENICE_API_KEY or ~/.venice_api_key",
+        )
+    )
+
+
+def has_venice_api_key() -> bool:
+    try:
+        load_venice_api_key()
+    except VeniceAuthError:
+        return False
+    return True
+
+
+def _venice_amount(value) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _normalize_venice_balance(payload: dict, endpoint: str) -> dict:
+    if endpoint == "billing/balance":
+        balances = payload.get("balances") if isinstance(payload.get("balances"), dict) else {}
+        usd = _venice_amount(balances.get("usd"))
+        bundled = _venice_amount(balances.get("bundledCredits"))
+        earned = _venice_amount(balances.get("earnedCredits"))
+        diem = _venice_amount(balances.get("diem"))
+        can_consume = payload.get("canConsume")
+        consumption_currency = payload.get("consumptionCurrency")
+        diem_allocation = _venice_amount(payload.get("diemEpochAllocation"))
+        api_tier = None
+    else:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        balances = data.get("balances") if isinstance(data.get("balances"), dict) else {}
+        usd = _venice_amount(balances.get("USD"))
+        bundled = _venice_amount(balances.get("BUNDLED_CREDITS"))
+        earned = None
+        diem = _venice_amount(balances.get("DIEM"))
+        can_consume = data.get("accessPermitted")
+        consumption_currency = None
+        diem_allocation = None
+        tier = data.get("apiTier") if isinstance(data.get("apiTier"), dict) else {}
+        api_tier = tier.get("id")
+    if usd is None and bundled is None and earned is None and diem is None:
+        raise VeniceError("Venice response did not include balances")
+    usd_credits = [value for value in (usd, bundled, earned) if value is not None]
+    total_usd = round(sum(usd_credits), 4) if usd_credits else None
+    diem_remaining_percent = None
+    if diem is not None and diem_allocation:
+        diem_remaining_percent = max(0, min(100, int(round(diem / diem_allocation * 100))))
+    return {
+        "source": f"api.venice.ai {endpoint}",
+        "available": bool(can_consume) if can_consume is not None else (total_usd or 0) > 0 or (diem or 0) > 0,
+        "can_consume": can_consume,
+        "consumption_currency": consumption_currency,
+        "api_tier": api_tier,
+        "currency": "USD",
+        "usd": usd,
+        "bundled_credits": bundled,
+        "earned_credits": earned,
+        "total_usd": total_usd,
+        "diem": diem,
+        "diem_epoch_allocation": diem_allocation,
+        "diem_remaining_percent": diem_remaining_percent,
+    }
+
+
+def _venice_get(url: str, api_key: str, timeout: int) -> dict:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": f"ai-limit/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise VeniceAuthError(
+                t(
+                    f"HTTP {exc.code}：Venice API Key 无效或无权限",
+                    f"HTTP {exc.code}: Venice API key is invalid or unauthorized",
+                )
+            ) from exc
+        raise VeniceError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise VeniceError(str(exc)) from exc
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise VeniceError("non-JSON response") from exc
+    if not isinstance(data, dict):
+        raise VeniceError("unexpected Venice response shape")
+    return data
+
+
+def live_venice_balance(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    api_key = load_venice_api_key()
+    try:
+        payload = _venice_get(VENICE_BALANCE_URL, api_key, timeout)
+        normalized = _normalize_venice_balance(payload, "billing/balance")
+    except VeniceAuthError:
+        raise
+    except VeniceError:
+        # billing/balance is Beta; the rate-limits view carries the same balances.
+        payload = _venice_get(VENICE_RATE_LIMITS_URL, api_key, timeout)
+        normalized = _normalize_venice_balance(payload, "api_keys/rate_limits")
+    return datetime.datetime.now(datetime.timezone.utc), normalized
 
 
 # ── GitHub Copilot ────────────────────────────────────────────────────────────

@@ -22,17 +22,21 @@ from ai_limit.providers import (
     CodexAuthError,
     DeepSeekAuthError,
     DeepSeekError,
+    VeniceAuthError,
+    VeniceError,
     GeminiAppUsageError,
     GoogleQuotaAuthError,
     GoogleQuotaError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     has_deepseek_api_key,
+    has_venice_api_key,
     has_gemini_app_cookies,
     has_google_oauth_creds,
     live_gemini_app_usage,
     live_claude_plan,
     live_claude_usage,
     live_deepseek_balance,
+    live_venice_balance,
     live_google_quota,
 )
 from ai_limit.api_credits import live_api_credit_balances
@@ -605,6 +609,36 @@ def render_deepseek():
         print(f"  {currency:<4} {t('总余额', 'Total')}: {_BOLD}{total}{_RST}  |  {t('赠送', 'Granted')}: {granted}  |  {t('充值', 'Topped-up')}: {topped}")
 
 
+def render_venice():
+    title = "Venice API"
+    print(f"\n{_DIM}{SEP}{_RST}")
+    print(f"{_BOLD}{title.center(52)}{_RST}")
+    print()
+    try:
+        ts, data = live_venice_balance()
+    except (VeniceAuthError, VeniceError) as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  (api key live){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('source')}  (API key){_RST}")
+    print()
+    available = data.get("available")
+    print(f"  {t('可用状态', 'Availability')}: {_BOLD}{t('可用', 'available') if available else t('余额不足', 'insufficient')}{_RST}")
+    total = data.get("total_usd")
+    if total is not None:
+        parts = [f"USD {fmt_money(data.get('usd') or 0, 'USD')}"]
+        if data.get("bundled_credits"):
+            parts.append(f"{t('套餐赠送', 'Bundled')} {fmt_money(data['bundled_credits'], 'USD')}")
+        if data.get("earned_credits"):
+            parts.append(f"{t('奖励', 'Earned')} {fmt_money(data['earned_credits'], 'USD')}")
+        print(f"  USD  {t('总余额', 'Total')}: {_BOLD}{fmt_money(total, 'USD')}{_RST}  |  {'  |  '.join(parts)}")
+    if data.get("diem") is not None:
+        pct = data.get("diem_remaining_percent")
+        suffix = f"  ({t('本轮剩余', 'left this epoch')} {pct}%)" if pct is not None else ""
+        print(f"  DIEM {t('余额', 'Balance')}: {_BOLD}{data['diem']:g}{_RST}{suffix}")
+
+
 def render_google():
     title = "Google (Antigravity)"
     print(f"\n{_DIM}{SEP}{_RST}")
@@ -800,6 +834,8 @@ def main():
     render_codex(since)
     if has_deepseek_api_key():
         render_deepseek()
+    if has_venice_api_key():
+        render_venice()
     if has_google_oauth_creds():
         render_google()
     if has_gemini_app_cookies():
