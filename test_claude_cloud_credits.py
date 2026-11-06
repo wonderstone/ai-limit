@@ -48,8 +48,11 @@ class CloudCreditTests(unittest.TestCase):
         self.assertEqual(next(r['value'] for r in rows if r['name']=='Cloud credits'),'Unavailable')
 
     def test_locked_api_credit_is_not_a_spendable_balance(self):
+        import pathlib
         from ai_limit import api_server
-        with mock.patch.object(api_server,'live_claude_usage',return_value=payload(locked_reason='restricted')), mock.patch.object(api_server,'live_claude_plan',return_value='Max'):
+        # A running menu bar app keeps a fresh widget cache that _claude_payload
+        # would serve instead of the mocked live read.
+        with mock.patch.object(api_server,'_CLAUDE_WIDGET_CACHE_PATH',pathlib.Path('/nonexistent/ai-limit-widget-cache.json')), mock.patch.object(api_server,'live_claude_usage',return_value=payload(locked_reason='restricted')), mock.patch.object(api_server,'live_claude_plan',return_value='Max'):
             result=api_server._claude_payload()
         cloud=result['cloud_session_credits']
         self.assertFalse(cloud['spendable'])
