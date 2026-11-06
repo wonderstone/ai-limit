@@ -23,6 +23,8 @@ from ai_limit.providers import (
     DeepSeekAuthError,
     DeepSeekError,
     VeniceAuthError,
+    CloudflareAuthError,
+    CloudflareCreditsError,
     VeniceError,
     GeminiAppUsageError,
     GoogleQuotaAuthError,
@@ -30,6 +32,7 @@ from ai_limit.providers import (
     current_codex_rate_limits as resolve_codex_rate_limits,
     has_deepseek_api_key,
     has_venice_api_key,
+    has_cloudflare_cookies,
     has_gemini_app_cookies,
     has_google_oauth_creds,
     live_gemini_app_usage,
@@ -37,6 +40,7 @@ from ai_limit.providers import (
     live_claude_usage,
     live_deepseek_balance,
     live_venice_balance,
+    live_cloudflare_credits,
     live_google_quota,
 )
 from ai_limit.api_credits import live_api_credit_balances
@@ -639,6 +643,31 @@ def render_venice():
         print(f"  DIEM {t('余额', 'Balance')}: {_BOLD}{data['diem']:g}{_RST}{suffix}")
 
 
+def render_cloudflare():
+    title = "Cloudflare AI Gateway"
+    print(f"\n{_DIM}{SEP}{_RST}")
+    print(f"{_BOLD}{title.center(52)}{_RST}")
+    print()
+    try:
+        ts, data = live_cloudflare_credits()
+    except (CloudflareAuthError, CloudflareCreditsError) as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  (browser live, {data.get('browser_profile')}){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('source')}{_RST}")
+    print()
+    for account in data.get("accounts") or []:
+        balance = account.get("balance_usd")
+        shown = fmt_money(balance, "USD") if balance is not None else "?"
+        print(f"  {account.get('account_name') or account.get('account_id')}")
+        print(f"    {t('余额', 'Credits')}: {_BOLD}{shown}{_RST}")
+        if account.get("spending_limit_enabled"):
+            print(f"    {t('花费上限', 'Spending limit')}: {account.get('spending_limit_amount')} / {account.get('spending_limit_period')}")
+        if account.get("auto_topup_amount_usd"):
+            print(f"    {t('自动充值', 'Auto top-up')}: {fmt_money(account['auto_topup_amount_usd'], 'USD')} @ {fmt_money(account.get('auto_topup_threshold_usd') or 0, 'USD')}")
+
+
 def render_google():
     title = "Google (Antigravity)"
     print(f"\n{_DIM}{SEP}{_RST}")
@@ -836,6 +865,8 @@ def main():
         render_deepseek()
     if has_venice_api_key():
         render_venice()
+    if has_cloudflare_cookies():
+        render_cloudflare()
     if has_google_oauth_creds():
         render_google()
     if has_gemini_app_cookies():

@@ -92,6 +92,10 @@ from ai_limit.providers import (
     live_venice_balance,
     VeniceAuthError,
     VeniceError,
+    CloudflareAuthError,
+    CloudflareCreditsError,
+    has_cloudflare_cookies,
+    live_cloudflare_credits,
 )
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -103,7 +107,7 @@ _ERROR_CACHE_TTL = 5
 _REFRESH_SEC  = 60
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
-_SERVICES      = ("claude", "codex", "deepseek", "venice", "google", "gemini", "copilot", "grok")
+_SERVICES      = ("claude", "codex", "deepseek", "venice", "cloudflare", "google", "gemini", "copilot", "grok")
 _MENU_MIN_WIDTH = 290
 _ZH_WEEKDAYS   = "一二三四五六日"
 _EN_WEEKDAYS   = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -113,6 +117,7 @@ _AUTHOR_URL_ZH = "https://gitee.com/zhuchenxi113"
 _AUTHOR_URL_EN = "https://github.com/zhuchenxi113"
 _DEEPSEEK_USAGE_URL = "https://platform.deepseek.com/usage"
 _VENICE_API_URL = "https://venice.ai/settings/api"
+_CLOUDFLARE_CREDITS_URL = "https://dash.cloudflare.com/?to=/:account/ai/ai-gateway/credits"
 _GOOGLE_QUOTA_DOCS_URL = "https://antigravity.google/docs/cli-credits"
 _GEMINI_APP_USAGE_URL = "https://gemini.google.com/usage"
 _LAUNCH_AGENT_LABEL = "com.zhuchenxi.ai-limit"
@@ -132,6 +137,8 @@ def _default_services():
         services.append("deepseek")
     if has_venice_api_key():
         services.append("venice")
+    if has_cloudflare_cookies():
+        services.append("cloudflare")
     if has_google_oauth_creds():
         services.append("google")
     if has_gemini_app_cookies():
@@ -296,6 +303,7 @@ def _status_service_label(service):
         "codex": "X",
         "deepseek": "D",
         "venice": "V",
+        "cloudflare": "CF",
         "google": "G",
         "gemini": "M",
         "copilot": "CP",
@@ -446,7 +454,9 @@ def _load_state():
                     svc.append("grok")
                 if "venice" not in offered and "venice" not in svc and has_venice_api_key():
                     svc.append("venice")
-                state["offered"] = sorted(set(offered) | {"grok", "venice"})
+                if "cloudflare" not in offered and "cloudflare" not in svc and has_cloudflare_cookies():
+                    svc.append("cloudflare")
+                state["offered"] = sorted(set(offered) | {"grok", "venice", "cloudflare"})
                 if svc:
                     state["services"] = svc
     except Exception:
@@ -476,6 +486,7 @@ def _load_cache():
                 "codex": codex,
                 "deepseek": raw.get("deepseek"),
                 "venice": raw.get("venice"),
+                "cloudflare": raw.get("cloudflare"),
                 "google": raw.get("google"),
                 "gemini": raw.get("gemini"),
                 "copilot": raw.get("copilot"),
@@ -517,18 +528,19 @@ def _save_cache(claude, cached):
     try:
         if isinstance(cached, dict) and (
             "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached
-            or "copilot" in cached or "grok" in cached or "venice" in cached
+            or "copilot" in cached or "grok" in cached or "venice" in cached or "cloudflare" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             venice = cached.get("venice")
+            cloudflare = cached.get("cloudflare")
             google = cached.get("google")
             gemini = cached.get("gemini")
             copilot = cached.get("copilot")
             grok = cached.get("grok")
         else:
             codex = cached
-            deepseek = venice = google = gemini = copilot = grok = None
+            deepseek = venice = cloudflare = google = gemini = copilot = grok = None
         _CACHE_PATH.write_text(
             json.dumps({
                 "cached_at": datetime.datetime.now().timestamp(),
@@ -536,6 +548,7 @@ def _save_cache(claude, cached):
                 "codex": codex,
                 "deepseek": deepseek,
                 "venice": venice,
+                "cloudflare": cloudflare,
                 "google": google,
                 "gemini": gemini,
                 "copilot": copilot,
@@ -812,6 +825,25 @@ def _fetch_venice(lang):
         }
     except (VeniceAuthError, VeniceError) as e:
         return {"error": str(e)}
+    except (socket.timeout, TimeoutError):
+        return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
+    except urllib.error.URLError:
+        return {"error": _tr(lang, "网络不可用", "Network unavailable")}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _fetch_cloudflare(lang):
+    import socket, urllib.error
+    try:
+        _ts, data = live_cloudflare_credits()
+        return {
+            **data,
+            "primary": {"currency": "USD", "total_balance": data.get("total_usd") or 0},
+            "source": "browser live",
+        }
+    except (CloudflareAuthError, CloudflareCreditsError) as e:
+        return _error_result(e)
     except (socket.timeout, TimeoutError):
         return {"error": _tr(lang, "网络超时，请稍后重试", "Network timeout, please retry later")}
     except urllib.error.URLError:
@@ -1401,6 +1433,7 @@ class AiLimitApp(rumps.App):
     # Venice joined after the other services; a class default keeps instances
     # built without __init__ (tests, partial setups) from tripping on it.
     _venice = None
+    _cloudflare = None
 
     def __init__(self):
         super().__init__("…", quit_button=None)
@@ -1409,6 +1442,7 @@ class AiLimitApp(rumps.App):
         self._codex  = None
         self._deepseek = None
         self._venice = None
+        self._cloudflare = None
         self._google = None
         self._gemini = None
         self._copilot = None
@@ -1492,6 +1526,7 @@ class AiLimitApp(rumps.App):
         self._svc_codex  = rumps.MenuItem("CodeX",       callback=self._toggle_codex)
         self._svc_deepseek = rumps.MenuItem("DeepSeek",  callback=self._toggle_deepseek)
         self._svc_venice = rumps.MenuItem("Venice", callback=self._toggle_venice)
+        self._svc_cloudflare = rumps.MenuItem("Cloudflare", callback=self._toggle_cloudflare)
         self._svc_google = rumps.MenuItem("Google", callback=self._toggle_google)
         self._svc_gemini = rumps.MenuItem("Gemini App", callback=self._toggle_gemini)
         self._svc_copilot = rumps.MenuItem("Copilot", callback=self._toggle_copilot)
@@ -1502,6 +1537,7 @@ class AiLimitApp(rumps.App):
         self._svc_menu.add(self._svc_codex)
         self._svc_menu.add(self._svc_deepseek)
         self._svc_menu.add(self._svc_venice)
+        self._svc_menu.add(self._svc_cloudflare)
         self._svc_menu.add(self._svc_google)
         self._svc_menu.add(self._svc_gemini)
         self._svc_menu.add(self._svc_copilot)
@@ -1547,6 +1583,10 @@ class AiLimitApp(rumps.App):
             "打开 Venice API 页" if lang == "zh" else "Open Venice API dashboard",
             callback=lambda _: webbrowser.open(_VENICE_API_URL),
         )
+        self._cloudflare_dash = rumps.MenuItem(
+            "打开 Cloudflare 额度页" if lang == "zh" else "Open Cloudflare credits",
+            callback=lambda _: webbrowser.open(_CLOUDFLARE_CREDITS_URL),
+        )
         self._google_dash = rumps.MenuItem(
             "打开 Google 配额说明页" if lang == "zh" else "Open Google quota docs",
             callback=lambda _: webbrowser.open(_GOOGLE_QUOTA_DOCS_URL),
@@ -1575,7 +1615,7 @@ class AiLimitApp(rumps.App):
             f"版本：ai-limit {__version__}" if lang == "zh" else f"Version: ai-limit {__version__}"
         ))
         self._about_scope  = _disable(rumps.MenuItem(
-            "监控：Claude / CodeX / DeepSeek / Venice / Google / Gemini App / Copilot / Grok" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Venice / Google / Gemini App / Copilot / Grok"
+            "监控：Claude / CodeX / DeepSeek / Venice / Cloudflare / Google / Gemini App / Copilot / Grok" if lang == "zh" else "Monitors: Claude / CodeX / DeepSeek / Venice / Cloudflare / Google / Gemini App / Copilot / Grok"
         ))
         self._about_surfaces = _disable(rumps.MenuItem(
             "界面：菜单栏 / CLI / daemon" if lang == "zh" else "Surfaces: menu bar / CLI / daemon"
@@ -1610,6 +1650,7 @@ class AiLimitApp(rumps.App):
             self._openai_billing_dash,
             self._deepseek_dash,
             self._venice_dash,
+            self._cloudflare_dash,
             self._google_dash,
             self._gemini_dash,
             self._copilot_dash,
@@ -1676,6 +1717,7 @@ class AiLimitApp(rumps.App):
         claude, codex, deepseek, google, gemini, copilot, grok = pending[:7]
         api_credits_v1 = pending[7] if len(pending) > 7 else None
         venice = pending[8] if len(pending) > 8 else None
+        cloudflare = pending[9] if len(pending) > 9 else None
         if claude is not None:
             self._claude = _keep_through_keychain_lock(self._claude, claude)
         if codex is not None:
@@ -1689,6 +1731,8 @@ class AiLimitApp(rumps.App):
             self._deepseek = deepseek
         if venice is not None:
             self._venice = venice
+        if cloudflare is not None:
+            self._cloudflare = _keep_through_keychain_lock(self._cloudflare, cloudflare)
         if google is not None:
             self._google = google
         if gemini is not None:
@@ -1705,6 +1749,7 @@ class AiLimitApp(rumps.App):
                 "codex": self._codex,
                 "deepseek": self._deepseek,
                 "venice": self._venice,
+                "cloudflare": self._cloudflare,
                 "google": self._google,
                 "gemini": self._gemini,
                 "copilot": self._copilot,
@@ -1719,17 +1764,19 @@ class AiLimitApp(rumps.App):
         codex = None
         deepseek = None
         venice = None
+        cloudflare = None
         google = None
         gemini = None
         copilot = None
         grok = None
         if isinstance(cached, dict) and (
             "codex" in cached or "deepseek" in cached or "google" in cached or "gemini" in cached
-            or "copilot" in cached or "grok" in cached or "venice" in cached
+            or "copilot" in cached or "grok" in cached or "venice" in cached or "cloudflare" in cached
         ):
             codex = cached.get("codex")
             deepseek = cached.get("deepseek")
             venice = cached.get("venice")
+            cloudflare = cached.get("cloudflare")
             google = cached.get("google")
             gemini = cached.get("gemini")
             copilot = cached.get("copilot")
@@ -1745,6 +1792,8 @@ class AiLimitApp(rumps.App):
             self._deepseek = deepseek
         if venice is not None:
             self._venice = venice
+        if cloudflare is not None:
+            self._cloudflare = cloudflare
         if google is not None:
             self._google = google
         if gemini is not None:
@@ -1803,8 +1852,9 @@ class AiLimitApp(rumps.App):
         copilot = _fetch_copilot(lang) if "copilot" in services else None
         grok = _fetch_grok(lang) if "grok" in services else None
         venice = _fetch_venice(lang) if "venice" in services else None
+        cloudflare = _fetch_cloudflare(lang) if "cloudflare" in services else None
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok, api_credits_v1, venice)
+            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok, api_credits_v1, venice, cloudflare)
 
     def _render(self):
         lang     = self._state["lang"]
@@ -2831,6 +2881,7 @@ class AiLimitApp(rumps.App):
             ("grok", "Grok", "bolt.fill", "#52525b", self._grok or {}),
             ("deepseek", "DeepSeek", "dollarsign.circle.fill", "#0891b2", self._deepseek or {}),
             ("venice", "Venice", "dollarsign.circle.fill", "#c2410c", self._venice or {}),
+            ("cloudflare", "Cloudflare", "cloud.fill", "#ea580c", self._cloudflare or {}),
         ]
         for service, title, symbol, accent, data in specs:
             if service not in services:
@@ -2886,7 +2937,7 @@ class AiLimitApp(rumps.App):
             pct = 100 if data.get("available") and _balance_amount(primary) > 0 else 0
             value = _fmt_balance_compact(primary)
             subtitle = _tr(lang, "API balance", "API balance")
-        elif service == "venice" and data:
+        elif service in ("venice", "cloudflare") and data:
             primary = data.get("primary") or {}
             pct = 100 if data.get("available") and _balance_amount(primary) > 0 else 0
             value = _fmt_balance_compact(primary)
@@ -3140,6 +3191,7 @@ class AiLimitApp(rumps.App):
             "Grok": "GK",
             "DeepSeek": "DS",
             "Venice": "VN",
+            "Cloudflare": "CF",
         }
         for item in self._widget_detail_rows(include_disabled=False):
             if item.get("type") == "section":
@@ -3171,6 +3223,7 @@ class AiLimitApp(rumps.App):
             ("codex", self._codex or {}),
             ("deepseek", self._deepseek or {}),
             ("venice", self._venice or {}),
+            ("cloudflare", self._cloudflare or {}),
             ("google", self._google or {}),
             ("gemini", self._gemini or {}),
             ("copilot", self._copilot or {}),
@@ -3211,6 +3264,8 @@ class AiLimitApp(rumps.App):
             return "D"
         if "venice" in text:
             return "V"
+        if "cloudflare" in text:
+            return "CF"
         return "AI"
 
     def _widget_detail_rows(self, include_disabled=True):
@@ -3369,6 +3424,14 @@ class AiLimitApp(rumps.App):
             )
             if self._venice.get("diem_remaining_percent") is not None:
                 append("DIEM", self._venice.get("diem_remaining_percent"))
+        if "cloudflare" in services and self._cloudflare and not self._cloudflare.get("error"):
+            section("Cloudflare", "#fb923c", self._cloudflare)
+            append(
+                _tr(lang, "AI 额度", "AI credits"),
+                value=_fmt_balance_compact(self._cloudflare.get("primary") or {}),
+                kind="balance",
+                color="#fb923c",
+            )
         if "google" in services:
             entries = self._widget_google_entries()
             if entries:
@@ -3532,6 +3595,8 @@ class AiLimitApp(rumps.App):
             lines.extend(self._widget_deepseek_lines())
         if "venice" in services:
             lines.extend(self._widget_venice_lines())
+        if "cloudflare" in services:
+            lines.extend(self._widget_cloudflare_lines())
         if "google" in services:
             lines.extend(self._widget_google_lines())
         if "gemini" in services:
@@ -3643,6 +3708,22 @@ class AiLimitApp(rumps.App):
             lines.append(f"  USD: {total}{suffix}")
             if data.get("diem") is not None:
                 lines.append(f"  DIEM: {data['diem']:g}")
+        lines.append("")
+        return lines
+
+    def _widget_cloudflare_lines(self):
+        lang = self._state["lang"]
+        data = self._cloudflare or {}
+        lines = self._widget_section("Cloudflare AI Gateway", data, data.get("source") or "browser live")
+        if data and not data.get("error"):
+            for account in data.get("accounts") or []:
+                balance = account.get("balance_usd")
+                shown = fmt_money(balance, "USD") if balance is not None else "?"
+                limit = ""
+                if account.get("spending_limit_enabled"):
+                    limit = _tr(lang, f"    上限 ${account.get('spending_limit_amount')}/{account.get('spending_limit_period')}",
+                                f"    limit ${account.get('spending_limit_amount')}/{account.get('spending_limit_period')}")
+                lines.append(_tr(lang, f"  额度: {shown}{limit}", f"  Credits: {shown}{limit}"))
         lines.append("")
         return lines
 
@@ -3793,6 +3874,7 @@ class AiLimitApp(rumps.App):
         self._openai_billing_dash.title = _tr(lang, "打开 OpenAI API 账单页", "Open OpenAI API billing")
         self._deepseek_dash.title = _tr(lang, "打开 DeepSeek 用量页", "Open DeepSeek usage")
         self._venice_dash.title = _tr(lang, "打开 Venice API 页", "Open Venice API dashboard")
+        self._cloudflare_dash.title = _tr(lang, "打开 Cloudflare 额度页", "Open Cloudflare credits")
         self._google_dash.title = _tr(lang, "打开 Google 配额说明页", "Open Google quota docs")
         self._gemini_dash.title = _tr(lang, "打开 Gemini App 用量页", "Open Gemini App usage")
         self._copilot_dash.title = _tr(lang, "打开 Copilot 用量页", "Open Copilot usage")
@@ -3807,8 +3889,8 @@ class AiLimitApp(rumps.App):
             f"Version: ai-limit {__version__}",
         )
         self._about_scope.title = _tr(lang,
-            "监控：Claude / CodeX / DeepSeek / Venice / Google / Gemini App / Copilot / Grok",
-            "Monitors: Claude / CodeX / DeepSeek / Venice / Google / Gemini App / Copilot / Grok",
+            "监控：Claude / CodeX / DeepSeek / Venice / Cloudflare / Google / Gemini App / Copilot / Grok",
+            "Monitors: Claude / CodeX / DeepSeek / Venice / Cloudflare / Google / Gemini App / Copilot / Grok",
         )
         self._about_surfaces.title = _tr(lang,
             "界面：菜单栏 / CLI / daemon",
@@ -3844,6 +3926,9 @@ class AiLimitApp(rumps.App):
 
     def _toggle_venice(self, _):
         self._toggle_service("venice")
+
+    def _toggle_cloudflare(self, _):
+        self._toggle_service("cloudflare")
 
     def _toggle_google(self, _):
         self._toggle_service("google")
@@ -3892,6 +3977,7 @@ class AiLimitApp(rumps.App):
         self._svc_codex.title  = ("✓ " if "codex"  in svc else "  ") + "CodeX"
         self._svc_deepseek.title = ("✓ " if "deepseek" in svc else "  ") + "DeepSeek"
         self._svc_venice.title = ("✓ " if "venice" in svc else "  ") + "Venice"
+        self._svc_cloudflare.title = ("✓ " if "cloudflare" in svc else "  ") + "Cloudflare"
         self._svc_google.title = ("✓ " if "google" in svc else "  ") + "Google"
         self._svc_gemini.title = ("✓ " if "gemini" in svc else "  ") + "Gemini App"
         self._svc_copilot.title = ("✓ " if "copilot" in svc else "  ") + "Copilot"
@@ -3905,6 +3991,8 @@ class AiLimitApp(rumps.App):
             enabled.append("DeepSeek")
         if "venice" in svc:
             enabled.append("Venice")
+        if "cloudflare" in svc:
+            enabled.append("Cloudflare")
         if "google" in svc:
             enabled.append("Google")
         if "gemini" in svc:

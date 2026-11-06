@@ -3632,3 +3632,179 @@ def live_grok_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         _raise_grok_grpc_status(int(header_status))
     normalized = _normalize_grok_credits_config(_parse_grpc_web_proto(body))
     return datetime.datetime.now(datetime.timezone.utc), normalized
+
+
+# ── Cloudflare (AI Gateway unified-billing credits) ───────────────────────────
+#
+# dash.cloudflare.com → AI → AI Gateway → Credits reads
+# `GET /api/v4/accounts/{id}/ai-gateway/billing/credit-balance`, whose
+# `result.balance` is in US cents (2500 = $25.00). The dashboard session cookie
+# (`vses2`) authorizes it, so no API token is needed; accounts are discovered
+# through `/api/v4/accounts` unless CLOUDFLARE_ACCOUNT_ID pins one.
+
+CLOUDFLARE_DASH_API = "https://dash.cloudflare.com/api/v4"
+CLOUDFLARE_CREDITS_URL = "https://dash.cloudflare.com/?to=/:account/ai/ai-gateway/credits"
+CLOUDFLARE_SESSION_COOKIES = ("vses2",)
+
+
+class CloudflareCreditsError(Exception):
+    pass
+
+
+class CloudflareAuthError(CloudflareCreditsError):
+    pass
+
+
+def _cloudflare_cookie_sets() -> list[tuple[str, str]]:
+    """Every browser profile holding a dash session, as (label, Cookie header)."""
+    try:
+        import browser_cookie3
+    except ImportError as exc:
+        raise CloudflareCreditsError(
+            t(
+                "未安装 browser_cookie3，请先运行: pip install browser-cookie3",
+                "browser_cookie3 not installed, run: pip install browser-cookie3",
+            )
+        ) from exc
+    loaders = [
+        (
+            f"Chrome/{(path.parent.parent if path.parent.name == 'Network' else path.parent).name}",
+            lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="cloudflare.com"),
+        )
+        for path in _chrome_profile_cookie_files()
+    ]
+    loaders.extend(
+        (label, lambda path=path: browser_cookie3.chrome(cookie_file=str(path), domain_name="cloudflare.com"))
+        for label, path in _chromium_profile_cookie_files()
+        if label.startswith("Chrome Canary/")
+    )
+    sets, errs = [], []
+    for name, loader in loaders:
+        try:
+            cookies = [(c.name, c.value) for c in loader() if c.domain.endswith("cloudflare.com")]
+        except Exception as exc:
+            errs.append(f"{name}: {exc}")
+            continue
+        if any(cookie_name in CLOUDFLARE_SESSION_COOKIES for cookie_name, _ in cookies):
+            sets.append((name, "; ".join(f"{k}={v}" for k, v in cookies)))
+    if sets:
+        return sets
+    if _chrome_keychain_locked(errs):
+        raise _keychain_locked_error(CloudflareAuthError)
+    detail = f" ({'; '.join(errs)})" if errs else ""
+    raise CloudflareAuthError(
+        t(
+            f"未找到 Cloudflare 登录 cookie{detail}，请先在 Chrome 登录 dash.cloudflare.com",
+            f"Cloudflare sign-in cookies not found{detail}; sign in to dash.cloudflare.com in Chrome",
+        )
+    )
+
+
+def has_cloudflare_cookies() -> bool:
+    try:
+        _cloudflare_cookie_sets()
+    except CloudflareCreditsError:
+        return False
+    return True
+
+
+def _cloudflare_get(path: str, cookie_header: str, timeout: int) -> dict:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{CLOUDFLARE_DASH_API}{path}",
+        headers={
+            "Cookie": cookie_header,
+            "Accept": "application/json",
+            "User-Agent": CHATGPT_UA,
+            "Referer": "https://dash.cloudflare.com/",
+            "X-Cross-Site-Security": "dash",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            # An expired dash session answers 400 (code 9300) or 403 (10000).
+            raise CloudflareAuthError(
+                t(
+                    f"HTTP {exc.code}：Cloudflare 登录已失效，请在 Chrome 重新登录 dash.cloudflare.com",
+                    f"HTTP {exc.code}: Cloudflare session expired; sign in to dash.cloudflare.com in Chrome again",
+                )
+            ) from exc
+        raise CloudflareCreditsError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise CloudflareCreditsError(str(exc)) from exc
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise CloudflareCreditsError("non-JSON response") from exc
+    if not isinstance(data, dict) or not data.get("success"):
+        raise CloudflareCreditsError("Cloudflare API reported failure")
+    return data
+
+
+def _cloudflare_cents(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return round(value / 100.0, 2)
+
+
+def _normalize_cloudflare_account(account: dict, balance: dict, spending: dict | None) -> dict:
+    topup = balance.get("topup_config") if isinstance(balance.get("topup_config"), dict) else {}
+    spending = spending if isinstance(spending, dict) else {}
+    limit_config = spending.get("config") if isinstance(spending.get("config"), dict) else {}
+    return {
+        "account_id": account.get("id"),
+        "account_name": account.get("name"),
+        "balance_usd": _cloudflare_cents(balance.get("balance")),
+        "auto_topup_threshold_usd": _cloudflare_cents(topup.get("threshold")),
+        "auto_topup_amount_usd": _cloudflare_cents(topup.get("amount")),
+        "spending_limit_enabled": bool(spending.get("enabled")),
+        "spending_limit_amount": limit_config.get("amount") if spending.get("enabled") else None,
+        "spending_limit_period": limit_config.get("duration") if spending.get("enabled") else None,
+    }
+
+
+def live_cloudflare_credits(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    pinned = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    errors = []
+    for profile, cookie_header in _cloudflare_cookie_sets():
+        try:
+            if pinned:
+                accounts = [{"id": pinned, "name": None}]
+            else:
+                listed = _cloudflare_get("/accounts?per_page=50", cookie_header, timeout).get("result") or []
+                accounts = [item for item in listed if isinstance(item, dict) and item.get("id")]
+            results = []
+            for account in accounts:
+                base = f"/accounts/{account['id']}/ai-gateway/billing"
+                try:
+                    balance = _cloudflare_get(f"{base}/credit-balance", cookie_header, timeout).get("result") or {}
+                except CloudflareAuthError:
+                    # A member without billing rights on one account must not hide the others.
+                    continue
+                try:
+                    spending = _cloudflare_get(f"{base}/spending-limit", cookie_header, timeout).get("result")
+                except CloudflareCreditsError:
+                    spending = None
+                results.append(_normalize_cloudflare_account(account, balance, spending))
+        except CloudflareAuthError as exc:
+            errors.append(f"{profile}: {exc}")
+            continue
+        if not results:
+            errors.append(f"{profile}: no account exposes AI Gateway credits")
+            continue
+        balances = [item["balance_usd"] for item in results if item["balance_usd"] is not None]
+        total = round(sum(balances), 2) if balances else None
+        return datetime.datetime.now(datetime.timezone.utc), {
+            "source": "dash.cloudflare.com ai-gateway/billing/credit-balance",
+            "browser_profile": profile,
+            "currency": "USD",
+            "total_usd": total,
+            "available": bool(total and total > 0),
+            "accounts": results,
+        }
+    raise CloudflareAuthError("; ".join(errors) or "no Cloudflare session")
