@@ -87,7 +87,8 @@ class LiveTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_posts_key_in_body(self):
-        with mock.patch("urllib.request.urlopen", return_value=_Response(json.dumps(STATUS).encode())) as urlopen:
+        with mock.patch.object(providers, "runninghub_points_expiry", return_value=None), \
+                mock.patch("urllib.request.urlopen", return_value=_Response(json.dumps(STATUS).encode())) as urlopen:
             _ts, data = live_runninghub_status()
         request = urlopen.call_args.args[0]
         self.assertTrue(request.full_url.endswith("/uc/openapi/accountStatus"))
@@ -99,6 +100,67 @@ class LiveTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(RunningHubAuthError):
                 live_runninghub_status()
+
+
+POINT_RECORDS = {
+    "code": 0,
+    "msg": "success",
+    "data": {
+        "records": [
+            {"sourceType": "SUBSCRIPTION_BONUS", "sourceTypeDesc": "会员加赠", "amountUnit": "400000",
+             "remainedUnit": "23620", "gainTime": "2026-11-08 22:27:00", "expiredTime": "2099-12-09 22:27:00", "expired": False},
+            {"sourceType": "SUBSCRIPTION_GRANT", "sourceTypeDesc": "会员权益发放", "amountUnit": "18900000",
+             "remainedUnit": "18900000", "gainTime": "2026-11-08 22:27:00", "expiredTime": "2099-12-10 22:27:00", "expired": False},
+            {"sourceType": "OLD", "amountUnit": "5000", "remainedUnit": "5000", "expiredTime": "2026-01-01 00:00:00", "expired": True},
+            {"sourceType": "USED", "amountUnit": "5000", "remainedUnit": "0", "expiredTime": "2099-01-01 00:00:00", "expired": False},
+        ],
+        "pages": "1",
+    },
+}
+
+
+class PointExpiryTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(providers, "RUNNINGHUB_POINTS_CACHE_PATH", pathlib.Path(tmp.name) / "points.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_batches_use_thousandth_units_and_beijing_time(self):
+        with mock.patch.object(providers, "_runninghub_access_tokens", return_value=[("Chrome/Default", "tok")]), \
+                mock.patch("urllib.request.urlopen", return_value=_Response(json.dumps(POINT_RECORDS).encode())) as urlopen:
+            expiry = providers.runninghub_points_expiry("https://www.runninghub.ai")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer tok")
+        self.assertEqual([b["remaining"] for b in expiry["point_batches"]], [23.62, 18900.0])
+        self.assertEqual(expiry["points_next_expiry"], "2099-12-09T14:27:00Z")
+        self.assertEqual(expiry["points_expiring_next"], 23.62)
+        self.assertEqual(expiry["points_expiry_source"], "browser live")
+
+    def test_lapsed_session_serves_the_last_good_read_as_cached(self):
+        with mock.patch.object(providers, "_runninghub_access_tokens", return_value=[("Chrome/Default", "tok")]), \
+                mock.patch("urllib.request.urlopen", return_value=_Response(json.dumps(POINT_RECORDS).encode())):
+            providers.runninghub_points_expiry()
+        err = urllib.error.HTTPError("https://www.runninghub.ai", 403, "err", {}, io.BytesIO(b"{}"))
+        with mock.patch.object(providers, "_runninghub_access_tokens", return_value=[("Chrome/Default", "old")]), \
+                mock.patch("urllib.request.urlopen", side_effect=err):
+            expiry = providers.runninghub_points_expiry()
+        self.assertEqual(expiry["points_expiry_source"], "cached")
+        self.assertEqual(expiry["points_next_expiry"], "2099-12-09T14:27:00Z")
+
+    def test_no_session_and_no_cache_is_none(self):
+        with mock.patch.object(providers, "_runninghub_access_tokens", return_value=[]):
+            self.assertIsNone(providers.runninghub_points_expiry())
+
+    def test_menubar_shows_next_expiry_and_partial_amount(self):
+        data = {"remain_points": 18923.62, "points_next_expiry": "2099-12-09T14:27:00Z",
+                "points_expiring_next": 23.62, "points_expiry_source": "cached"}
+        label = menubar._runninghub_expiry_label(data, "zh")
+        self.assertIn("· 24", label)
+        self.assertTrue(label.endswith("（缓存）"))
+        whole = menubar._runninghub_expiry_label({**data, "points_expiring_next": 18923.62, "points_expiry_source": "browser live"}, "zh")
+        self.assertNotIn("·", whole)
 
 
 class ApiServerTests(unittest.TestCase):

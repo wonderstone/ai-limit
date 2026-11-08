@@ -668,6 +668,11 @@ def render_runninghub():
     if data.get("remain_points") is not None:
         points = data["remain_points"]
         print(f"  {t('积分', 'Points')}: {_BOLD}{points:,.1f}{_RST}  (≈¥{points / 100:,.2f})")
+        if data.get("points_next_expiry"):
+            expires = fmt_dt(datetime.datetime.fromisoformat(data["points_next_expiry"].replace("Z", "+00:00")).astimezone())
+            amount = data.get("points_expiring_next")
+            cached = f"  ({t('缓存', 'cached')})" if data.get("points_expiry_source") == "cached" else ""
+            print(f"  {t('积分到期', 'Points expire')}: {_BOLD}{expires}{_RST}  {t('到期', 'expiring')} {amount:,.1f}{cached}")
     if data.get("remain_money") is not None:
         print(f"  {t('钱包', 'Wallet')}: {_BOLD}{fmt_money(data['remain_money'], currency)}{_RST}  ({t('企业级 API 按量扣费', 'enterprise API usage')})")
     parts = []

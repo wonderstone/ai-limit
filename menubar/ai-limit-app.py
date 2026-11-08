@@ -846,6 +846,26 @@ def _fetch_venice(lang):
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _runninghub_expiry_label(data, lang):
+    """Next point expiry as local date; adds the amount when only part expires."""
+    raw = (data or {}).get("points_next_expiry")
+    if not raw:
+        return None
+    try:
+        expires = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+    now = datetime.datetime.now().astimezone()
+    label = expires.strftime("%m-%d %H:%M" if expires.year == now.year else "%Y-%m-%d")
+    amount = data.get("points_expiring_next")
+    total = data.get("remain_points")
+    if isinstance(amount, (int, float)) and isinstance(total, (int, float)) and amount < total - 0.5:
+        label += f" · {amount:,.0f}"
+    if data.get("points_expiry_source") == "cached":
+        label += _tr(lang, "（缓存）", " (cached)")
+    return label
+
+
 def _fetch_runninghub(lang):
     import socket, urllib.error
     try:
@@ -3521,6 +3541,14 @@ class AiLimitApp(rumps.App):
                     kind="balance",
                     color="#c4b5fd",
                 )
+            expiry_label = _runninghub_expiry_label(self._runninghub, lang)
+            if expiry_label:
+                append(
+                    _tr(lang, "积分到期（本地）", "Points expire (local)"),
+                    value=expiry_label,
+                    kind="credit",
+                    color="#c4b5fd",
+                )
             append(
                 _tr(lang, "钱包", "Wallet"),
                 value=_fmt_balance_compact(self._runninghub.get("primary") or {}),
@@ -3835,6 +3863,9 @@ class AiLimitApp(rumps.App):
             if data.get("remain_points") is not None:
                 points = data["remain_points"]
                 lines.append(_tr(lang, f"  积分: {points:,.1f}  (≈¥{points / 100:,.2f})", f"  Points: {points:,.1f}  (≈¥{points / 100:,.2f})"))
+                expiry_label = _runninghub_expiry_label(data, lang)
+                if expiry_label:
+                    lines.append(_tr(lang, f"  积分到期: {expiry_label}", f"  Points expire: {expiry_label}"))
             lines.append(_tr(lang, f"  钱包: {shown}", f"  Wallet: {shown}"))
             extra = []
             if data.get("current_task_counts"):

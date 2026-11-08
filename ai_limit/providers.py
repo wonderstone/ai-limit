@@ -3923,7 +3923,7 @@ def _normalize_runninghub_status(payload: dict) -> dict:
     }
 
 
-def live_runninghub_status(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+def live_runninghub_status(timeout: int = CLAUDE_WEB_TIMEOUT_SEC, *, with_expiry: bool = True):
     import urllib.error
     import urllib.request
 
@@ -3960,4 +3960,160 @@ def live_runninghub_status(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
         raise RunningHubError("unexpected RunningHub response shape")
     normalized = _normalize_runninghub_status(payload)
     normalized["base_url"] = base_url
+    if with_expiry:
+        try:
+            expiry = runninghub_points_expiry(base_url, timeout=timeout)
+        except Exception:
+            expiry = None
+        if expiry:
+            normalized.update(expiry)
     return datetime.datetime.now(datetime.timezone.utc), normalized
+
+
+# RunningHub point batches carry their own expiry (points are spent in expiry
+# order), but accountStatus only returns the total. The signed-in web console
+# lists the batches at /uc/bill/v2/pointRecords with its short-lived
+# Rh-Accesstoken (a ~12 h JWT the site refreshes while it is open), so the
+# last good read is kept on disk and served, marked cached, when the browser
+# session has lapsed. Amounts are in 1/1000 points.
+
+RUNNINGHUB_POINT_RECORDS_PATH = "/uc/bill/v2/pointRecords"
+RUNNINGHUB_POINTS_CACHE_PATH = pathlib.Path.home() / ".config" / "ai-limit" / "runninghub_points_cache.json"
+RUNNINGHUB_POINT_UNIT = 1000
+_RUNNINGHUB_SITE_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _runninghub_access_tokens() -> list[tuple[str, str]]:
+    try:
+        import browser_cookie3
+    except ImportError:
+        return []
+    tokens = []
+    for label, path in _chromium_profile_cookie_files():
+        try:
+            jar = browser_cookie3.chrome(cookie_file=str(path), domain_name="runninghub.ai")
+        except Exception:
+            continue
+        for cookie in jar:
+            if cookie.name == "Rh-Accesstoken" and cookie.value:
+                tokens.append((label, cookie.value))
+                break
+    return tokens
+
+
+def _runninghub_site_time(value) -> str | None:
+    try:
+        parsed = datetime.datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=_RUNNINGHUB_SITE_TZ).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_runninghub_point_batches(records: list) -> list[dict]:
+    batches = []
+    for item in records:
+        if not isinstance(item, dict) or item.get("expired"):
+            continue
+        remaining = _venice_amount(item.get("remainedUnit"))
+        if remaining is None or remaining <= 0:
+            continue
+        expires_at = _runninghub_site_time(item.get("expiredTime"))
+        batches.append(
+            {
+                "source": item.get("sourceTypeDesc") or item.get("sourceType"),
+                "granted": (_venice_amount(item.get("amountUnit")) or 0) / RUNNINGHUB_POINT_UNIT,
+                "remaining": remaining / RUNNINGHUB_POINT_UNIT,
+                "granted_at": _runninghub_site_time(item.get("gainTime")),
+                "expires_at": expires_at,
+            }
+        )
+    batches.sort(key=lambda b: b["expires_at"] or "9999")
+    return batches
+
+
+def _runninghub_point_records(token: str, base_url: str, timeout: int) -> list:
+    import urllib.error
+    import urllib.request
+
+    records = []
+    for page in range(1, 6):
+        req = urllib.request.Request(
+            f"{base_url}{RUNNINGHUB_POINT_RECORDS_PATH}",
+            data=json.dumps({"current": page, "size": 50}).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": f"ai-limit/{__version__}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise RunningHubAuthError(f"HTTP {exc.code}") from exc
+            raise RunningHubError(f"HTTP {exc.code}") from exc
+        except Exception as exc:
+            raise RunningHubError(str(exc)) from exc
+        if not isinstance(payload, dict) or payload.get("code") not in (0, "0"):
+            raise RunningHubAuthError(str((payload or {}).get("msg") or "point records unavailable"))
+        data = payload.get("data") or {}
+        page_records = data.get("records") or []
+        records.extend(page_records)
+        try:
+            pages = int(data.get("pages") or 1)
+        except (TypeError, ValueError):
+            pages = 1
+        if page >= pages or not page_records:
+            break
+    return records
+
+
+def _runninghub_points_summary(batches: list[dict], observed_at: str, source: str) -> dict:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    live = []
+    for batch in batches:
+        try:
+            expires = datetime.datetime.fromisoformat(str(batch.get("expires_at")).replace("Z", "+00:00"))
+        except ValueError:
+            expires = None
+        if expires is not None and expires <= now:
+            continue
+        live.append(batch)
+    next_expiry = next((b["expires_at"] for b in live if b.get("expires_at")), None)
+    expiring = sum(b["remaining"] for b in live if next_expiry and b.get("expires_at") == next_expiry)
+    return {
+        "point_batches": live,
+        "points_next_expiry": next_expiry,
+        "points_expiring_next": round(expiring, 3) if next_expiry else None,
+        "points_expiry_source": source,
+        "points_expiry_observed_at": observed_at,
+    }
+
+
+def runninghub_points_expiry(base_url: str | None = None, timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict | None:
+    """Per-batch point expiry from the web console, or the last good read."""
+    base_url = (base_url or RUNNINGHUB_DEFAULT_BASE_URL).rstrip("/")
+    for _label, token in _runninghub_access_tokens():
+        try:
+            batches = _normalize_runninghub_point_batches(_runninghub_point_records(token, base_url, timeout))
+        except RunningHubError:
+            continue
+        observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        try:
+            RUNNINGHUB_POINTS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            RUNNINGHUB_POINTS_CACHE_PATH.write_text(
+                json.dumps({"observed_at": observed_at, "batches": batches}), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        return _runninghub_points_summary(batches, observed_at, "browser live")
+    try:
+        cached = json.loads(RUNNINGHUB_POINTS_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, dict) or not isinstance(cached.get("batches"), list):
+        return None
+    return _runninghub_points_summary(cached["batches"], cached.get("observed_at"), "cached")
