@@ -662,13 +662,17 @@ def render_runninghub():
     print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('base_url')} accountStatus  (API key){_RST}")
     print()
     currency = data.get("currency") or "USD"
-    if data.get("remain_money") is not None:
-        print(f"  {currency:<4} {t('余额', 'Balance')}: {_BOLD}{fmt_money(data['remain_money'], currency)}{_RST}")
-    parts = []
-    if data.get("remain_coins") is not None:
-        parts.append(f"{t('RH 币', 'RH coins')} {data['remain_coins']:,.0f}")
+    # 2026-11 membership upgrade: points (100 = ¥1) pay for platform tasks,
+    # the wallet pays for enterprise API calls, and RH coins remain only as
+    # non-renewing transition coins for RunningHub's own compute.
     if data.get("remain_points") is not None:
-        parts.append(f"{t('积分', 'Points')} {data['remain_points']:,.1f}")
+        points = data["remain_points"]
+        print(f"  {t('积分', 'Points')}: {_BOLD}{points:,.1f}{_RST}  (≈¥{points / 100:,.2f})")
+    if data.get("remain_money") is not None:
+        print(f"  {t('钱包', 'Wallet')}: {_BOLD}{fmt_money(data['remain_money'], currency)}{_RST}  ({t('企业级 API 按量扣费', 'enterprise API usage')})")
+    parts = []
+    if data.get("remain_coins"):
+        parts.append(f"{t('过渡 RH 币', 'Transition RH coins')} {data['remain_coins']:,.0f}")
     if data.get("current_task_counts") is not None:
         parts.append(f"{t('运行中任务', 'Running tasks')} {data['current_task_counts']}")
     if parts:

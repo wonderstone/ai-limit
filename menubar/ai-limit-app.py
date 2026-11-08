@@ -2989,6 +2989,11 @@ class AiLimitApp(rumps.App):
             pct = 100 if data.get("available") and _balance_amount(primary) > 0 else 0
             value = _fmt_balance_compact(primary)
             subtitle = _tr(lang, "API balance", "API balance")
+        elif service == "runninghub" and data and data.get("remain_points") is not None:
+            points = data.get("remain_points") or 0
+            pct = 100 if points > 0 else 0
+            value = _tr(lang, f"{points:,.0f} 积分", f"{points:,.0f} pts")
+            subtitle = _tr(lang, "积分", "Points")
         elif service in ("venice", "cloudflare", "runninghub") and data:
             primary = data.get("primary") or {}
             pct = 100 if data.get("available") and _balance_amount(primary) > 0 else 0
@@ -3490,15 +3495,25 @@ class AiLimitApp(rumps.App):
             )
         if "runninghub" in services and self._runninghub and not self._runninghub.get("error"):
             section("RunningHub", "#c4b5fd", self._runninghub)
+            # Since the 2026-11 membership upgrade, points pay for platform
+            # tasks, the wallet pays for enterprise API calls, and RH coins
+            # survive only as non-renewing "transition" coins.
+            if self._runninghub.get("remain_points") is not None:
+                append(
+                    _tr(lang, "积分", "Points"),
+                    value=f"{self._runninghub['remain_points']:,.0f}",
+                    kind="balance",
+                    color="#c4b5fd",
+                )
             append(
-                _tr(lang, "API 余额", "API balance"),
+                _tr(lang, "钱包", "Wallet"),
                 value=_fmt_balance_compact(self._runninghub.get("primary") or {}),
                 kind="balance",
                 color="#c4b5fd",
             )
-            if self._runninghub.get("remain_coins") is not None:
+            if self._runninghub.get("remain_coins"):
                 append(
-                    _tr(lang, "RH 币", "RH coins"),
+                    _tr(lang, "过渡 RH 币", "Transition RH coins"),
                     value=f"{self._runninghub['remain_coins']:,.0f}",
                     kind="balance",
                     color="#c4b5fd",
@@ -3808,12 +3823,13 @@ class AiLimitApp(rumps.App):
             currency = data.get("currency") or "USD"
             money = data.get("remain_money")
             shown = fmt_money(money, currency) if money is not None else "?"
-            lines.append(_tr(lang, f"  余额: {shown}", f"  Balance: {shown}"))
-            extra = []
-            if data.get("remain_coins") is not None:
-                extra.append(_tr(lang, f"RH 币 {data['remain_coins']:,.0f}", f"RH coins {data['remain_coins']:,.0f}"))
             if data.get("remain_points") is not None:
-                extra.append(_tr(lang, f"积分 {data['remain_points']:,.1f}", f"points {data['remain_points']:,.1f}"))
+                points = data["remain_points"]
+                lines.append(_tr(lang, f"  积分: {points:,.1f}  (≈¥{points / 100:,.2f})", f"  Points: {points:,.1f}  (≈¥{points / 100:,.2f})"))
+            lines.append(_tr(lang, f"  钱包: {shown}", f"  Wallet: {shown}"))
+            extra = []
+            if data.get("remain_coins"):
+                extra.append(_tr(lang, f"过渡 RH 币 {data['remain_coins']:,.0f}", f"transition RH coins {data['remain_coins']:,.0f}"))
             if data.get("current_task_counts"):
                 extra.append(_tr(lang, f"运行中 {data['current_task_counts']}", f"running {data['current_task_counts']}"))
             if extra:

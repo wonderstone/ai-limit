@@ -128,10 +128,26 @@ class MenubarTests(unittest.TestCase):
         app._runninghub = runninghub
         rows = app._widget_detail_rows()
         by_name = {row.get("name"): row for row in rows}
-        self.assertEqual(by_name["API 余额"]["value"], "$4.35")
-        self.assertEqual(by_name["RH 币"]["value"], "28,203")
+        self.assertEqual(by_name["积分"]["value"], "19,162")
+        self.assertEqual(by_name["钱包"]["value"], "$4.35")
+        self.assertEqual(by_name["过渡 RH 币"]["value"], "28,203")
+        names = [row.get("name") for row in rows]
+        self.assertLess(names.index("积分"), names.index("钱包"))
         body = app._widget_text_body()
-        self.assertIn("余额: $4.35", body)
+        self.assertIn("积分: 19,162.3  (≈¥191.62)", body)
+        self.assertIn("钱包: $4.35", body)
+
+    def test_spent_transition_coins_are_hidden(self):
+        data = _normalize_runninghub_status({**STATUS, "data": {**STATUS["data"], "remainCoins": "0"}})
+        with mock.patch.object(menubar, "live_runninghub_status", return_value=(NOW, data)):
+            runninghub = menubar._fetch_runninghub("zh")
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        app._state = {"lang": "zh", "global": "7d", "services": ["runninghub"], "widget": True}
+        app._claude = app._codex = app._deepseek = app._google = app._gemini = app._copilot = app._grok = None
+        app._api_credits_v1 = None
+        app._runninghub = runninghub
+        names = [row.get("name") for row in app._widget_detail_rows()]
+        self.assertNotIn("过渡 RH 币", names)
         self.assertIn("runninghub", menubar._SERVICES)
 
 
