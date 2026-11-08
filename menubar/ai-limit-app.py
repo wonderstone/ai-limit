@@ -3496,8 +3496,8 @@ class AiLimitApp(rumps.App):
         if "runninghub" in services and self._runninghub and not self._runninghub.get("error"):
             section("RunningHub", "#c4b5fd", self._runninghub)
             # Since the 2026-11 membership upgrade, points pay for platform
-            # tasks, the wallet pays for enterprise API calls, and RH coins
-            # survive only as non-renewing "transition" coins.
+            # tasks and the wallet pays for enterprise API calls. The legacy
+            # remainCoins number is not shown on the account pages, so not here.
             if self._runninghub.get("remain_points") is not None:
                 append(
                     _tr(lang, "积分", "Points"),
@@ -3511,13 +3511,6 @@ class AiLimitApp(rumps.App):
                 kind="balance",
                 color="#c4b5fd",
             )
-            if self._runninghub.get("remain_coins"):
-                append(
-                    _tr(lang, "过渡 RH 币", "Transition RH coins"),
-                    value=f"{self._runninghub['remain_coins']:,.0f}",
-                    kind="balance",
-                    color="#c4b5fd",
-                )
         if "google" in services:
             entries = self._widget_google_entries()
             if entries:
@@ -3828,8 +3821,6 @@ class AiLimitApp(rumps.App):
                 lines.append(_tr(lang, f"  积分: {points:,.1f}  (≈¥{points / 100:,.2f})", f"  Points: {points:,.1f}  (≈¥{points / 100:,.2f})"))
             lines.append(_tr(lang, f"  钱包: {shown}", f"  Wallet: {shown}"))
             extra = []
-            if data.get("remain_coins"):
-                extra.append(_tr(lang, f"过渡 RH 币 {data['remain_coins']:,.0f}", f"transition RH coins {data['remain_coins']:,.0f}"))
             if data.get("current_task_counts"):
                 extra.append(_tr(lang, f"运行中 {data['current_task_counts']}", f"running {data['current_task_counts']}"))
             if extra:

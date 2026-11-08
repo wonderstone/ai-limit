@@ -3903,21 +3903,23 @@ def _normalize_runninghub_status(payload: dict) -> dict:
     if not isinstance(data, dict):
         raise RunningHubError("RunningHub response did not include account data")
     money = _venice_amount(data.get("remainMoney"))
+    # remainCoins still answers after the 2026-11 points switch, but the
+    # account pages no longer show RH coins; keep it only as a legacy field.
     coins = _venice_amount(data.get("remainCoins"))
     points = _venice_amount(data.get("remainPoint"))
     tasks = _venice_amount(data.get("currentTaskCounts"))
-    if money is None and coins is None and points is None:
+    if money is None and points is None:
         raise RunningHubError("RunningHub response did not include balances")
     currency = str(data.get("currency") or "USD").upper()
     return {
         "source": "runninghub accountStatus",
         "currency": currency,
         "remain_money": money,
-        "remain_coins": coins,
+        "legacy_remain_coins": coins,
         "remain_points": points,
         "current_task_counts": int(tasks) if tasks is not None else None,
         "api_type": data.get("apiType"),
-        "available": bool((money or 0) > 0 or (coins or 0) > 0 or (points or 0) > 0),
+        "available": bool((money or 0) > 0 or (points or 0) > 0),
     }
 
 

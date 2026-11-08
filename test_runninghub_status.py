@@ -45,7 +45,7 @@ class NormalizeTests(unittest.TestCase):
     def test_string_amounts_become_numbers(self):
         data = _normalize_runninghub_status(STATUS)
         self.assertEqual(data["remain_money"], 4.347)
-        self.assertEqual(data["remain_coins"], 28203)
+        self.assertEqual(data["legacy_remain_coins"], 28203)
         self.assertEqual(data["remain_points"], 19162.3)
         self.assertEqual(data["current_task_counts"], 0)
         self.assertTrue(data["available"])
@@ -130,15 +130,14 @@ class MenubarTests(unittest.TestCase):
         by_name = {row.get("name"): row for row in rows}
         self.assertEqual(by_name["积分"]["value"], "19,162")
         self.assertEqual(by_name["钱包"]["value"], "$4.35")
-        self.assertEqual(by_name["过渡 RH 币"]["value"], "28,203")
         names = [row.get("name") for row in rows]
         self.assertLess(names.index("积分"), names.index("钱包"))
         body = app._widget_text_body()
         self.assertIn("积分: 19,162.3  (≈¥191.62)", body)
         self.assertIn("钱包: $4.35", body)
 
-    def test_spent_transition_coins_are_hidden(self):
-        data = _normalize_runninghub_status({**STATUS, "data": {**STATUS["data"], "remainCoins": "0"}})
+    def test_legacy_rh_coins_are_not_shown(self):
+        data = _normalize_runninghub_status(STATUS)
         with mock.patch.object(menubar, "live_runninghub_status", return_value=(NOW, data)):
             runninghub = menubar._fetch_runninghub("zh")
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
@@ -147,7 +146,8 @@ class MenubarTests(unittest.TestCase):
         app._api_credits_v1 = None
         app._runninghub = runninghub
         names = [row.get("name") for row in app._widget_detail_rows()]
-        self.assertNotIn("过渡 RH 币", names)
+        self.assertFalse(any("RH" in str(name) for name in names))
+        self.assertNotIn("28,203", app._widget_text_body())
         self.assertIn("runninghub", menubar._SERVICES)
 
 

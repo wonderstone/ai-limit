@@ -468,7 +468,7 @@ def _runninghub_payload(*, require_key: bool = False) -> dict[str, Any] | None:
             "source": data.get("source") or "runninghub accountStatus",
             "currency": data.get("currency"),
             "remain_money": data.get("remain_money"),
-            "remain_coins": data.get("remain_coins"),
+            "legacy_remain_coins": data.get("legacy_remain_coins"),
             "remain_points": data.get("remain_points"),
             "current_task_counts": data.get("current_task_counts"),
             "api_type": data.get("api_type"),
