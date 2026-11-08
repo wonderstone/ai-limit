@@ -2264,6 +2264,9 @@ class AiLimitApp(rumps.App):
             False,
         )
         panel.setTitle_("AI Limit")
+        # Remember where the user put the window across launches.
+        if hasattr(panel, "setFrameAutosaveName_"):
+            panel.setFrameAutosaveName_("AiLimitWidget")
         panel.setReleasedWhenClosed_(False)
         panel.setHidesOnDeactivate_(False)
         panel.setLevel_(getattr(AppKit, "NSFloatingWindowLevel", 3))
@@ -2601,7 +2604,10 @@ class AiLimitApp(rumps.App):
         top = frame.origin.y + frame.size.height
         origin_x = right - current_width
         origin_y = top - height
-        screen = AppKit.NSScreen.mainScreen()
+        # Clamp to the screen the window is on. mainScreen() is the screen
+        # with keyboard focus, so clamping to it dragged the window back to
+        # the external display on every refresh.
+        screen = self._widget_screen(panel)
         visible = screen.visibleFrame() if screen is not None else None
         if visible is not None:
             inset = 16
@@ -2652,9 +2658,19 @@ class AiLimitApp(rumps.App):
         if hasattr(scroll, "reflectScrolledClipView_"):
             scroll.reflectScrolledClipView_(clip)
 
+    @staticmethod
+    def _widget_screen(panel):
+        screen = None
+        if panel is not None and hasattr(panel, "screen"):
+            try:
+                screen = panel.screen()
+            except Exception:
+                screen = None
+        return screen if screen is not None else AppKit.NSScreen.mainScreen()
+
     def _widget_height_limit(self):
         limit = self._WIDGET_MAX_HEIGHT
-        screen = AppKit.NSScreen.mainScreen()
+        screen = self._widget_screen(getattr(self, "_widget_panel", None))
         visible = screen.visibleFrame() if screen is not None else None
         if visible is not None:
             limit = min(limit, max(self._WIDGET_MIN_HEIGHT, int(visible.size.height) - 32))

@@ -342,6 +342,32 @@ class DashboardLayoutTests(unittest.TestCase):
         self.assertEqual(panel.frame().size.width, 640)
         self.assertEqual(panel.frame().size.height, 500)
 
+    def test_resize_keeps_the_window_on_its_own_screen(self):
+        class _Screen:
+            def __init__(self, x, y, w, h):
+                self._visible = _Frame(x, y, w, h)
+
+            def visibleFrame(self):
+                return self._visible
+
+        laptop = _Screen(-1512, 0, 1512, 945)      # built-in display, left of the main one
+        external = _Screen(0, 0, 2560, 1415)       # main (focused) display
+
+        class _ScreenPanel(_ResizablePanel):
+            def screen(self):
+                return laptop
+
+        app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
+        panel = _ScreenPanel(width=640, height=600)
+        panel._frame = _Frame(-1300, 200, 640, 600)
+        app._widget_panel = panel
+        with mock.patch.object(menubar.AppKit.NSScreen, "mainScreen", return_value=external), \
+                mock.patch.object(menubar.AppKit, "NSMakeRect", side_effect=lambda x, y, w, h: _Frame(x, y, w, h)), \
+                mock.patch.object(menubar.AiLimitApp, "_widget_frame_chrome_height", return_value=28):
+            app._widget_resize_panel(400)
+        self.assertEqual(panel.frame().origin.x, -1300)
+        self.assertEqual(panel.frame().origin.y + panel.frame().size.height, 800)
+
     def test_short_content_shrinks_below_old_minimum(self):
         app = menubar.AiLimitApp.__new__(menubar.AiLimitApp)
         panel = _ResizablePanel(height=600)
