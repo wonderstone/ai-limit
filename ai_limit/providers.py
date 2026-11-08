@@ -3808,3 +3808,154 @@ def live_cloudflare_credits(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
             "accounts": results,
         }
     raise CloudflareAuthError("; ".join(errors) or "no Cloudflare session")
+
+
+# ── RunningHub (prepaid workflow account) ─────────────────────────────────────
+#
+# `POST {base}/uc/openapi/accountStatus` with `{"apikey": ...}` returns the
+# account's RH coins, cash balance (`remainMoney` in `currency`), points and
+# the tasks currently running. Both runninghub.ai and runninghub.cn answer for
+# the same key. Recut keeps its key in config/runninghub.env, so that file is
+# the last place the key is looked up.
+
+RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.ai"
+RUNNINGHUB_KEY_PATHS = (
+    pathlib.Path.home() / ".runninghub_api_key",
+    pathlib.Path.home() / ".config" / "ai-limit" / "runninghub_api_key",
+)
+RUNNINGHUB_ENV_FILES = (
+    pathlib.Path.home() / "Desktop" / "Recut" / "config" / "runninghub.env",
+)
+
+
+class RunningHubError(Exception):
+    pass
+
+
+class RunningHubAuthError(RunningHubError):
+    pass
+
+
+def _runninghub_env_file_values() -> dict:
+    for path in RUNNINGHUB_ENV_FILES:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        values = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            name = name.strip().removeprefix("export ").strip()
+            values[name] = value.strip().strip("'\"")
+        if values.get("RUNNINGHUB_API_KEY"):
+            return values
+    return {}
+
+
+def load_runninghub_config() -> tuple[str, str]:
+    """Return (api_key, base_url)."""
+    file_values = _runninghub_env_file_values()
+    base_url = (
+        os.environ.get("RUNNINGHUB_BASE_URL", "").strip()
+        or file_values.get("RUNNINGHUB_BASE_URL", "").strip()
+        or RUNNINGHUB_DEFAULT_BASE_URL
+    ).rstrip("/")
+    env_key = os.environ.get("RUNNINGHUB_API_KEY", "").strip()
+    if env_key:
+        return env_key, base_url
+    for path in RUNNINGHUB_KEY_PATHS:
+        try:
+            key = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if key:
+            return key, base_url
+    if file_values.get("RUNNINGHUB_API_KEY"):
+        return file_values["RUNNINGHUB_API_KEY"], base_url
+    raise RunningHubAuthError(
+        t(
+            "未找到 RunningHub API Key，请设置 RUNNINGHUB_API_KEY 或 ~/.runninghub_api_key",
+            "RunningHub API key not found. Set RUNNINGHUB_API_KEY or ~/.runninghub_api_key",
+        )
+    )
+
+
+def has_runninghub_api_key() -> bool:
+    try:
+        load_runninghub_config()
+    except RunningHubAuthError:
+        return False
+    return True
+
+
+def _normalize_runninghub_status(payload: dict) -> dict:
+    code = payload.get("code")
+    if code not in (0, "0"):
+        message = payload.get("msg") or payload.get("errorMessages") or f"code {code}"
+        lowered = str(message).lower()
+        if "key" in lowered or "auth" in lowered or "token" in lowered:
+            raise RunningHubAuthError(str(message))
+        raise RunningHubError(str(message))
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RunningHubError("RunningHub response did not include account data")
+    money = _venice_amount(data.get("remainMoney"))
+    coins = _venice_amount(data.get("remainCoins"))
+    points = _venice_amount(data.get("remainPoint"))
+    tasks = _venice_amount(data.get("currentTaskCounts"))
+    if money is None and coins is None and points is None:
+        raise RunningHubError("RunningHub response did not include balances")
+    currency = str(data.get("currency") or "USD").upper()
+    return {
+        "source": "runninghub accountStatus",
+        "currency": currency,
+        "remain_money": money,
+        "remain_coins": coins,
+        "remain_points": points,
+        "current_task_counts": int(tasks) if tasks is not None else None,
+        "api_type": data.get("apiType"),
+        "available": bool((money or 0) > 0 or (coins or 0) > 0 or (points or 0) > 0),
+    }
+
+
+def live_runninghub_status(timeout: int = CLAUDE_WEB_TIMEOUT_SEC):
+    import urllib.error
+    import urllib.request
+
+    api_key, base_url = load_runninghub_config()
+    req = urllib.request.Request(
+        f"{base_url}/uc/openapi/accountStatus",
+        data=json.dumps({"apikey": api_key}).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"ai-limit/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RunningHubAuthError(
+                t(
+                    f"HTTP {exc.code}：RunningHub API Key 无效或无权限",
+                    f"HTTP {exc.code}: RunningHub API key is invalid or unauthorized",
+                )
+            ) from exc
+        raise RunningHubError(f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise RunningHubError(str(exc)) from exc
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RunningHubError("non-JSON response") from exc
+    if not isinstance(payload, dict):
+        raise RunningHubError("unexpected RunningHub response shape")
+    normalized = _normalize_runninghub_status(payload)
+    normalized["base_url"] = base_url
+    return datetime.datetime.now(datetime.timezone.utc), normalized

@@ -37,6 +37,8 @@ from ai_limit.providers import (  # noqa: E402
     GoogleQuotaError,
     GrokAuthError,
     GrokUsageError,
+    RunningHubAuthError,
+    RunningHubError,
     VeniceAuthError,
     CloudflareAuthError,
     CloudflareCreditsError,
@@ -46,6 +48,7 @@ from ai_limit.providers import (  # noqa: E402
     codex_window_reset_time,
     current_codex_rate_limits,
     has_deepseek_api_key,
+    has_runninghub_api_key,
     has_venice_api_key,
     has_cloudflare_cookies,
     has_gemini_app_cookies,
@@ -54,6 +57,7 @@ from ai_limit.providers import (  # noqa: E402
     live_claude_api_credits,  # legacy import retained for downstream patchers
     live_claude_usage,
     live_deepseek_balance,
+    live_runninghub_status,
     live_venice_balance,
     live_cloudflare_credits,
     live_copilot_quota,
@@ -452,6 +456,29 @@ def _venice_payload(*, require_key: bool = False) -> dict[str, Any] | None:
         return {"provider": "venice", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
 
 
+def _runninghub_payload(*, require_key: bool = False) -> dict[str, Any] | None:
+    if not has_runninghub_api_key() and not require_key:
+        return None
+    try:
+        observed_at, data = live_runninghub_status(timeout=5)
+        return {
+            "provider": "runninghub",
+            "available": bool(data.get("available")),
+            "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+            "source": data.get("source") or "runninghub accountStatus",
+            "currency": data.get("currency"),
+            "remain_money": data.get("remain_money"),
+            "remain_coins": data.get("remain_coins"),
+            "remain_points": data.get("remain_points"),
+            "current_task_counts": data.get("current_task_counts"),
+            "api_type": data.get("api_type"),
+        }
+    except (RunningHubAuthError, RunningHubError) as exc:
+        return {"provider": "runninghub", "available": False, "observed_at": _utc_now(), "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"provider": "runninghub", "available": False, "observed_at": _utc_now(), **_jsonable_error(exc)}
+
+
 def _cloudflare_payload(*, require_session: bool = False) -> dict[str, Any] | None:
     if not require_session and not has_cloudflare_cookies():
         return None
@@ -644,6 +671,7 @@ def quota_payload(*, allow_app_server: bool = False) -> dict[str, Any]:
         "codex": lambda: _codex_payload(allow_app_server=allow_app_server),
         "deepseek": _deepseek_payload,
         "venice": _venice_payload,
+        "runninghub": _runninghub_payload,
         "cloudflare": _cloudflare_payload,
         "google": _google_payload,
         "gemini": _gemini_payload,
@@ -725,6 +753,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/quota/venice", "/v1/quota/venice"}:
             self._write_json(_venice_payload(require_key=True))
+            return
+        if parsed.path in {"/quota/runninghub", "/v1/quota/runninghub"}:
+            self._write_json(_runninghub_payload(require_key=True))
             return
         if parsed.path in {"/quota/cloudflare", "/v1/quota/cloudflare"}:
             self._write_json(_cloudflare_payload(require_session=True))

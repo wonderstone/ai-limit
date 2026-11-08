@@ -22,6 +22,8 @@ from ai_limit.providers import (
     CodexAuthError,
     DeepSeekAuthError,
     DeepSeekError,
+    RunningHubAuthError,
+    RunningHubError,
     VeniceAuthError,
     CloudflareAuthError,
     CloudflareCreditsError,
@@ -31,6 +33,7 @@ from ai_limit.providers import (
     GoogleQuotaError,
     current_codex_rate_limits as resolve_codex_rate_limits,
     has_deepseek_api_key,
+    has_runninghub_api_key,
     has_venice_api_key,
     has_cloudflare_cookies,
     has_gemini_app_cookies,
@@ -39,6 +42,7 @@ from ai_limit.providers import (
     live_claude_plan,
     live_claude_usage,
     live_deepseek_balance,
+    live_runninghub_status,
     live_venice_balance,
     live_cloudflare_credits,
     live_google_quota,
@@ -643,6 +647,34 @@ def render_venice():
         print(f"  DIEM {t('余额', 'Balance')}: {_BOLD}{data['diem']:g}{_RST}{suffix}")
 
 
+def render_runninghub():
+    title = "RunningHub"
+    print(f"\n{_DIM}{SEP}{_RST}")
+    print(f"{_BOLD}{title.center(52)}{_RST}")
+    print()
+    try:
+        ts, data = live_runninghub_status()
+    except (RunningHubAuthError, RunningHubError) as e:
+        print(f"  ⚠️  {t('读取失败', 'Failed to fetch')}: {e}")
+        return
+
+    print(f"  {_DIM}{t('数据时间', 'Data time')}: {fmt_dt(ts.astimezone())}  (api key live){_RST}")
+    print(f"  {_DIM}{t('数据来源', 'Source')}: {data.get('base_url')} accountStatus  (API key){_RST}")
+    print()
+    currency = data.get("currency") or "USD"
+    if data.get("remain_money") is not None:
+        print(f"  {currency:<4} {t('余额', 'Balance')}: {_BOLD}{fmt_money(data['remain_money'], currency)}{_RST}")
+    parts = []
+    if data.get("remain_coins") is not None:
+        parts.append(f"{t('RH 币', 'RH coins')} {data['remain_coins']:,.0f}")
+    if data.get("remain_points") is not None:
+        parts.append(f"{t('积分', 'Points')} {data['remain_points']:,.1f}")
+    if data.get("current_task_counts") is not None:
+        parts.append(f"{t('运行中任务', 'Running tasks')} {data['current_task_counts']}")
+    if parts:
+        print(f"  {'  |  '.join(parts)}")
+
+
 def render_cloudflare():
     title = "Cloudflare AI Gateway"
     print(f"\n{_DIM}{SEP}{_RST}")
@@ -865,6 +897,8 @@ def main():
         render_deepseek()
     if has_venice_api_key():
         render_venice()
+    if has_runninghub_api_key():
+        render_runninghub()
     if has_cloudflare_cookies():
         render_cloudflare()
     if has_google_oauth_creds():

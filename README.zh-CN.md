@@ -130,7 +130,7 @@ AI_LIMIT_LANG=zh ai-limit   # 强制中文
 
 ### 本地 JSON API
 
-`ai_limit/api_server.py` 在 `127.0.0.1:17655` 提供只读额度 JSON：`/health`、`/v1/quota`（全部 provider）、`/v1/quota/{codex,claude,copilot,grok}`。登录时自动启动（用户 LaunchAgent `com.zhuchenxi.ai-limit-api`，日志在 `~/Library/Logs/ai-limit/`）：
+`ai_limit/api_server.py` 在 `127.0.0.1:17655` 提供只读额度 JSON：`/health`、`/v1/quota`（全部 provider）、`/v1/quota/{codex,claude,copilot,grok,venice,runninghub,cloudflare}`。RunningHub 的 key 依次从 `RUNNINGHUB_API_KEY`、`~/.runninghub_api_key`、`~/.config/ai-limit/runninghub_api_key`、Recut 的 `~/Desktop/Recut/config/runninghub.env` 读取。登录时自动启动（用户 LaunchAgent `com.zhuchenxi.ai-limit-api`，日志在 `~/Library/Logs/ai-limit/`）：
 
 ```bash
 ./install-api-agent.sh            # 安装 / 重装
