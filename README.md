@@ -130,7 +130,7 @@ AI_LIMIT_LANG=zh ai-limit   # force Chinese
 
 ### Local JSON API
 
-`ai_limit/api_server.py` serves read-only quota JSON on `127.0.0.1:17655`: `/health`, `/v1/quota` (all providers), and `/v1/quota/{codex,claude,copilot,grok,venice,runninghub,cloudflare}`. RunningHub reads its key from `RUNNINGHUB_API_KEY`, `~/.runninghub_api_key`, `~/.config/ai-limit/runninghub_api_key` or Recut's `~/Desktop/Recut/config/runninghub.env`. To start it at login as a user LaunchAgent (`com.zhuchenxi.ai-limit-api`, logs in `~/Library/Logs/ai-limit/`):
+`ai_limit/api_server.py` serves read-only quota JSON on `127.0.0.1:17655`: `/health`, `/v1/quota` (all providers), and `/v1/quota/{codex,claude,copilot,grok,venice,runninghub,cloudflare}`. RunningHub reads its key from `RUNNINGHUB_API_KEY`, `~/.runninghub_api_key`, `~/.config/ai-limit/runninghub_api_key` or Recut's `~/Desktop/Recut/config/runninghub.env` (the packaged menu bar app usually can't read `~/Desktop`, so keep a copy in `~/.config/ai-limit/runninghub_api_key` for it). To start it at login as a user LaunchAgent (`com.zhuchenxi.ai-limit-api`, logs in `~/Library/Logs/ai-limit/`):
 
 ```bash
 ./install-api-agent.sh            # install / reinstall
