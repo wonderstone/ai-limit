@@ -134,94 +134,80 @@ def read_byte(stream: typing.BinaryIO) -> typing.Optional[int]:
 
 
 def decompress(data: typing.BinaryIO) -> bytes:
-    """Decompresses the snappy compressed data stream"""
+    """Decompresses the snappy compressed data stream.
+
+    Indexes a bytes buffer instead of reading the stream one byte at a time:
+    the stream version took ~90s on a 17MB Chrome Local Storage database.
+    Same bounds checks as before; consumes the rest of the stream.
+    """
     uncompressed_length = read_le_varint(data)
     if uncompressed_length is None or not 0 <= uncompressed_length <= 8 * 1024 * 1024:
         raise ValueError("Snappy block exceeds local read limit")
-    # log(f"Uncompressed length: {uncompressed_length}")
 
-    out = io.BytesIO()
-
-    while True:
-        start_offset = data.tell()
-        # log(f"Reading tag at offset {start_offset}")
-        type_byte = read_byte(data)
-        if type_byte is None:
-            break
-
-        # log(f"Type Byte is {type_byte:02x}")
-
+    src = data.read()
+    n = len(src)
+    total = uncompressed_length
+    out = bytearray(total)
+    pos = 0  # bytes written so far
+    i = 0
+    from_bytes = int.from_bytes
+    while i < n:
+        type_byte = src[i]
+        i += 1
         tag = type_byte & 0x03
-
-        # log(f"Element Type is: {ElementType(tag)}")
-
-        if tag == ElementType.Literal:
-            if ((type_byte & 0xFC) >> 2) < 60:  # embedded in tag
-                length = 1 + ((type_byte & 0xFC) >> 2)
-                # log(f"Literal length is embedded in type byte and is {length}")
-            elif ((type_byte & 0xFC) >> 2) == 60:  # 8 bit
-                length = 1 + read_byte(data)
-                # log(f"Literal length is 8bit and is {length}")
-            elif ((type_byte & 0xFC) >> 2) == 61:  # 16 bit
-                length = 1 + read_uint16(data)
-                # log(f"Literal length is 16bit and is {length}")
-            elif ((type_byte & 0xFC) >> 2) == 62:  # 16 bit
-                length = 1 + read_uint24(data)
-                # log(f"Literal length is 24bit and is {length}")
-            elif ((type_byte & 0xFC) >> 2) == 63:  # 16 bit
-                length = 1 + read_uint32(data)
-                # log(f"Literal length is 32bit and is {length}")
-            else:
-                raise ValueError()  # cannot ever happen
-
-            if length > uncompressed_length - out.tell():
+        if tag == 0:  # literal
+            length = (type_byte >> 2) + 1
+            if length > 60:
+                extra = length - 60  # 1..4 length bytes
+                if i + extra > n:
+                    raise ValueError("Couldn't read enough literal data")
+                length = from_bytes(src[i:i + extra], "little") + 1
+                i += extra
+            end = pos + length
+            if end > total:
                 raise ValueError("Snappy literal exceeds declared output")
-            literal_data = data.read(length)
-            if len(literal_data) < length:
+            if i + length > n:
                 raise ValueError("Couldn't read enough literal data")
-
-            out.write(literal_data)
-
+            out[pos:end] = src[i:i + length]
+            i += length
+            pos = end
+            continue
+        if tag == 1:
+            if i >= n:
+                raise ValueError("Truncated snappy copy")
+            length = ((type_byte >> 2) & 0x07) + 4
+            offset = ((type_byte & 0xE0) << 3) | src[i]
+            i += 1
+        elif tag == 2:
+            if i + 2 > n:
+                raise ValueError("Truncated snappy copy")
+            length = (type_byte >> 2) + 1
+            offset = src[i] | (src[i + 1] << 8)
+            i += 2
         else:
-            if tag == ElementType.CopyOneByte:
-                length = ((type_byte & 0x1C) >> 2) + 4
-                offset = ((type_byte & 0xE0) << 3) | read_byte(data)
-            elif tag == ElementType.CopyTwoByte:
-                length = 1 + ((type_byte & 0xFC) >> 2)
-                offset = read_uint16(data)
-            elif tag == ElementType.CopyFourByte:
-                length = 1 + ((type_byte & 0xFC) >> 2)
-                offset = read_uint32(data)
-            else:
-                raise ValueError()  # cannot ever happen
+            if i + 4 > n:
+                raise ValueError("Truncated snappy copy")
+            length = (type_byte >> 2) + 1
+            offset = from_bytes(src[i:i + 4], "little")
+            i += 4
+        end = pos + length
+        if end > total:
+            raise ValueError("Snappy copy exceeds declared output")
+        if offset == 0:
+            raise ValueError("Offset cannot be 0")
+        start = pos - offset
+        if start < 0:
+            raise ValueError("Snappy copy offset before start of output")
+        if offset >= length:
+            out[pos:end] = out[start:start + length]
+        else:
+            # Overlapping copy repeats the last `offset` bytes.
+            out[pos:end] = (out[start:pos] * (length // offset + 1))[:length]
+        pos = end
 
-            if length > uncompressed_length - out.tell():
-                raise ValueError("Snappy copy exceeds declared output")
-            if offset == 0:
-                raise ValueError("Offset cannot be 0")
-
-            actual_offset = out.tell() - offset
-            # log(f"Current Outstream Length: {out.tell()}")
-            # log(f"Backreference length: {length}")
-            # log(f"Backreference relative offset: {offset}")
-            # log(f"Backreference absolute offset: {actual_offset}")
-
-            # have to read incrementally because you might have to read data that you've just written
-            # for i in range(length):
-            #     out.write(out.getbuffer()[actual_offset + i: actual_offset + i + 1].tobytes())
-            buffer = out.getbuffer()[actual_offset: actual_offset + length].tobytes()
-            if offset - length <= 0:
-                # better safe than sorry, this way we're sure to extend it
-                # as much as needed without doing some extra calculations
-                buffer = (buffer * length)[:length]
-            out.write(buffer)
-
-    result = out.getvalue()
-    if uncompressed_length != len(result):
+    if pos != total:
         raise ValueError("Wrong data length in uncompressed data")
-        # TODO: allow a partial / potentially bad result via a flag in the function call?
-
-    return result
+    return bytes(out)
 
 
 def check_masked_crc(crc, data, xor_value=0xffffffff):

@@ -267,6 +267,35 @@ class LdbFile:
                     block.offset if block.was_compressed else block.offset + entry.block_offset,
                     block.was_compressed)
 
+    def iter_user_keys(self, user_keys) -> typing.Iterable[Record]:
+        """Records for the given user keys, decompressing only candidate blocks.
+
+        Assumes the bytewise comparator. Each index key is a separator that is
+        >= every key in its block and < every key in the next, so a user key U
+        can only sit in block i when sep[i-1].user <= U <= sep[i].user.
+        """
+        targets = frozenset(user_keys)
+        if not targets:
+            return
+        previous = None
+        for block_key, handle in self._index:
+            current = block_key[:-8] if len(block_key) >= 8 else None
+            if current is None:
+                wanted = True
+            else:
+                wanted = any((previous is None or previous <= key) and key <= current for key in targets)
+            previous = current
+            if not wanted:
+                continue
+            block = self._read_block(handle)
+            for entry in block:
+                user_key = entry.key[:-8] if len(entry.key) > 8 else entry.key
+                if user_key in targets:
+                    yield Record.ldb_record(
+                        entry.key, entry.value, self.path,
+                        block.offset if block.was_compressed else block.offset + entry.block_offset,
+                        block.was_compressed)
+
     def close(self):
         self._f.close()
 
@@ -484,6 +513,11 @@ class VersionEditTag(enum.IntEnum):
     PrevLogNumber = 9
 
 
+_CompactionPointer = namedtuple("CompactionPointer", ["level", "pointer"])
+_DeletedFile = namedtuple("DeletedFile", ["level", "file_no"])
+_NewFile = namedtuple("NewFile", ["level", "file_no", "file_size", "smallest_key", "largest_key"])
+
+
 @dataclasses.dataclass(frozen=True)
 class VersionEdit:
     """
@@ -511,9 +545,11 @@ class VersionEdit:
         deleted_files = []
         new_files = []
 
-        compaction_pointer_nt = namedtuple("CompactionPointer", ["level", "pointer"])
-        deleted_file_nt = namedtuple("DeletedFile", ["level", "file_no"])
-        new_file_nt = namedtuple("NewFile", ["level", "file_no", "file_size", "smallest_key", "largest_key"])
+        # Module-level types: building namedtuples per edit made a ~4k-edit
+        # Chrome manifest take ~9s and tripped the 8s parse budget.
+        compaction_pointer_nt = _CompactionPointer
+        deleted_file_nt = _DeletedFile
+        new_file_nt = _NewFile
 
         with io.BytesIO(buffer) as b:
             while b.tell() < len(buffer) - 1:

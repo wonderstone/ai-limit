@@ -34,6 +34,10 @@ class PlatformBalanceError(Exception):
         self.code, self.mismatch = code, mismatch
 
 
+# (path, stat stamp, targets) -> target records of one immutable table file.
+_TABLE_MEMO: dict = {}
+
+
 def _stamp(path):
     s = path.stat()
     return (s.st_ino, s.st_size, s.st_mtime_ns)
@@ -124,16 +128,39 @@ def read_platform_session(profile):
     prefix = b"_https://platform.openai.com\x00\x01"
     auth_key, org_key = prefix + b"oai-auth:onboard", prefix + b"oai/activeOrg"
 
+    targets = {auth_key, org_key}
+
+    # Drop memo entries for tables that compaction has removed.
+    live_tables = {(str(path), before[path]) for path in files if path.suffix != ".log"}
+    for key in [k for k in _TABLE_MEMO if k[:2] not in live_tables]:
+        del _TABLE_MEMO[key]
+
     def records():
         for path in sorted(files):
-            reader = ccl_leveldb.LogFile(path) if path.suffix == ".log" else ccl_leveldb.LdbFile(path)
-            try:
-                yield from reader
-                if getattr(reader, "damage", None):
+            if path.suffix == ".log":
+                reader = ccl_leveldb.LogFile(path)
+                try:
+                    yield from reader
+                    if reader.damage:
+                        raise PlatformBalanceError("browser_storage_changed")
+                finally:
+                    reader.close()
+                continue
+            # Table files never change once written, so their target records
+            # are memoized in memory (never on disk) by path and stat stamp.
+            memo_key = (str(path), before[path], frozenset(targets))
+            if memo_key not in _TABLE_MEMO:
+                reader = ccl_leveldb.LdbFile(path)
+                try:
+                    # Only decompress blocks whose index range covers a target key.
+                    found = tuple(reader.iter_user_keys(targets))
+                finally:
+                    reader.close()
+                if _stamp(path) != before[path]:
                     raise PlatformBalanceError("browser_storage_changed")
-            finally:
-                reader.close()
-    values = _latest_values(records(), {auth_key, org_key})
+                _TABLE_MEMO[memo_key] = found
+            yield from _TABLE_MEMO[memo_key]
+    values = _latest_values(records(), targets)
     if any(_stamp(path) != stamp for path, stamp in before.items()):
         raise PlatformBalanceError("browser_storage_changed")
     if auth_key not in values or org_key not in values:
@@ -176,7 +203,14 @@ def _request(path, token, timeout, *, organization_id=None, login=False):
 
 def fetch_credit_grants(profile, organization_id, timeout=5):
     try:
-        token, active_org = read_platform_session(profile)
+        try:
+            token, active_org = read_platform_session(profile)
+        except PlatformBalanceError as exc:
+            # Chrome writes Local Storage while we read; one retry is cheap now
+            # that unchanged table files are memoized.
+            if exc.code != "browser_storage_changed":
+                raise
+            token, active_org = read_platform_session(profile)
         if active_org != organization_id:
             raise PlatformBalanceError("account_mismatch", mismatch=True)
         login = _request("/onboarding/login", token, timeout, login=True)
