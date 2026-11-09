@@ -1278,6 +1278,12 @@ def _has_windowed_quota(data):
     return False
 
 
+# Values kept from an earlier read because the latest refresh failed or timed
+# out. Fuchsia stays apart from the red/amber/orange quota warnings, so an old
+# number never reads as a fresh, healthy one.
+_STALE_VALUE_COLOR = "#f0abfc"
+
+
 def _widget_risk_color(pct):
     pct = _widget_pct_value(pct)
     if pct <= 5:
@@ -2883,7 +2889,7 @@ class AiLimitApp(rumps.App):
         if note:
             # Stale readings keep their numbers; the title column says so.
             self._widget_add_label(card["title"], x + 14, y + h / 2 - 1, title_w, 17, size=12, weight="bold")
-            self._widget_add_label(note, x + 14, y + h / 2 - 16, title_w, 14, size=9, color="#fbbf24")
+            self._widget_add_label(note, x + 14, y + h / 2 - 16, title_w, 14, size=9, color=_STALE_VALUE_COLOR)
         else:
             self._widget_add_label(card["title"], x + 14, y + (h - 17) / 2, title_w, 17, size=12, weight="bold")
 
@@ -3370,7 +3376,9 @@ class AiLimitApp(rumps.App):
         lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
 
-        def section(name, color, data=None, *, family=None, subsection=None, order=0):
+        stale_section = [False]
+
+        def section(name, color, data=None, *, family=None, subsection=None, order=0, stale=False):
             row = {"type": "section", "name": name, "color": color}
             if family:
                 row.update(family=family, family_label={"claude": "Claude", "openai": "OpenAI"}[family],
@@ -3378,6 +3386,9 @@ class AiLimitApp(rumps.App):
             note = _stale_note(data, lang)
             if note:
                 row["note"] = _tr(lang, "旧数据", "Stale")
+            stale_section[0] = bool(note or stale)
+            if stale_section[0]:
+                row["stale"] = True
             rows.append(row)
 
         def append(name, pct=None, disabled=False, value=None, reset=None, unknown=False, kind="percent", color=None):
@@ -3398,9 +3409,11 @@ class AiLimitApp(rumps.App):
                 "pct": pct,
                 "value": display_value,
                 "reset": self._format_detail_reset(reset),
-                "color": "#71717a" if (disabled or unknown) else (color or _widget_risk_color(pct)),
+                "color": "#71717a" if (disabled or unknown) else (
+                    _STALE_VALUE_COLOR if stale_section[0] else (color or _widget_risk_color(pct))),
                 "disabled": disabled or unknown,
                 "kind": kind,
+                **({"stale": True} if stale_section[0] and not (disabled or unknown) else {}),
             })
 
         def append_metadata(name, value, color="#a1a1aa"):
@@ -3466,7 +3479,7 @@ class AiLimitApp(rumps.App):
                 cached = record.get("status") == "stale"
                 section(label + (_tr(lang, " · 缓存", " · cached") if cached else ""), color,
                         family=provider, subsection=_tr(lang, "API 额度", "API credits")
-                        + (_tr(lang, " · 缓存", " · cached") if cached else ""), order=1)
+                        + (_tr(lang, " · 缓存", " · cached") if cached else ""), order=1, stale=cached)
                 for key, zh_name, en_name in (
                     ("promotional_balance", "赠送余额", "Promotional"),
                     ("purchased_balance", "购买余额", "Purchased"),
