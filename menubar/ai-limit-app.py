@@ -11,6 +11,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import concurrent.futures
 import threading
 import webbrowser
 import atexit
@@ -109,6 +110,11 @@ _CACHE_PATH   = pathlib.Path.home() / ".ai-limit-menubar-cache.json"
 _CACHE_TTL    = 55
 _ERROR_CACHE_TTL = 5
 _REFRESH_SEC  = 60
+# Providers fetched in parallel per refresh; each one updates its card on arrival.
+_REFRESH_WORKERS = 6
+_STARTUP_CACHE_MAX_AGE = 6 * 3600
+_PENDING_ORDER = ("claude", "codex", "deepseek", "google", "gemini", "copilot", "grok",
+                  "api_credits_v1", "venice", "cloudflare", "runninghub")
 _DISPLAY_MODES = ("5h", "7d")
 _LANGS         = ("zh", "en")
 _SERVICES      = ("claude", "codex", "deepseek", "venice", "runninghub", "cloudflare", "google", "gemini", "copilot", "grok")
@@ -482,7 +488,7 @@ def _save_state(state):
     except Exception:
         pass
 
-def _load_cache():
+def _load_cache(max_age=None):
     try:
         raw = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
         age = datetime.datetime.now().timestamp() - float(raw.get("cached_at", 0))
@@ -491,6 +497,8 @@ def _load_cache():
         if isinstance(codex, dict) and codex.get("source") != "web":
             codex = None
         ttl = _ERROR_CACHE_TTL if isinstance(claude, dict) and claude.get("error") else _CACHE_TTL
+        if max_age is not None:
+            ttl = max(ttl, max_age)
         if age <= ttl:
             cached = {
                 "codex": codex,
@@ -1749,7 +1757,9 @@ class AiLimitApp(rumps.App):
     @rumps.timer(0.3)
     def _init_render(self, sender):
         """启动后立即用缓存重画 + 后台拉一次最新数据。"""
-        self._refresh_from_cache()
+        # At launch an older cache beats a blank window; each card is replaced
+        # as soon as its own fresh read arrives.
+        self._refresh_from_cache(max_age=_STARTUP_CACHE_MAX_AGE)
         self._show_widget_if_enabled()
         self._kick_background_fetch()
         sender.stop()
@@ -1780,13 +1790,12 @@ class AiLimitApp(rumps.App):
         with self._pending_lock:
             pending = self._pending
             self._pending = None
-        if pending is None:
+        if not pending:
             return
-        claude, codex, deepseek, google, gemini, copilot, grok = pending[:7]
-        api_credits_v1 = pending[7] if len(pending) > 7 else None
-        venice = pending[8] if len(pending) > 8 else None
-        cloudflare = pending[9] if len(pending) > 9 else None
-        runninghub = pending[10] if len(pending) > 10 else None
+        if not isinstance(pending, dict):
+            pending = dict(zip(_PENDING_ORDER, pending))
+        claude, codex, deepseek, google, gemini, copilot, grok, api_credits_v1, venice, cloudflare, runninghub = (
+            pending.get(name) for name in _PENDING_ORDER)
         if claude is not None:
             self._claude = _keep_through_keychain_lock(self._claude, claude)
         if codex is not None:
@@ -1830,9 +1839,9 @@ class AiLimitApp(rumps.App):
         )
         self._render()
 
-    def _refresh_from_cache(self):
+    def _refresh_from_cache(self, max_age=None):
         """主线程瞬时操作：读短缓存重画，不碰网络。"""
-        claude, cached = _load_cache()
+        claude, cached = _load_cache(max_age)
         codex = None
         deepseek = None
         venice = None
@@ -1916,22 +1925,39 @@ class AiLimitApp(rumps.App):
             raise
 
     def _async_refresh(self, *, force_api_refresh=False):
-        """后台线程：抓数据 → 写共享变量。不能调任何 rumps/AppKit UI。"""
+        """后台线程：并行抓各服务，谁先到谁先进 _pending。不能调任何 rumps/AppKit UI。
+
+        Each result is merged into the pending dict as soon as it arrives, so
+        _apply_pending draws that card right away instead of waiting for the
+        slowest provider.
+        """
         lang = self._state["lang"]
         services = self._state.get("services") or list(_SERVICES)
-        claude = _fetch_claude(lang) if "claude" in services else None
-        api_credits_v1 = _fetch_api_credit_balances(force=force_api_refresh)
-        codex  = _fetch_codex(lang)  if "codex"  in services else None
-        deepseek = _fetch_deepseek(lang) if "deepseek" in services else None
-        google = _fetch_google(lang) if "google" in services else None
-        gemini = _fetch_gemini_app(lang) if "gemini" in services else None
-        copilot = _fetch_copilot(lang) if "copilot" in services else None
-        grok = _fetch_grok(lang) if "grok" in services else None
-        venice = _fetch_venice(lang) if "venice" in services else None
-        cloudflare = _fetch_cloudflare(lang) if "cloudflare" in services else None
-        runninghub = _fetch_runninghub(lang) if "runninghub" in services else None
+        jobs = {"api_credits_v1": lambda: _fetch_api_credit_balances(force=force_api_refresh)}
+        for name, fetch in (
+            ("claude", _fetch_claude), ("codex", _fetch_codex), ("deepseek", _fetch_deepseek),
+            ("google", _fetch_google), ("gemini", _fetch_gemini_app), ("copilot", _fetch_copilot),
+            ("grok", _fetch_grok), ("venice", _fetch_venice), ("cloudflare", _fetch_cloudflare),
+            ("runninghub", _fetch_runninghub),
+        ):
+            if name in services:
+                jobs[name] = (lambda fetch=fetch: fetch(lang))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_REFRESH_WORKERS) as pool:
+            futures = {pool.submit(job): name for name, job in jobs.items()}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    value = future.result()
+                except Exception:
+                    continue  # keep the last good value for this provider
+                self._queue_pending(futures[future], value)
+
+    def _queue_pending(self, name, value):
+        if value is None:
+            return
         with self._pending_lock:
-            self._pending = (claude, codex, deepseek, google, gemini, copilot, grok, api_credits_v1, venice, cloudflare, runninghub)
+            pending = self._pending if isinstance(self._pending, dict) else {}
+            pending[name] = value
+            self._pending = pending
 
     def _render(self):
         lang     = self._state["lang"]
