@@ -63,7 +63,7 @@ Claude quota uses the active `claude.ai` browser session.
 
 Flow:
 
-1. Read Chrome or Firefox cookies for `.claude.ai`.
+1. Check readable Chrome and Chrome Canary profiles for a signed-in `claude.ai` session. Skip rejected sessions (401/403) within the fetch timeout.
 2. Extract `lastActiveOrg` from cookies.
 3. Request `https://claude.ai/api/organizations/{orgId}/usage`.
 4. Optionally request `https://claude.ai/api/organizations/{orgId}` for plan metadata.

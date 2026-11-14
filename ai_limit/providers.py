@@ -231,49 +231,45 @@ def find_free_local_port() -> int:
         return sock.getsockname()[1]
 
 
-def _claude_web_context(referer: str) -> tuple[str, dict]:
+def _claude_web_contexts(referer: str, deadline=None):
     try:
         import browser_cookie3
     except ImportError as exc:
-        raise ClaudeWebError(
-            t(
-                "未安装 browser_cookie3，请先运行: pip install browser-cookie3",
-                "browser_cookie3 not installed, run: pip install browser-cookie3",
-            )
-        ) from exc
+        raise ClaudeWebError("browser_cookie3 not installed") from exc
 
-    cookies = []
     errs = []
-    for name, loader in [("Chrome", browser_cookie3.chrome), ("Firefox", browser_cookie3.firefox)]:
+    found = False
+    for _, path in _chromium_profile_cookie_files():
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
-            jar = loader(domain_name=".claude.ai")
-            cookies = [(c.name, c.value) for c in jar]
-            if cookies:
-                break
+            jar = browser_cookie3.chrome(cookie_file=str(path), domain_name=".claude.ai")
+            cookies = [(c.name, c.value) for c in jar
+                       if c.domain.lstrip(".") == "claude.ai"]
         except Exception as exc:
-            errs.append(f"{name}: {exc}")
+            errs.append(str(exc))
+            continue
+        cookie_dict = dict(cookies)
+        org_id = cookie_dict.get("lastActiveOrg")
+        if not org_id or not cookie_dict.get("sessionKey"):
+            continue
+        found = True
+        yield org_id, _claude_web_headers(referer, cookies)
 
-    if not cookies:
+    if not found:
         if _chrome_keychain_locked(errs):
             raise _keychain_locked_error(ClaudeWebError)
-        detail = f" ({'; '.join(errs)})" if errs else ""
-        raise ClaudeWebError(
-            t(
-                f"无法读取浏览器 cookie{detail}，请先在浏览器登录 claude.ai",
-                f"cannot read browser cookies{detail}, please log in to claude.ai first",
-            )
-        )
+        raise ClaudeWebError(t(
+            "未找到有效的 Claude 浏览器登录，请先打开 claude.ai 登录",
+            "No Claude browser session found; please sign in at claude.ai",
+        ))
 
-    cookie_dict = dict(cookies)
-    org_id = cookie_dict.get("lastActiveOrg", "")
-    if not org_id:
-        raise ClaudeWebError(
-            t(
-                "未能从 cookie 读取 org ID，请先在浏览器打开 claude.ai",
-                "could not read org ID from cookie, please open claude.ai in your browser",
-            )
-        )
 
+def _claude_web_context(referer: str) -> tuple[str, dict]:
+    return next(_claude_web_contexts(referer))
+
+
+def _claude_web_headers(referer, cookies):
     cookie_header = "; ".join(f"{name}={value}" for name, value in cookies)
     headers = {
         "Cookie": cookie_header,
@@ -290,7 +286,7 @@ def _claude_web_context(referer: str) -> tuple[str, dict]:
             "Chrome/124.0.0.0 Safari/537.36"
         ),
     }
-    return org_id, headers
+    return headers
 
 
 def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
@@ -316,14 +312,33 @@ def _claude_web_get(path: str, headers: dict, timeout: int) -> dict:
         ) from exc
 
 
+def _claude_subscription_read(referer, suffix, timeout):
+    deadline = time.monotonic() + timeout
+    rejected = None
+    for org_id, headers in _claude_web_contexts(referer, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return _claude_web_get(
+                f"/api/organizations/{urllib.parse.quote(org_id, safe='')}{suffix}",
+                headers, remaining,
+            )
+        except ClaudeWebError as exc:
+            if not isinstance(exc.__cause__, urllib.error.HTTPError) or exc.__cause__.code not in (401, 403):
+                raise
+            rejected = exc
+    if rejected is not None:
+        raise rejected
+    raise ClaudeWebError("Claude browser profile search timed out")
+
+
 def live_claude_usage(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> dict:
-    org_id, headers = _claude_web_context(CLAUDE_USAGE_URL)
-    return _claude_web_get(f"/api/organizations/{org_id}/usage", headers, timeout)
+    return _claude_subscription_read(CLAUDE_USAGE_URL, "/usage", timeout)
 
 
 def live_claude_plan(timeout: int = CLAUDE_WEB_TIMEOUT_SEC) -> str | None:
-    org_id, headers = _claude_web_context("https://claude.ai/settings/billing")
-    data = _claude_web_get(f"/api/organizations/{org_id}", headers, timeout)
+    data = _claude_subscription_read("https://claude.ai/settings/billing", "", timeout)
     capabilities = set(data.get("capabilities") or [])
     raven_type = data.get("raven_type")
     if raven_type == "enterprise":
