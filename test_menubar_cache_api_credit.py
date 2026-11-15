@@ -36,7 +36,7 @@ def _claude_v1(status="ok", observed_at="2026-10-30T22:06:59Z"):
                 "program_id": "subscription_api_credit",
                 "granted": 200.0,
                 "remaining": 76.58,
-                "expires_at": "2026-11-11T00:00:00Z",
+                "expires_at": "2099-11-11T00:00:00Z",
                 "granted_at": "2026-10-15T07:37:04Z",
                 "usage_restrictions": None,
             }
@@ -65,7 +65,7 @@ class ClaudeCacheEntryTest(unittest.TestCase):
         self.assertEqual(credit["balance"], 76.59)
         self.assertEqual(credit["currency"], "USD")
         self.assertEqual(credit["granted"], 200.0)
-        self.assertEqual(credit["expires_at"], "2026-11-11T00:00:00Z")
+        self.assertEqual(credit["expires_at"], "2099-11-11T00:00:00Z")
         self.assertEqual(credit["observed_at"], "2026-10-30T22:06:59Z")
         self.assertEqual(credit["status"], "ok")
         self.assertAlmostEqual(_infoweave_gift_remaining(credit), 76.58)

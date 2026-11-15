@@ -407,7 +407,7 @@ class DashboardLayoutTests(unittest.TestCase):
         details = [
             {"type": "section", "name": "Claude API", "color": "#fff"},
             {"kind": "metadata", "name": "Account / organization", "value": "Profile · " + "Organization name and id " * 4},
-            {"kind": "metadata", "name": "Grant expires", "value": "2026-11-11 00:00 UTC"},
+            {"kind": "metadata", "name": "Grant expires", "value": "2099-11-11 00:00 UTC"},
         ]
 
         natural_narrow = app._widget_layout_height(

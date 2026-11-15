@@ -23,7 +23,7 @@ CREDITS = {
         {
             "remaining_amount_minor_units": 19999,
             "currency": "USD",
-            "expires_at": "2026-11-11T00:00:00Z",
+            "expires_at": "2099-11-11T00:00:00Z",
             "granted_amount_minor_units": 20000,
             "granted_at": "2026-10-15T07:37:04.026000Z",
             "remaining": {"money": None, "credits": {"amount_minor": 19999, "exponent": 2}},
@@ -32,7 +32,7 @@ CREDITS = {
             "name": "API credit (Max 20x)",
         }
     ],
-    "next_expires_at": "2026-11-11T00:00:00Z",
+    "next_expires_at": "2099-11-11T00:00:00Z",
 }
 
 CHAT_ORG = {"uuid": "chat-org", "name": "Chat", "billing_type": "stripe_subscription", "capabilities": ["claude_max", "chat"]}
@@ -56,7 +56,7 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(credit["balance"], 200.0)
         self.assertEqual(credit["granted"], 200.0)
         self.assertEqual(credit["remaining_percent"], 100)
-        self.assertEqual(credit["expires_at"], "2026-11-11T00:00:00Z")
+        self.assertEqual(credit["expires_at"], "2099-11-11T00:00:00Z")
         self.assertEqual(credit["tranches"][0]["name"], "API credit (Max 20x)")
         self.assertEqual(credit["tranches"][0]["remaining"], 199.99)
 
@@ -248,7 +248,7 @@ class MenubarTest(unittest.TestCase):
                 "status": "ok", "account_identity": {"profile": "Chrome/Default", "label": "Sample account"},
                 "organization_identity": {"name": "Sample API", "id": "org-1234567890"}, "currency": "USD",
                 "promotional_balance": 199.99, "purchased_balance": None, "total": 200.0,
-                "grants": [{"name": "Sample grant", "remaining": 199.99, "expires_at": "2026-11-11T00:00:00Z"}],
+                "grants": [{"name": "Sample grant", "remaining": 199.99, "expires_at": "2099-11-11T00:00:00Z"}],
                 "source_updated_at": "2026-10-29T23:58:00Z", "observed_at": "2026-10-30T00:00:00Z", "checked_at": "2026-10-30T00:01:00Z",
             },
         }
@@ -259,7 +259,7 @@ class MenubarTest(unittest.TestCase):
         names = [row.get("name") for row in rows]
         for hidden in ("Account / organization", "Status", "Binding", "Source updated", "Last successful read", "Last checked", "Total"):
             self.assertNotIn(hidden, names)
-        self.assertEqual([row["value"] for row in rows if row.get("name") == "Expires (local)"], ["Unknown", "2026-11-11"])
+        self.assertEqual([row["value"] for row in rows if row.get("name") == "Expires (local)"], ["Unknown", "2099-11-11"])
         self.assertEqual(sum(row.get("name") in {"Promotional", "Purchased", "Expires (local)"} for row in rows), 6)
 
     def test_compact_credit_dates_fit_native_widths(self):
@@ -270,7 +270,7 @@ class MenubarTest(unittest.TestCase):
                 "status": "ok", "account_identity": {"profile": "Chrome/Default", "label": "Sample account"},
                 "organization_identity": {"name": "Sample API", "id": "org-1234567890"}, "currency": "USD",
                 "promotional_balance": 199.99, "purchased_balance": None, "total": 200.0,
-                "grants": [{"name": "Sample grant", "remaining": 199.99, "expires_at": "2026-11-11T00:00:00Z"}],
+                "grants": [{"name": "Sample grant", "remaining": 199.99, "expires_at": "2099-11-11T00:00:00Z"}],
                 "source_updated_at": "2026-10-29T23:58:00Z", "observed_at": "2026-10-30T00:00:00Z", "checked_at": "2026-10-30T00:01:00Z",
             },
         }
@@ -287,7 +287,7 @@ class MenubarTest(unittest.TestCase):
                         mock.patch.object(menubar.AiLimitApp, "_clear_widget_content", lambda _self: None):
                     app._render_widget_dashboard()
 
-                expiry = next(label for label in labels if label[0] == "2026-11-11")
+                expiry = next(label for label in labels if label[0] == "2099-11-11")
                 self.assertEqual(expiry[2], menubar.AiLimitApp._WIDGET_WIDE_VALUE_WIDTH)
                 self.assertFalse(any("Chrome/Default" in label[0] for label in labels))
                 self.assertTrue(any(label[0] == "到期（本地）" for label in labels))
