@@ -1,6 +1,6 @@
 # 此刻
 
-更新：2026-11-15 14:40 NZDT（Claude，ai-limit 会话）
+更新：2026-11-15 16:13 NZDT（Codex，总控轮换前核对）
 
 ## 一句话现状
 
@@ -21,18 +21,19 @@ Air 和 Mini 都已装 0.3.59，仓库都在已推送的 origin/main；两台 AP
 
 ## 卡住
 
-- Google 卡片报 403“Google CLI auth expired”：需要用户重新登录 Antigravity / Gemini CLI，代码侧无事可做
+- 无已确认的项目阻塞；Gemini / Google 已退订，不以恢复付费额度为目标
 
 ## 最近决定
 
+- 用户批准会话轮换，当前项目只保留一个 Codex 总控；新总控先只读报告，通过旧总控核对后接管
+- 按 Astra 总控流程：派工前精简 TaskGraph，按实时目录选择 Sol/Terra Worker 与推理强度，记录 internal/external 通道，独立复审后最终验收
 - 不经用户同意不推送、不开 PR
 - 0.3.57 是另一会话的 Claude 浏览器配置修复；OpenAI 额度读取修复归入 0.3.58
 - RunningHub 只显示积分（附到期时间）和钱包，不再显示 RH 币
-- 刷新失败后保留的旧数值统一用品红色 `#f0abfc`，与红 / 琥珀 / 橙警戒色区分
-- 各服务并行抓取，回来一个更新一张卡；启动时可先显示 6 小时内的缓存
 
 ## 先读
 
+- `/Users/mac/.codex/AGENTS.md`
 - `README.md`
 - `ai_limit/version.py`
 - `menubar/ai-limit-app.py`
